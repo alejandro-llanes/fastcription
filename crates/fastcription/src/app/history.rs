@@ -70,6 +70,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: ConversationId) {
                 } else {
                     current.push(tag.id);
                 }
+                app.persist_tags(id, &current);
                 app.conversation_tags.insert(id, current.clone());
             }
         }
@@ -101,6 +102,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: ConversationId) {
         });
 
     if changed {
+        app.persist_conversation(&conversation);
         app.conversations[index] = conversation;
     }
 }

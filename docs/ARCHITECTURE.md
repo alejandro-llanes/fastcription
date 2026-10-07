@@ -170,6 +170,11 @@ src/
   session.rs         the supervisor: owns the capture threads, the segmenter,
                      the ASR workers and the store handle; the only place that
                      knows how the crates fit together
+  env.rs             what the app reads from the machine it runs on: the
+                     library, the capture sources, voxtype's configured engine
+                     and its service state. Each probe fails on its own, since
+                     the useful states are partial — a missing voxtype is no
+                     reason to hide a past transcript
   app/
     mod.rs           App state, drains SessionEvent each frame, repaint plumbing
     live.rs          live transcript: auto-scroll, sticky bottom, segment rows

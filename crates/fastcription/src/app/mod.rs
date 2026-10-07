@@ -492,6 +492,124 @@ impl App {
         }
     }
 
+    /// Writes an edited conversation back to the library.
+    ///
+    /// The history pane edits its own copy and hands it back; this is where
+    /// that copy becomes durable. A failure raises a banner rather than being
+    /// swallowed, because silently losing a rename is the kind of bug users
+    /// cannot diagnose.
+    fn persist_conversation(&mut self, conversation: &Conversation) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let guard = match store.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Err(err) = guard.rename_conversation(conversation.id, &conversation.title) {
+            drop(guard);
+            self.raise(format!("Could not rename the conversation: {err}"));
+            return;
+        }
+        if let Err(err) = guard.set_group(conversation.id, conversation.group) {
+            drop(guard);
+            self.raise(format!("Could not change the group: {err}"));
+        }
+    }
+
+    /// Applies a tag change for one conversation.
+    fn persist_tags(&mut self, id: ConversationId, tags: &[TagId]) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let existing: Vec<TagId> = self
+            .conversation_tags
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
+        let guard = match store.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut failure = None;
+        for added in tags.iter().filter(|t| !existing.contains(t)) {
+            if let Err(err) = guard.add_tag(id, *added) {
+                failure = Some(err.to_string());
+            }
+        }
+        for removed in existing.iter().filter(|t| !tags.contains(t)) {
+            if let Err(err) = guard.remove_tag(id, *removed) {
+                failure = Some(err.to_string());
+            }
+        }
+        drop(guard);
+        if let Some(message) = failure {
+            self.raise(format!("Could not update tags: {message}"));
+        }
+    }
+
+    /// Writes a transcript to a file next to the user's other downloads.
+    ///
+    /// There is no file dialog: pulling in a portal dependency for this is not
+    /// worth it yet, so the path is chosen here and reported back so the user
+    /// knows exactly where it went.
+    fn export_conversation(
+        &mut self,
+        conversation: &Conversation,
+        format: fc_export::ExportFormat,
+        options: fc_export::ExportOptions,
+    ) {
+        let segments = self.segments_for(conversation.id).to_vec();
+        if segments.is_empty() {
+            self.raise("That conversation has no transcript to export.");
+            return;
+        }
+
+        let rendered = fc_export::export(conversation, &segments, format, &options);
+        let dir = dirs::download_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(std::env::temp_dir);
+        let path = dir.join(format!(
+            "{}.{}",
+            sanitise_filename(&conversation.title),
+            format.extension()
+        ));
+
+        match std::fs::write(&path, rendered) {
+            Ok(()) => self.raise(format!("Exported to {}", path.display())),
+            Err(err) => self.raise(format!("Could not write {}: {err}", path.display())),
+        }
+    }
+
+    /// Starts or stops the voxtype user service, then re-reads its real state
+    /// rather than assuming the action worked.
+    fn set_service_running(&mut self, running: bool) {
+        let outcome = if running {
+            fc_voxtype::service::start()
+        } else {
+            fc_voxtype::service::stop()
+        };
+        if let Err(err) = outcome {
+            let verb = if running { "start" } else { "stop" };
+            self.raise(format!("Could not {verb} voxtype.service: {err}"));
+        }
+        self.voxtype_service = crate::env::service_status();
+    }
+
+    /// Re-reads the capture sources, keeping the user's choice selected if it
+    /// is still there. An index into a list that has changed underneath is how
+    /// a picker crashes, so the selection is matched by identity and only
+    /// falls back to the first entry when the chosen source is really gone.
+    fn refresh_sources(&mut self) {
+        let chosen = self.sources.get(self.selected_source).cloned();
+        let probe = crate::env::list_sources();
+        if let Some(problem) = probe.problem {
+            self.raise(problem);
+        }
+        self.sources = probe.value;
+        self.selected_source = reselect(chosen.as_ref(), &self.sources);
+    }
+
     fn raise(&mut self, message: impl Into<String>) {
         let message = message.into();
         tracing::warn!(%message, "raising a banner");
@@ -678,16 +796,36 @@ impl fastframe_shell::Resident for App {
     }
 }
 
+/// The source picker, plus the refresh that keeps it honest.
+///
+/// The list can legitimately be empty — no sound server running, `pactl`
+/// missing, every device suspended — so nothing here indexes into it without
+/// checking. Refresh matters because sink inputs come and go: the application
+/// whose audio the user wants to transcribe may not have started playing when
+/// fastcription launched.
 fn source_combo(app: &mut App, ui: &mut egui::Ui, id_salt: &str) {
-    let current = app.sources[app.selected_source].label();
+    let current = match app.sources.get(app.selected_source) {
+        Some(source) => source.label(),
+        None => t("No audio source").to_owned(),
+    };
     egui::ComboBox::from_id_salt(id_salt)
         .selected_text(current)
         .show_ui(ui, |ui| {
+            if app.sources.is_empty() {
+                ui.label(t("Nothing to record"));
+            }
             for index in 0..app.sources.len() {
                 let label = app.sources[index].label();
                 ui.selectable_value(&mut app.selected_source, index, label);
             }
         });
+    if ui
+        .small_button(t("↻"))
+        .on_hover_text(t("Look for audio sources again"))
+        .clicked()
+    {
+        app.refresh_sources();
+    }
 }
 
 fn service_pill(ui: &mut egui::Ui, status: ServiceStatus) {
@@ -755,6 +893,45 @@ fn default_title() -> String {
         .unwrap_or_else(|_| "Conversation".to_owned())
 }
 
+/// Finds the user's previously chosen source in a freshly enumerated list.
+///
+/// Matched on identity rather than position: a source that disappears shifts
+/// every index after it, and quietly recording a different stream than the one
+/// the user picked is the worst failure this app has. Falls back to the first
+/// entry only when the previous choice is genuinely gone.
+fn reselect(previous: Option<&AudioSource>, sources: &[AudioSource]) -> usize {
+    previous
+        .and_then(|previous| {
+            sources.iter().position(|source| {
+                source.kind == previous.kind
+                    && source.name == previous.name
+                    && source.application == previous.application
+            })
+        })
+        .unwrap_or(0)
+}
+
+/// Keeps a user-chosen title usable as a filename without surprising them with
+/// a mangled name: separators and control characters go, everything else stays.
+fn sanitise_filename(title: &str) -> String {
+    let cleaned: String = title
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '/' | '\\' | ':' | '\0') {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.').to_owned();
+    if trimmed.is_empty() {
+        "conversation".to_owned()
+    } else {
+        trimmed
+    }
+}
+
 fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -767,3 +944,55 @@ fn now_millis() -> i64 {
 
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::{reselect, sanitise_filename};
+    use fc_core::{AudioSource, SourceKind};
+
+    fn monitor(name: &str) -> AudioSource {
+        AudioSource::named(SourceKind::SinkMonitor, name, name)
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_chosen_source_when_the_list_shifts() {
+        let previous = monitor("b.monitor");
+        let after = vec![monitor("new.monitor"), monitor("a.monitor"), monitor("b.monitor")];
+        assert_eq!(reselect(Some(&previous), &after), 2);
+    }
+
+    #[test]
+    fn a_vanished_source_falls_back_to_the_first() {
+        let previous = monitor("gone.monitor");
+        let after = vec![monitor("a.monitor")];
+        assert_eq!(reselect(Some(&previous), &after), 0);
+    }
+
+    #[test]
+    fn an_empty_list_selects_index_zero_without_panicking() {
+        let previous = monitor("a.monitor");
+        assert_eq!(reselect(Some(&previous), &[]), 0);
+        assert_eq!(reselect(None, &[]), 0);
+    }
+
+    /// Two streams of the same application are told apart by index, which the
+    /// identity match deliberately ignores — so the application name has to be
+    /// part of what is compared, or the wrong one gets picked.
+    #[test]
+    fn sink_inputs_match_on_application_not_position() {
+        let firefox = AudioSource::sink_input(12, "Firefox", "Firefox playback");
+        let after = vec![
+            AudioSource::sink_input(30, "Spotify", "Spotify playback"),
+            AudioSource::sink_input(31, "Firefox", "Firefox playback"),
+        ];
+        assert_eq!(reselect(Some(&firefox), &after), 1);
+    }
+
+    #[test]
+    fn filenames_survive_a_title_with_separators() {
+        assert_eq!(sanitise_filename("1:1 with Alice"), "1-1 with Alice");
+        assert_eq!(sanitise_filename("a/b\\c"), "a-b-c");
+        assert_eq!(sanitise_filename("   "), "conversation");
+        assert_eq!(sanitise_filename("..."), "conversation");
+    }
+}

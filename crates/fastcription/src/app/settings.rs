@@ -64,12 +64,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label(service_label(app.voxtype_service));
         if ui.button(t("Start")).clicked() {
-            app.voxtype_service = ServiceStatus::Running;
-            tracing::info!("placeholder: would run `systemctl --user start voxtype.service`");
+            app.set_service_running(true);
         }
         if ui.button(t("Stop")).clicked() {
-            app.voxtype_service = ServiceStatus::Stopped;
-            tracing::info!("placeholder: would run `systemctl --user stop voxtype.service`");
+            app.set_service_running(false);
+        }
+        if ui.button(t("Refresh")).clicked() {
+            app.voxtype_service = crate::env::service_status();
         }
     });
 
