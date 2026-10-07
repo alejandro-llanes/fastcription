@@ -29,7 +29,8 @@ fn engines_real_capture() {
 
 #[test]
 fn engines_rejects_empty_output() {
-    let err = parse_engines("Transcription engines\n\nSwitch with: voxtype config set engine <NAME>\n");
+    let err =
+        parse_engines("Transcription engines\n\nSwitch with: voxtype config set engine <NAME>\n");
     assert!(err.is_err());
 }
 
@@ -78,7 +79,9 @@ fn devices_real_capture() {
 
 #[test]
 fn devices_empty_is_not_an_error() {
-    let entries = parse_devices("Audio input devices\n\nSelect one with: voxtype config set audio.device <NAME>\n");
+    let entries = parse_devices(
+        "Audio input devices\n\nSelect one with: voxtype config set audio.device <NAME>\n",
+    );
     assert!(entries.is_empty());
 }
 
@@ -93,7 +96,8 @@ fn accel_real_capture() {
 
 #[test]
 fn status_json_happy_path_real_capture() {
-    let info: StatusInfo = serde_json::from_str(&fixture("status_json_happy.json")).expect("parses");
+    let info: StatusInfo =
+        serde_json::from_str(&fixture("status_json_happy.json")).expect("parses");
     assert_eq!(info.alt, "idle");
     assert_eq!(info.class, "idle");
     assert_eq!(info.model.as_deref(), Some("base.en"));
@@ -113,7 +117,8 @@ fn status_json_missing_fields_do_not_fail_the_parse() {
 
 #[test]
 fn status_engine_info_fills_in_the_caller_supplied_engine_name() {
-    let info: StatusInfo = serde_json::from_str(&fixture("status_json_happy.json")).expect("parses");
+    let info: StatusInfo =
+        serde_json::from_str(&fixture("status_json_happy.json")).expect("parses");
     let engine_info = info.engine_info("whisper", "en");
     assert_eq!(engine_info.engine, "whisper");
     assert_eq!(engine_info.model, "base.en");

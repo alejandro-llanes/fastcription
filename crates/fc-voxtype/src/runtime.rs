@@ -67,7 +67,9 @@ pub struct RuntimePaths {
 impl RuntimePaths {
     pub fn discover() -> Result<Self> {
         let base = std::env::var_os("XDG_RUNTIME_DIR").ok_or(VoxtypeError::NoRuntimeDir)?;
-        Ok(Self { dir: PathBuf::from(base).join("voxtype") })
+        Ok(Self {
+            dir: PathBuf::from(base).join("voxtype"),
+        })
     }
 
     pub fn state(&self) -> PathBuf {
@@ -152,10 +154,23 @@ pub fn watch(paths: RuntimePaths) -> Result<Receiver<RuntimeUpdate>> {
                         }
                         // Read the initial state immediately so the caller
                         // does not have to wait for a second filesystem event.
-                        if let Some(state) =
-                            std::fs::read_to_string(&state_path).ok().and_then(|s| DaemonState::parse(&s))
+                        // Both files, mirroring read_now(): a meeting can
+                        // already be in progress by the time this directory
+                        // shows up (the daemon creates it once at startup,
+                        // before any meeting state exists, but a watcher that
+                        // only attaches once the app starts could still race
+                        // a daemon that was already mid-meeting).
+                        if let Some(state) = std::fs::read_to_string(&state_path)
+                            .ok()
+                            .and_then(|s| DaemonState::parse(&s))
                         {
                             let _ = tx.send(RuntimeUpdate::State(state));
+                        }
+                        if let Some(meeting) = std::fs::read_to_string(&meeting_path)
+                            .ok()
+                            .and_then(|s| MeetingState::parse(&s))
+                        {
+                            let _ = tx.send(RuntimeUpdate::Meeting(meeting));
                         }
                     }
                 }
@@ -164,8 +179,9 @@ pub fn watch(paths: RuntimePaths) -> Result<Receiver<RuntimeUpdate>> {
 
             for path in &event.paths {
                 if *path == state_path {
-                    if let Some(state) =
-                        std::fs::read_to_string(&state_path).ok().and_then(|s| DaemonState::parse(&s))
+                    if let Some(state) = std::fs::read_to_string(&state_path)
+                        .ok()
+                        .and_then(|s| DaemonState::parse(&s))
                     {
                         let _ = tx.send(RuntimeUpdate::State(state));
                     }

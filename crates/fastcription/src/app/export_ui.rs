@@ -48,6 +48,10 @@ pub struct State {
     pub timestamps: bool,
     pub speakers: bool,
     pub metadata: bool,
+    /// Where the file goes, editable. There is no file dialog: a portal
+    /// dependency is not worth it to pick one directory, but a path the user
+    /// cannot see or change is worse than no dialog at all.
+    pub destination: String,
 }
 
 impl Default for State {
@@ -58,12 +62,12 @@ impl Default for State {
             timestamps: true,
             speakers: true,
             metadata: true,
+            destination: String::new(),
         }
     }
 }
 
-/// The export button for the conversation currently open in the history
-/// view. Opens a format picker; choosing one logs what would be written.
+/// The export button for the conversation currently open in the history view.
 pub fn button(app: &mut App, ui: &mut egui::Ui, conversation: &fc_core::Conversation) {
     let clicked = ui
         .horizontal(|ui| {
@@ -73,15 +77,42 @@ pub fn button(app: &mut App, ui: &mut egui::Ui, conversation: &fc_core::Conversa
         .inner;
     if clicked {
         app.export.open = !app.export.open;
+        if app.export.open {
+            app.export.destination = app
+                .default_export_path(conversation, app.export.format.to_export())
+                .display()
+                .to_string();
+        }
     }
     if app.export.open {
         egui::Window::new(t("Export conversation"))
             .collapsible(false)
             .resizable(false)
             .show(ui.ctx(), |ui| {
+                let before = app.export.format;
                 for format in Format::ALL {
                     ui.radio_value(&mut app.export.format, format, format.label());
                 }
+                if app.export.format != before {
+                    // Keep the suggested filename's extension honest when the
+                    // format changes, unless the user has typed their own path.
+                    let suggested = app
+                        .default_export_path(conversation, before.to_export())
+                        .display()
+                        .to_string();
+                    if app.export.destination == suggested {
+                        app.export.destination = app
+                            .default_export_path(conversation, app.export.format.to_export())
+                            .display()
+                            .to_string();
+                    }
+                }
+                ui.separator();
+                ui.label(t("Save to"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.export.destination)
+                        .desired_width(380.0),
+                );
                 ui.separator();
                 ui.checkbox(&mut app.export.timestamps, t("Timestamps"));
                 ui.checkbox(&mut app.export.speakers, t("Speaker labels"));
@@ -94,10 +125,14 @@ pub fn button(app: &mut App, ui: &mut egui::Ui, conversation: &fc_core::Conversa
                             speakers: app.export.speakers,
                             metadata: app.export.metadata,
                         };
+                        let destination = std::path::PathBuf::from(
+                            shellexpand_home(&app.export.destination),
+                        );
                         app.export_conversation(
                             conversation,
                             app.export.format.to_export(),
                             options,
+                            &destination,
                         );
                         app.export.open = false;
                     }
@@ -106,5 +141,17 @@ pub fn button(app: &mut App, ui: &mut egui::Ui, conversation: &fc_core::Conversa
                     }
                 });
             });
+    }
+}
+
+/// Expands a leading `~` so a hand-typed path behaves the way a shell would.
+/// Nothing else is expanded: this is a path field, not a shell.
+fn shellexpand_home(path: &str) -> String {
+    let trimmed = path.trim();
+    match trimmed.strip_prefix("~/") {
+        Some(rest) => dirs::home_dir()
+            .map(|home| home.join(rest).display().to_string())
+            .unwrap_or_else(|| trimmed.to_owned()),
+        None => trimmed.to_owned(),
     }
 }

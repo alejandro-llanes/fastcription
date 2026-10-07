@@ -6,12 +6,15 @@
 //! partial. voxtype missing is not a reason to hide a past transcript; a
 //! suspended sound server is not a reason to refuse to open.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use fc_core::{AudioSource, Conversation, ConversationId, EngineInfo, Group, Segment, SourceKind, Tag, TagId};
+use fc_core::{
+    AudioSource, Conversation, ConversationId, ConversationStatus, EngineInfo, Group, Segment,
+    SourceKind, Tag, TagId, Track, UnixMillis,
+};
 use fc_store::{ConversationFilter, Store};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::session::SharedStore;
 
@@ -83,15 +86,67 @@ pub fn list_sources() -> Probe<Vec<AudioSource>> {
     }
 }
 
+/// What voxtype offers: the engines compiled into this build and the models
+/// actually installed.
+///
+/// Offered as a choice rather than a text field because a mistyped model name
+/// only fails on the first chunk, which during a meeting is the worst moment
+/// to discover it. An empty list is normal — `voxtype info` can fail while
+/// transcription works — and the settings pane falls back to free text.
+pub struct Catalog {
+    pub engines: Vec<String>,
+    pub models: Vec<String>,
+}
+
+pub fn probe_catalog() -> Catalog {
+    let probe = fc_voxtype::cli::probe();
+    let engines = probe
+        .engines
+        .map(|entries| {
+            entries
+                .into_iter()
+                .filter(|entry| entry.compiled)
+                .map(|entry| entry.name)
+                .collect()
+        })
+        .unwrap_or_default();
+    let models = probe
+        .models
+        .map(|entries| {
+            entries
+                .into_iter()
+                .filter(|entry| entry.installed)
+                .map(|entry| entry.name)
+                .collect()
+        })
+        .unwrap_or_default();
+    Catalog { engines, models }
+}
+
+/// voxtype's own configured defaults, used to seed the settings pane so that
+/// leaving it alone reproduces what voxtype would have done by itself.
+pub fn voxtype_defaults() -> fc_voxtype::config::Defaults {
+    fc_voxtype::config::default_path()
+        .and_then(|path| fc_voxtype::config::read_defaults(path).ok())
+        .unwrap_or_default()
+}
+
+/// Microphone-like sources: real capture devices, never monitors.
+pub fn microphones(sources: &[AudioSource]) -> Vec<AudioSource> {
+    sources
+        .iter()
+        .filter(|source| source.kind == SourceKind::Device)
+        .cloned()
+        .collect()
+}
+
 /// What voxtype will actually do, recorded with each conversation.
 ///
 /// The daemon's status knows the model and the acceleration backend but not the
 /// engine or language, and the CLI adapter deliberately never reads the user's
 /// config (decision D6), so the two sources are combined here.
 pub fn probe_engine(binary: Option<&PathBuf>) -> EngineInfo {
-    let defaults = fc_voxtype::config::default_path()
-        .and_then(|path| fc_voxtype::config::read_defaults(path).ok())
-        .unwrap_or_default();
+    let defaults = voxtype_defaults();
     let engine = defaults.engine.unwrap_or_else(|| "whisper".to_owned());
     let language = defaults.language.unwrap_or_else(|| "en".to_owned());
 
@@ -190,5 +245,293 @@ pub fn load_segments(store: &SharedStore, id: ConversationId) -> Vec<Segment> {
             tracing::warn!(id = %id, %err, "could not load segments");
             Vec::new()
         }
+    }
+}
+
+
+/// Keeps the voxtype service indicator truthful without the user pressing
+/// anything.
+///
+/// Two signals, because neither alone is enough: `systemctl` knows whether the
+/// unit is active but says nothing until asked, and the daemon's runtime state
+/// file changes the instant it does something but does not exist when the
+/// daemon is stopped. The watcher turns a file change into an immediate
+/// re-check, and a slow poll catches the unit being started or stopped from
+/// outside fastcription.
+pub struct ServiceMonitor {
+    updates: crossbeam_channel::Receiver<crate::app::ServiceStatus>,
+}
+
+impl ServiceMonitor {
+    const POLL: std::time::Duration = std::time::Duration::from_secs(3);
+
+    pub fn spawn() -> Self {
+        let (tx, updates) = crossbeam_channel::bounded(8);
+        std::thread::Builder::new()
+            .name("fc-service-monitor".into())
+            .spawn(move || {
+                // A failure to watch is not fatal: the poll below still keeps
+                // the indicator correct, just less promptly.
+                let watch = fc_voxtype::runtime::RuntimePaths::discover()
+                    .ok()
+                    .and_then(|paths| fc_voxtype::runtime::watch(paths).ok());
+
+                let mut last = None;
+                loop {
+                    let current = service_status();
+                    if Some(current) != last {
+                        last = Some(current);
+                        if tx.send(current).is_err() {
+                            return;
+                        }
+                    }
+                    match &watch {
+                        // Any daemon activity is a reason to look again now.
+                        Some(rx) => match rx.recv_timeout(Self::POLL) {
+                            Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                                std::thread::sleep(Self::POLL)
+                            }
+                        },
+                        None => std::thread::sleep(Self::POLL),
+                    }
+                }
+            })
+            .map_err(|err| tracing::error!(%err, "could not spawn the service monitor"))
+            .ok();
+        Self { updates }
+    }
+
+    /// The newest status, if it changed since the last call.
+    pub fn poll(&self) -> Option<crate::app::ServiceStatus> {
+        self.updates.try_iter().last()
+    }
+}
+
+/// What an import run did, for reporting back to the user.
+pub struct Imported {
+    pub added: usize,
+    pub skipped: usize,
+    pub failed: Vec<String>,
+}
+
+/// Copies meetings recorded by voxtype's own meeting mode into the library.
+///
+/// Read-only with respect to voxtype: its database and transcript files are
+/// never touched, only read through `voxtype meeting export` (architecture §7).
+/// Meetings already imported are skipped, so running this twice is safe, and a
+/// meeting still in progress is left alone — its transcript does not exist yet.
+pub fn import_meetings(store: &SharedStore, binary: &Path) -> Result<Imported, String> {
+    let meetings = fc_voxtype::meeting::list(binary, None)
+        .map_err(|err| format!("Could not list voxtype meetings: {err}"))?;
+
+    let seen = imported_ids(store);
+    let mut outcome = Imported {
+        added: 0,
+        skipped: 0,
+        failed: Vec::new(),
+    };
+
+    for meeting in meetings {
+        let finished = matches!(
+            meeting.status,
+            None | Some(fc_voxtype::meeting::MeetingStatus::Completed)
+        );
+        if seen.contains(&meeting.id) || !finished {
+            outcome.skipped += 1;
+            continue;
+        }
+        match import_one(store, binary, &meeting) {
+            Ok(()) => outcome.added += 1,
+            Err(err) => {
+                tracing::warn!(id = %meeting.id, %err, "could not import a voxtype meeting");
+                outcome.failed.push(format!("{}: {err}", meeting.title));
+            }
+        }
+    }
+
+    Ok(outcome)
+}
+
+/// The voxtype meeting ids already in the library.
+///
+/// Collected in one pass before importing rather than queried per meeting:
+/// `list_conversations` does not carry the imported id, so each row has to be
+/// read in full. That cost is paid once, for an action the user asked for, and
+/// it is what makes a second import a no-op instead of a duplicate library.
+fn imported_ids(store: &SharedStore) -> HashSet<String> {
+    let guard = match store.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let Ok(rows) = guard.list_conversations(&ConversationFilter::default()) else {
+        return HashSet::new();
+    };
+    rows.iter()
+        .filter_map(|row| guard.get_conversation(row.id).ok())
+        .filter_map(|conversation| conversation.voxtype_meeting_id)
+        .collect()
+}
+
+fn import_one(
+    store: &SharedStore,
+    binary: &Path,
+    meeting: &fc_voxtype::meeting::MeetingRecord,
+) -> Result<(), String> {
+    let json = fc_voxtype::meeting::export(
+        binary,
+        &meeting.id,
+        fc_voxtype::meeting::ExportFormat::Json,
+        fc_voxtype::meeting::ExportOptions {
+            timestamps: true,
+            speakers: true,
+            metadata: true,
+        },
+    )
+    .map_err(|err| err.to_string())?;
+
+    let transcript =
+        fc_voxtype::meeting::parse_export_json(&json).map_err(|err| err.to_string())?;
+    if transcript.segments.is_empty() {
+        return Err("the meeting has no transcript".to_owned());
+    }
+
+    let started_at = transcript
+        .started_at
+        .as_deref()
+        .and_then(parse_rfc3339_millis)
+        .or_else(|| meeting.started_at.as_deref().and_then(parse_local_minute))
+        .ok_or("the meeting has no readable start time")?;
+
+    // Segment offsets are relative to the meeting's start, so the last one's
+    // end is the meeting's length. voxtype's own `durationSecs` is not carried
+    // through the import types, and this agrees with it to the millisecond.
+    let ended_at = started_at
+        + transcript
+            .segments
+            .iter()
+            .map(|segment| segment.end_ms)
+            .max()
+            .unwrap_or(0) as i64;
+
+    let segments: Vec<Segment> = transcript
+        .segments
+        .iter()
+        .filter(|segment| !segment.text.trim().is_empty())
+        .enumerate()
+        .map(|(index, segment)| Segment {
+            // voxtype attributes by source, not by track, and the distinction
+            // is not in the export. One track keeps the imported transcript
+            // honest; the speaker labels it does carry are preserved.
+            track: Track::Selected,
+            seq: index as u64,
+            start_ms: segment.start_ms,
+            end_ms: segment.end_ms,
+            text: segment.text.clone(),
+            translation: None,
+            speaker: segment.speaker.clone(),
+            confidence: None,
+            provisional: false,
+        })
+        .collect();
+
+    let guard = match store.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let id = guard
+        .create_conversation(&fc_store::NewConversation {
+            title: transcript.title.clone().unwrap_or_else(|| meeting.title.clone()),
+            group: None,
+            started_at,
+            // voxtype does not record which source a meeting came from, and
+            // inventing one would put a claim in the library nothing backs.
+            source: AudioSource::named(SourceKind::Device, "", "Imported from voxtype"),
+            mic_track: false,
+            engine: EngineInfo {
+                engine: "voxtype".to_owned(),
+                // Not in the export either: metadata carries id, title, times,
+                // status and chunk count, and no model.
+                model: "unknown".to_owned(),
+                language: "unknown".to_owned(),
+                backend: None,
+            },
+            voxtype_meeting_id: Some(meeting.id.clone()),
+        })
+        .map_err(|err| err.to_string())?;
+
+    guard
+        .append_segments(id, &segments)
+        .map_err(|err| err.to_string())?;
+    guard
+        .finish_conversation(id, ended_at, ConversationStatus::Completed)
+        .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+/// `metadata.startedAt` from a JSON export, e.g. `2026-10-07T14:30:22+00:00`.
+fn parse_rfc3339_millis(text: &str) -> Option<UnixMillis> {
+    time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(|stamp| (stamp.unix_timestamp_nanos() / 1_000_000) as i64)
+}
+
+/// The `Date:` line from `meeting list`, e.g. `2026-10-07 14:30`. It carries no
+/// timezone and no seconds, so it is read as local time and only used when the
+/// JSON export has no start time of its own.
+fn parse_local_minute(text: &str) -> Option<UnixMillis> {
+    let format = time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]");
+    let naive = time::PrimitiveDateTime::parse(text.trim(), &format).ok()?;
+    let offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+    Some(naive.assume_offset(offset).unix_timestamp() * 1_000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_local_minute, parse_rfc3339_millis};
+
+    /// The exact value voxtype writes in a JSON export's `metadata.startedAt`.
+    /// A unit mistake here would shift every imported transcript by a factor
+    /// of a thousand, so the expected epoch is spelled out rather than
+    /// computed by the same code under test.
+    #[test]
+    fn a_json_export_start_time_reads_as_milliseconds() {
+        // 2026-10-07T14:30:22+00:00 == 1791383422 seconds since the epoch.
+        assert_eq!(
+            parse_rfc3339_millis("2026-10-07T14:30:22+00:00"),
+            Some(1_791_383_422_000)
+        );
+    }
+
+    /// An offset other than UTC must be honoured, not ignored.
+    #[test]
+    fn a_non_utc_offset_is_applied() {
+        let utc = parse_rfc3339_millis("2026-10-07T14:30:22+00:00").unwrap();
+        let plus_two = parse_rfc3339_millis("2026-10-07T14:30:22+02:00").unwrap();
+        assert_eq!(utc - plus_two, 2 * 60 * 60 * 1_000);
+    }
+
+    #[test]
+    fn unreadable_start_times_are_rejected_rather_than_guessed() {
+        assert_eq!(parse_rfc3339_millis(""), None);
+        assert_eq!(parse_rfc3339_millis("2026-10-07 14:30"), None);
+        assert_eq!(parse_local_minute("not a date"), None);
+        assert_eq!(parse_local_minute(""), None);
+    }
+
+    /// The `Date:` line from `meeting list` has no timezone, so it is read as
+    /// local time. Asserted against the same offset the function uses, since
+    /// the test machine's zone is not fixed.
+    #[test]
+    fn a_meeting_list_date_reads_as_local_time() {
+        let parsed = parse_local_minute("2026-10-07 14:30").expect("parses");
+        let offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+        let expected = time::macros::date!(2026 - 10 - 07)
+            .with_hms(14, 30, 0)
+            .unwrap()
+            .assume_offset(offset)
+            .unix_timestamp()
+            * 1_000;
+        assert_eq!(parsed, expected);
     }
 }

@@ -10,7 +10,7 @@ mod settings;
 mod sidebar;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -18,11 +18,15 @@ use crossbeam_channel::Receiver;
 use fastframe_theme::Palette as ThemePalette;
 
 use fc_core::{
-    AudioSource, Conversation, ConversationId, EngineInfo, Group,
+    AudioSource, Conversation, ConversationId, EngineInfo, Group, GroupId,
     Pressure, Segment, SessionEvent, SessionState, Tag, TagId, Track,
 };
 
 use crate::session::{self, Session, SessionConfig, SharedStore};
+
+/// How many transcript matches one search returns. Enough to cover any
+/// realistic library without rendering a list nobody scrolls.
+const SEARCH_LIMIT: u32 = 500;
 
 use crate::i18n::t;
 
@@ -41,6 +45,14 @@ pub enum ServiceStatus {
     Unknown,
     Running,
     Stopped,
+}
+
+/// A rename or deletion of a group or a tag, applied by `App::edit_label`.
+pub enum LabelEdit {
+    RenameGroup(GroupId, String),
+    DeleteGroup(GroupId),
+    RenameTag(TagId, String),
+    DeleteTag(TagId),
 }
 
 /// A dismissible error banner, raised by `SessionEvent::Failed` or
@@ -86,15 +98,21 @@ pub struct App {
     level_peak: f32,
     level_rms: f32,
     mic_track: bool,
+    /// The microphone used for the optional second track. Separate from
+    /// `sources`/`selected_source`, which is the source being transcribed.
+    mic_source: AudioSource,
     sources: Vec<AudioSource>,
     selected_source: usize,
+    /// What voxtype reports it can do; empty when `voxtype info` failed.
+    engines: Vec<String>,
+    models: Vec<String>,
     banner: Option<Banner>,
     segments: Vec<Segment>,
     provisional: HashMap<Track, Segment>,
     overlay: overlay::Shared,
     overlay_open: bool,
 
-    // Library (placeholder data; `fc-store` owns the real rows)
+    // Library, read from `fc-store` at startup and after any change.
     conversations: Vec<Conversation>,
     groups: Vec<Group>,
     tags: Vec<Tag>,
@@ -103,11 +121,14 @@ pub struct App {
 
     // Navigation and per-pane transient state
     main_view: MainView,
+    /// Set while a deletion is awaiting confirmation.
+    pending_delete: Option<ConversationId>,
     sidebar: sidebar::State,
     settings: settings::State,
     export: export_ui::State,
 
     voxtype_service: ServiceStatus,
+    service_monitor: crate::env::ServiceMonitor,
 }
 
 impl App {
@@ -116,6 +137,20 @@ impl App {
         let sources = crate::env::list_sources();
         let voxtype = fc_voxtype::cli::find_binary();
         let engine = crate::env::probe_engine(voxtype.as_ref());
+        let catalog = crate::env::probe_catalog();
+        let defaults = crate::env::voxtype_defaults();
+        // Seeded from voxtype's own configuration, so the settings pane opens
+        // showing what voxtype would do unprompted rather than a guess.
+        let settings = settings::State {
+            engine: defaults
+                .engine
+                .unwrap_or_else(|| engine.engine.clone()),
+            model: defaults.model.unwrap_or_else(|| engine.model.clone()),
+            language: defaults
+                .language
+                .unwrap_or_else(|| engine.language.clone()),
+            ..settings::State::default()
+        };
         let library = store
             .value
             .as_ref()
@@ -188,8 +223,11 @@ impl App {
             level_peak: 0.0,
             level_rms: 0.0,
             mic_track: false,
+            mic_source: crate::env::default_microphone(),
             sources: sources.value,
             selected_source: 0,
+            engines: catalog.engines,
+            models: catalog.models,
             banner,
             segments: Vec::new(),
             provisional: HashMap::new(),
@@ -201,10 +239,12 @@ impl App {
             conversation_tags: library.value.conversation_tags,
             history_segments: HashMap::new(),
             main_view: MainView::Live,
+            pending_delete: None,
             sidebar: sidebar::State::default(),
-            settings: settings::State::default(),
+            settings,
             export: export_ui::State::default(),
             voxtype_service: crate::env::service_status(),
+            service_monitor: crate::env::ServiceMonitor::spawn(),
         }
     }
 
@@ -235,11 +275,16 @@ impl App {
     pub fn frame(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.scrolling.apply(ui.ctx());
         self.drain_events(ui.ctx());
+        if let Some(status) = self.service_monitor.poll() {
+            self.voxtype_service = status;
+        }
+        self.update_search();
         self.poll_theme(ui.ctx());
         self.drain_tray(ui.ctx(), false);
         if self.quit_requested {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
+        self.delete_confirmation(ui.ctx());
 
         egui::Panel::top("top-bar").show(ui, |ui| self.top_bar(ui));
 
@@ -422,9 +467,9 @@ impl App {
             title: default_title(),
             group: None,
             source,
-            mic_source: self.mic_track.then(crate::env::default_microphone),
+            mic_source: self.mic_track.then(|| self.mic_source.clone()),
             segmenter: self.segmenter_config(),
-            engine: self.engine.clone(),
+            engine: self.chosen_engine(),
         };
 
         match Session::start(
@@ -463,20 +508,51 @@ impl App {
         }
     }
 
+    /// What the conversation will be transcribed with, as the settings pane
+    /// currently has it. Recorded with the conversation so an old transcript
+    /// can be read in the light of how it was made.
+    fn chosen_engine(&self) -> EngineInfo {
+        EngineInfo {
+            engine: self.settings.engine.clone(),
+            model: self.settings.model.clone(),
+            language: self.settings.language.clone(),
+            backend: self.engine.backend.clone(),
+        }
+    }
+
     /// Builds the per-track transcriber.
     ///
-    /// Engine, model and language are deliberately not passed: voxtype reads
-    /// its own configuration, and pinning what was probed at startup would
-    /// freeze the user's choice for the lifetime of the window (decision D6).
+    /// Engine, model and language are passed as voxtype's global options, which
+    /// is what decision D6 allows: fastcription never writes the user's
+    /// `config.toml`, it only overrides per invocation. The fields were seeded
+    /// from that same config at startup, so an untouched settings pane
+    /// reproduces voxtype's own behaviour.
     fn transcriber_factory(&self) -> session::TranscriberFactory {
         let binary = self.voxtype.clone();
+        let engine = self.settings.engine.clone();
+        let model = self.settings.model.clone();
+        let language = self.settings.language.clone();
         Box::new(move |_track| {
             let mut cli = fc_asr::VoxtypeCli::new();
             if let Some(path) = &binary {
                 cli = cli.with_binary(path.display().to_string());
             }
+            if !engine.trim().is_empty() {
+                cli = cli.with_engine(engine.clone());
+            }
+            if !model.trim().is_empty() {
+                cli = cli.with_model(model.clone());
+            }
+            if !language.trim().is_empty() {
+                cli = cli.with_language(language.clone());
+            }
             Box::new(cli)
         })
+    }
+
+    /// Capture devices offered as the microphone for the second track.
+    fn microphones(&self) -> Vec<AudioSource> {
+        crate::env::microphones(&self.sources)
     }
 
     fn segmenter_config(&self) -> fc_asr::SegmenterConfig {
@@ -553,31 +629,56 @@ impl App {
     /// There is no file dialog: pulling in a portal dependency for this is not
     /// worth it yet, so the path is chosen here and reported back so the user
     /// knows exactly where it went.
+    /// Where a transcript is suggested to go: the user's downloads directory,
+    /// named after the conversation.
+    fn default_export_path(
+        &self,
+        conversation: &Conversation,
+        format: fc_export::ExportFormat,
+    ) -> PathBuf {
+        let dir = dirs::download_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(std::env::temp_dir);
+        dir.join(format!(
+            "{}.{}",
+            sanitise_filename(&conversation.title),
+            format.extension()
+        ))
+    }
+
     fn export_conversation(
         &mut self,
         conversation: &Conversation,
         format: fc_export::ExportFormat,
         options: fc_export::ExportOptions,
+        destination: &Path,
     ) {
         let segments = self.segments_for(conversation.id).to_vec();
         if segments.is_empty() {
             self.raise("That conversation has no transcript to export.");
             return;
         }
+        if destination.as_os_str().is_empty() {
+            self.raise("Choose where to save the transcript.");
+            return;
+        }
+
+        if let Some(parent) = destination.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(err) = std::fs::create_dir_all(parent) {
+                    self.raise(format!("Could not create {}: {err}", parent.display()));
+                    return;
+                }
+            }
+        }
 
         let rendered = fc_export::export(conversation, &segments, format, &options);
-        let dir = dirs::download_dir()
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(std::env::temp_dir);
-        let path = dir.join(format!(
-            "{}.{}",
-            sanitise_filename(&conversation.title),
-            format.extension()
-        ));
-
-        match std::fs::write(&path, rendered) {
-            Ok(()) => self.raise(format!("Exported to {}", path.display())),
-            Err(err) => self.raise(format!("Could not write {}: {err}", path.display())),
+        match std::fs::write(destination, rendered) {
+            Ok(()) => self.raise(format!("Exported to {}", destination.display())),
+            Err(err) => self.raise(format!(
+                "Could not write {}: {err}",
+                destination.display()
+            )),
         }
     }
 
@@ -645,6 +746,213 @@ impl App {
         match outcome {
             Ok(_) => self.reload_library(),
             Err(err) => self.raise(format!("Could not create the tag: {err}")),
+        }
+    }
+
+    /// Runs the transcript search when the query changes.
+    ///
+    /// The sidebar's box searches two things: conversation titles, matched in
+    /// memory, and the words that were actually said, matched by SQLite's
+    /// full-text index. Finding a meeting by something said in it is the whole
+    /// point of keeping the transcripts.
+    fn update_search(&mut self) {
+        if self.sidebar.search == self.sidebar.searched_for {
+            return;
+        }
+        self.sidebar.searched_for = self.sidebar.search.clone();
+
+        let query = self.sidebar.search.trim().to_owned();
+        if query.is_empty() {
+            self.sidebar.matches = None;
+            return;
+        }
+        let Some(store) = self.store.clone() else {
+            self.sidebar.matches = None;
+            return;
+        };
+
+        let hits = {
+            let guard = match store.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.search(&query, SEARCH_LIMIT)
+        };
+        match hits {
+            Ok(hits) => {
+                let mut by_conversation = HashMap::new();
+                for hit in hits {
+                    // The first hit in rank order is the best excerpt for that
+                    // conversation, so later ones do not overwrite it.
+                    by_conversation
+                        .entry(hit.conversation_id)
+                        .or_insert(hit.snippet);
+                }
+                self.sidebar.matches = Some(by_conversation);
+            }
+            Err(err) => {
+                self.sidebar.matches = Some(HashMap::new());
+                self.raise(format!("Search failed: {err}"));
+            }
+        }
+    }
+
+    /// Renames a group or a tag, or deletes one.
+    ///
+    /// Grouped under one method because each is a single statement plus a
+    /// library reload, and the reload is the part that must not be forgotten:
+    /// a renamed group that still shows its old name in the filter looks like
+    /// the rename failed.
+    fn edit_label(&mut self, edit: LabelEdit) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let outcome = {
+            let guard = match store.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            match &edit {
+                LabelEdit::RenameGroup(id, name) => guard.rename_group(*id, name),
+                LabelEdit::DeleteGroup(id) => guard.delete_group(*id),
+                LabelEdit::RenameTag(id, name) => guard.rename_tag(*id, name),
+                LabelEdit::DeleteTag(id) => guard.delete_tag(*id),
+            }
+        };
+        match outcome {
+            Ok(()) => {
+                // A deleted group may be the one being filtered on, and a
+                // deleted tag may be in the tag filter; leaving either behind
+                // would filter the list down to nothing with no visible cause.
+                match edit {
+                    LabelEdit::DeleteGroup(id) => {
+                        if self.sidebar.group_filter == Some(id) {
+                            self.sidebar.group_filter = None;
+                        }
+                    }
+                    LabelEdit::DeleteTag(id) => {
+                        self.sidebar.tag_filter.remove(&id);
+                        for tags in self.conversation_tags.values_mut() {
+                            tags.retain(|tag| *tag != id);
+                        }
+                    }
+                    _ => {}
+                }
+                self.reload_library();
+            }
+            Err(err) => self.raise(format!("Could not apply that change: {err}")),
+        }
+    }
+
+    /// Deletes a conversation and its transcript. Confirmed in the UI first:
+    /// this is the one irreversible thing the app can do to a user's data.
+    fn delete_conversation(&mut self, id: ConversationId) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let outcome = {
+            let guard = match store.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.delete_conversation(id)
+        };
+        match outcome {
+            Ok(()) => {
+                self.history_segments.remove(&id);
+                if matches!(self.main_view, MainView::History(open) if open == id) {
+                    self.main_view = MainView::Live;
+                }
+                self.reload_library();
+            }
+            Err(err) => self.raise(format!("Could not delete the conversation: {err}")),
+        }
+    }
+
+    fn ask_to_delete(&mut self, id: ConversationId) {
+        self.pending_delete = Some(id);
+    }
+
+    /// The confirmation for the one irreversible action in the app. Shown as a
+    /// modal window rather than an inline button so a mis-click on a list that
+    /// has just reordered cannot destroy a transcript.
+    fn delete_confirmation(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.pending_delete else {
+            return;
+        };
+        let title = self
+            .conversations
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.title.clone())
+            .unwrap_or_else(|| id.to_string());
+
+        let mut decision = None;
+        egui::Window::new(t("Delete conversation"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!("{} \u{201c}{title}\u{201d}?", t("Permanently delete")));
+                ui.label(
+                    egui::RichText::new(t("The transcript cannot be recovered."))
+                        .small()
+                        .color(self.palette.secondary),
+                );
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button(t("Delete")).clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.button(t("Cancel")).clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+
+        match decision {
+            Some(true) => {
+                self.pending_delete = None;
+                self.delete_conversation(id);
+            }
+            Some(false) => self.pending_delete = None,
+            None => {}
+        }
+    }
+
+    /// Imports past voxtype meetings into the library.
+    ///
+    /// Blocking: an import reads and re-exports each meeting through the
+    /// voxtype CLI, which is fast for a handful and is a deliberate,
+    /// user-initiated action rather than something happening in the
+    /// background. The result is reported as a banner.
+    fn import_voxtype_meetings(&mut self) {
+        let Some(store) = self.store.clone() else {
+            self.raise("Importing needs the conversation library, which could not be opened.");
+            return;
+        };
+        let Some(binary) = self.voxtype.clone() else {
+            self.raise("voxtype was not found, so there is nothing to import from.");
+            return;
+        };
+
+        match crate::env::import_meetings(&store, &binary) {
+            Ok(outcome) => {
+                self.reload_library();
+                let mut message = format!(
+                    "Imported {} meeting(s), skipped {}.",
+                    outcome.added, outcome.skipped
+                );
+                if !outcome.failed.is_empty() {
+                    message.push_str(&format!(
+                        " {} could not be imported: {}",
+                        outcome.failed.len(),
+                        outcome.failed.join("; ")
+                    ));
+                }
+                self.raise(message);
+            }
+            Err(err) => self.raise(err),
         }
     }
 

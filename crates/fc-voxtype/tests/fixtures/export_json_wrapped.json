@@ -1,8 +1,0 @@
-{
-  "title": "Standup",
-  "started_at": "2026-10-07T14:30:22Z",
-  "segments": [
-    {"start_ms": 0, "end_ms": 1800, "text": "Morning everyone.", "speaker_id": "SPEAKER_00", "speaker_label": "Alice", "confidence": 0.97},
-    {"start_ms": 1800, "end_ms": 4200, "text": "", "speaker_id": "SPEAKER_01", "speaker_label": "Bob", "confidence": 0.4}
-  ]
-}

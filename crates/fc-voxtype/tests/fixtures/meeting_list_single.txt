@@ -1,10 +1,9 @@
 Recent Meetings
 ===============
 
-ID:       20261007-143022
-Title:    Standup
-Started:  2026-10-07 14:30:22
-Duration: 12m34s
-Segments: 42
-Speakers: 3
-Status:   completed
+Standup
+  ID: 3f29c5e1-8b77-4b1a-9c3b-1a2b3c4d5e6f
+  Date: 2026-10-07 14:30
+  Duration: 12m 34s
+  Status: Completed
+

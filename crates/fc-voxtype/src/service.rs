@@ -53,7 +53,9 @@ pub fn parse_show(text: &str) -> ServiceStatus {
     let mut sub_state = String::new();
     let mut unit_file_state = String::new();
     for line in text.lines() {
-        let Some((key, value)) = line.split_once('=') else { continue };
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
         match key {
             "ActiveState" => active_state = value.to_string(),
             "SubState" => sub_state = value.to_string(),
@@ -74,7 +76,13 @@ pub fn parse_show(text: &str) -> ServiceStatus {
 
 fn show(unit: &str) -> Result<String> {
     let output = Command::new("systemctl")
-        .args(["--user", "show", "-p", "ActiveState,SubState,UnitFileState", unit])
+        .args([
+            "--user",
+            "show",
+            "-p",
+            "ActiveState,SubState,UnitFileState",
+            unit,
+        ])
         .output()?;
     if !output.status.success() {
         return Err(VoxtypeError::CommandFailed {
@@ -98,7 +106,9 @@ pub fn is_active() -> Result<bool> {
 }
 
 fn action(verb: &str) -> Result<()> {
-    let output = Command::new("systemctl").args(["--user", verb, UNIT]).output()?;
+    let output = Command::new("systemctl")
+        .args(["--user", verb, UNIT])
+        .output()?;
     if output.status.success() {
         Ok(())
     } else {

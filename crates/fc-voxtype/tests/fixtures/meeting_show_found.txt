@@ -1,9 +1,17 @@
-ID:       20261007-143022
-Title:    Standup
-Started:  2026-10-07 14:30:22
-Duration: 12m34s
-Segments: 42
-Speakers: 3
-Status:   completed
+Standup
+=======
 
-Use 'voxtype meeting export 20261007-143022' to export the transcript.
+ID:       3f29c5e1-8b77-4b1a-9c3b-1a2b3c4d5e6f
+Started:  2026-10-07 14:30 UTC
+Ended:    2026-10-07 14:42 UTC
+Duration: 12m 34s
+Status:   Completed
+Chunks:   42
+
+Transcript:
+-----------
+Segments: 42
+Words:    312
+Speakers: Alice, Bob, Carol
+
+Use 'voxtype meeting export 3f29c5e1-8b77-4b1a-9c3b-1a2b3c4d5e6f' to export the transcript.

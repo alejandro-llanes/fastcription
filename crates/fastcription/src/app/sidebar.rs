@@ -1,13 +1,20 @@
 //! Groups, a tag filter, a search box, and the conversation list. Selecting a
 //! row switches the main pane to the history view.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use egui::RichText;
-use fc_core::{GroupId, TagId};
+use fc_core::{ConversationId, GroupId, TagId};
 
-use crate::app::{App, MainView};
+use crate::app::{App, LabelEdit, MainView};
 use crate::i18n::t;
+
+/// Which label an inline rename is editing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Renaming {
+    Group(GroupId),
+    Tag(TagId),
+}
 
 #[derive(Default)]
 pub struct State {
@@ -19,6 +26,19 @@ pub struct State {
     /// and both features are dead on a fresh library.
     pub new_group: String,
     pub new_tag: String,
+    /// Transcript matches for the current search, keyed by conversation, with
+    /// the excerpt that matched. `None` means no search is active — distinct
+    /// from an empty map, which means a search that found nothing.
+    ///
+    /// Cached rather than queried per frame: the search runs against SQLite and
+    /// egui repaints many times a second.
+    /// The group or tag currently being renamed, with its draft name. One at
+    /// a time: an inline editor is clearer than a text field inside a context
+    /// menu, which closes the moment it loses focus.
+    pub renaming: Option<(Renaming, String)>,
+    pub matches: Option<HashMap<ConversationId, String>>,
+    /// The query `matches` was computed for, so a repaint does not re-run it.
+    pub searched_for: String,
 }
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
@@ -40,9 +60,21 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         }
         for group in app.groups.clone() {
             let selected = app.sidebar.group_filter == Some(group.id);
-            if ui.selectable_label(selected, &group.name).clicked() {
+            let chip = ui.selectable_label(selected, &group.name);
+            if chip.clicked() {
                 app.sidebar.group_filter = if selected { None } else { Some(group.id) };
             }
+            chip.context_menu(|ui| {
+                if ui.button(t("Rename")).clicked() {
+                    app.sidebar.renaming =
+                        Some((Renaming::Group(group.id), group.name.clone()));
+                    ui.close();
+                }
+                if ui.button(t("Delete group")).clicked() {
+                    app.edit_label(LabelEdit::DeleteGroup(group.id));
+                    ui.close();
+                }
+            });
         }
     });
     if let Some(name) = creator(ui, &mut app.sidebar.new_group, t("New group…"), "new-group") {
@@ -63,20 +95,63 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 .as_deref()
                 .and_then(fastframe_theme::parse_color)
                 .unwrap_or(app.palette.accent);
-            if ui
-                .selectable_label(selected, RichText::new(&tag.name).color(color))
-                .clicked()
-            {
+            let chip = ui.selectable_label(selected, RichText::new(&tag.name).color(color));
+            if chip.clicked() {
                 if selected {
                     app.sidebar.tag_filter.remove(&tag.id);
                 } else {
                     app.sidebar.tag_filter.insert(tag.id);
                 }
             }
+            chip.context_menu(|ui| {
+                if ui.button(t("Rename")).clicked() {
+                    app.sidebar.renaming = Some((Renaming::Tag(tag.id), tag.name.clone()));
+                    ui.close();
+                }
+                if ui.button(t("Delete tag")).clicked() {
+                    app.edit_label(LabelEdit::DeleteTag(tag.id));
+                    ui.close();
+                }
+            });
         }
     });
     if let Some(name) = creator(ui, &mut app.sidebar.new_tag, t("New tag…"), "new-tag") {
         app.create_tag(&name);
+    }
+
+    if let Some((target, mut draft)) = app.sidebar.renaming.clone() {
+        ui.add_space(4.0);
+        let mut finish = None;
+        ui.horizontal(|ui| {
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut draft)
+                    .id_salt("rename-label")
+                    .desired_width(130.0),
+            );
+            field.request_focus();
+            let committed =
+                field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if ui.small_button(t("Save")).clicked() || committed {
+                finish = Some(true);
+            }
+            if ui.small_button(t("Cancel")).clicked() {
+                finish = Some(false);
+            }
+        });
+        match finish {
+            Some(true) => {
+                let name = draft.trim().to_owned();
+                app.sidebar.renaming = None;
+                if !name.is_empty() {
+                    app.edit_label(match target {
+                        Renaming::Group(id) => LabelEdit::RenameGroup(id, name),
+                        Renaming::Tag(id) => LabelEdit::RenameTag(id, name),
+                    });
+                }
+            }
+            Some(false) => app.sidebar.renaming = None,
+            None => app.sidebar.renaming = Some((target, draft)),
+        }
     }
 
     ui.add_space(8.0);
@@ -87,6 +162,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             let search = app.sidebar.search.to_lowercase();
+            let mut shown = 0usize;
             for conversation in app.conversations.clone() {
                 if let Some(filter) = app.sidebar.group_filter {
                     if conversation.group != Some(filter) {
@@ -103,10 +179,26 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                         continue;
                     }
                 }
-                if !search.is_empty() && !conversation.title.to_lowercase().contains(&search) {
-                    continue;
+                if !search.is_empty() {
+                    let in_title = conversation.title.to_lowercase().contains(&search);
+                    let in_transcript = app
+                        .sidebar
+                        .matches
+                        .as_ref()
+                        .is_some_and(|hits| hits.contains_key(&conversation.id));
+                    if !in_title && !in_transcript {
+                        continue;
+                    }
                 }
                 row(app, ui, &conversation);
+                shown += 1;
+            }
+            if shown == 0 {
+                ui.weak(if search.is_empty() {
+                    t("No conversations yet. Choose a source and press Start.")
+                } else {
+                    t("Nothing matches that search.")
+                });
             }
         });
 }
@@ -117,6 +209,21 @@ fn row(app: &mut App, ui: &mut egui::Ui, conversation: &fc_core::Conversation) {
         selected,
         format!("{}\n{}", conversation.title, conversation.source.label()),
     );
+    // The excerpt is why this row matched; without it a transcript hit looks
+    // like an unexplained result.
+    if let Some(excerpt) = app
+        .sidebar
+        .matches
+        .as_ref()
+        .and_then(|hits| hits.get(&conversation.id))
+    {
+        ui.label(
+            RichText::new(excerpt)
+                .small()
+                .italics()
+                .color(app.palette.secondary),
+        );
+    }
     if response.clicked() {
         app.open_history(conversation.id);
     }

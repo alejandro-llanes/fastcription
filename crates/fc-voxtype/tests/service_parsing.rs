@@ -53,7 +53,8 @@ fn inactive_but_installed() {
 
 #[test]
 fn tolerates_reordered_and_extra_lines() {
-    let text = "SubState=running\nSomeOtherProperty=whatever\nActiveState=active\nUnitFileState=enabled\n";
+    let text =
+        "SubState=running\nSomeOtherProperty=whatever\nActiveState=active\nUnitFileState=enabled\n";
     let status = parse_show(text);
     assert!(status.is_active());
 }

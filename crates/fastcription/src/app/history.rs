@@ -21,6 +21,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: ConversationId) {
     ui.horizontal(|ui| {
         ui.heading(t("Conversation"));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .button(t("Delete"))
+                .on_hover_text(t("Deletes this conversation and its transcript."))
+                .clicked()
+            {
+                app.ask_to_delete(conversation.id);
+            }
             crate::app::export_ui::button(app, ui, &conversation);
         });
     });

@@ -101,7 +101,9 @@ pub fn parse_engines(text: &str) -> Result<Vec<EngineEntry>> {
             continue; // blank line, or an instructional footer like "Switch with: ..."
         }
         let tokens: Vec<&str> = line.split_whitespace().collect();
-        let Some(&first) = tokens.first() else { continue };
+        let Some(&first) = tokens.first() else {
+            continue;
+        };
         let (compiled, name) = if first == "compiled" {
             (true, tokens.get(1))
         } else {
@@ -157,9 +159,13 @@ pub fn parse_models(text: &str) -> Result<Vec<ModelEntry>> {
             current_engine = line.split_whitespace().next().map(str::to_string);
             continue;
         }
-        let Some(engine) = current_engine.clone() else { continue };
+        let Some(engine) = current_engine.clone() else {
+            continue;
+        };
         let tokens: Vec<&str> = line.split_whitespace().collect();
-        let Some(&first) = tokens.first() else { continue };
+        let Some(&first) = tokens.first() else {
+            continue;
+        };
         let (installed, name) = if first == "installed" {
             (true, tokens.get(1))
         } else {
@@ -219,7 +225,9 @@ pub struct AccelInfo {
 pub fn parse_accel(text: &str) -> AccelInfo {
     let mut info = AccelInfo::default();
     for line in text.lines() {
-        let Some((key, value)) = line.split_once(':') else { continue };
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
         let value = value.trim();
         if value.is_empty() {
             continue;

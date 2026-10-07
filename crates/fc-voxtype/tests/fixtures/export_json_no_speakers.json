@@ -1,0 +1,33 @@
+{
+  "metadata": {
+    "id": "7a1bdf3e-2222-4b1a-9c3b-000000000001",
+    "title": null,
+    "startedAt": "2026-10-07T09:00:00+00:00",
+    "status": "active",
+    "chunkCount": 1
+  },
+  "transcript": {
+    "segments": [
+      {
+        "id": 0,
+        "startMs": 0,
+        "endMs": 1800,
+        "text": "Morning everyone.",
+        "source": "microphone",
+        "chunkId": 0
+      },
+      {
+        "id": 1,
+        "startMs": 1800,
+        "endMs": 4200,
+        "text": "",
+        "source": "loopback",
+        "chunkId": 0
+      }
+    ],
+    "totalChunks": 1,
+    "wordCount": 2,
+    "durationMs": 4200,
+    "speakers": []
+  }
+}

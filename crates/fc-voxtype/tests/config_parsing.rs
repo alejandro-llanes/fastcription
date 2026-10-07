@@ -61,7 +61,10 @@ fn meeting_section_when_present() {
     let meeting = d.meeting.expect("meeting section present");
     assert_eq!(meeting.enabled, Some(true));
     assert_eq!(meeting.chunk_duration_secs, Some(45));
-    assert_eq!(meeting.storage_path.as_deref(), Some("/home/user/voxtype-meetings"));
+    assert_eq!(
+        meeting.storage_path.as_deref(),
+        Some("/home/user/voxtype-meetings")
+    );
     assert_eq!(meeting.mic_device.as_deref(), Some("default"));
     assert_eq!(meeting.loopback_device.as_deref(), Some("disabled"));
     assert_eq!(meeting.diarization_backend.as_deref(), Some("ml"));
