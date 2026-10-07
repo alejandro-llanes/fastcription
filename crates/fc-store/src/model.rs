@@ -30,6 +30,9 @@ pub struct ConversationFilter {
     pub tag: Option<TagId>,
     /// Plain-text match against the conversation title. Unlike `search`, this
     /// is a `LIKE` match on metadata, not an FTS lookup over segment text.
+    /// Treated as literal text, not a pattern: `%` and `_` in here match
+    /// themselves, not "anything"/"any one character" -- `list_conversations`
+    /// escapes them before building the `LIKE` pattern.
     pub query: Option<String>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,

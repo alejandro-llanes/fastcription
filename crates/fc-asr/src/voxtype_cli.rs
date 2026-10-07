@@ -147,6 +147,17 @@ fn write_wav(path: &Path, pcm: &[f32], sample_rate: u32) -> Result<(), AsrError>
 /// Runs `child` to completion, reading stdout/stderr on background threads so
 /// a chatty process can't deadlock the pipe, and killing it if `timeout`
 /// elapses first.
+///
+/// On timeout the reader threads are deliberately **not** joined. `child.kill()`
+/// only terminates the direct child; if it had forked a descendant that
+/// inherited our stdout/stderr pipes (the ordinary case for e.g. a wrapper
+/// shell script: the shell itself dies, but a command it ran keeps running
+/// and keeps the pipe's write end open), the pipe never sees EOF until that
+/// orphan exits on its own -- which may be long after `timeout`, or never.
+/// Joining here would silently turn a bounded timeout into an unbounded hang,
+/// which is worse than the thing it's meant to prevent. The reader threads
+/// are abandoned instead: each one still exits and is cleaned up by the OS
+/// the moment its pipe actually closes, we just don't wait around for it.
 fn run_with_timeout(
     mut child: std::process::Child,
     timeout: Duration,
@@ -176,8 +187,7 @@ fn run_with_timeout(
                 if start.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let _ = stdout_handle.join();
-                    let _ = stderr_handle.join();
+                    // Not joined -- see the doc comment above.
                     return Err(AsrError::Timeout { timeout });
                 }
                 std::thread::sleep(Duration::from_millis(20));
@@ -330,7 +340,9 @@ impl Transcriber for VoxtypeCli {
         // works, while `voxtype -q transcribe f.wav --model base.en` exits 2
         // with a usage error. Verified against voxtype 1.0.1 — hence the
         // ordering here and the regression test below.
-        cmd.args(self.global_args()).arg("transcribe").arg(tmp.path());
+        cmd.args(self.global_args())
+            .arg("transcribe")
+            .arg(tmp.path());
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -501,6 +513,48 @@ hi\n";
     }
 
     #[test]
+    fn blank_line_in_the_middle_of_the_transcript_is_preserved() {
+        // A transcript that itself contains a blank line (e.g. a pause
+        // between two spoken paragraphs) must not be mistaken for a second
+        // banner-separator or otherwise truncated -- only the single blank
+        // line right after the banner is the separator.
+        let stdout = "Loading audio file: \"sp.wav\"\n\
+Audio format: 16000 Hz, 1 channel(s), Int\n\
+Processing 1 samples (0.00s)...\n\
+\n\
+First paragraph.\n\
+\n\
+Second paragraph after a pause.\n";
+        let text = parse_transcript_output(stdout).expect("should parse");
+        assert_eq!(text, "First paragraph.\n\nSecond paragraph after a pause.");
+    }
+
+    #[test]
+    fn leading_blank_line_in_the_transcript_itself_is_trimmed() {
+        // Banner separator consumed, then the transcript's own first line
+        // happens to be blank before the real text starts.
+        let stdout = "Loading audio file: \"sp.wav\"\n\
+Audio format: 16000 Hz, 1 channel(s), Int\n\
+Processing 1 samples (0.00s)...\n\
+\n\
+\n\
+Real text starts on the second line.\n";
+        let text = parse_transcript_output(stdout).expect("should parse");
+        assert_eq!(text, "Real text starts on the second line.");
+    }
+
+    #[test]
+    fn crlf_line_endings_parse_the_same_as_lf() {
+        let stdout = "Loading audio file: \"sp.wav\"\r\n\
+Audio format: 16000 Hz, 1 channel(s), Int\r\n\
+Processing 110924 samples (6.93s)...\r\n\
+\r\n\
+The transcript line.\r\n";
+        let text = parse_transcript_output(stdout).expect("should parse CRLF");
+        assert_eq!(text, "The transcript line.");
+    }
+
+    #[test]
     fn wrong_second_line_is_an_error() {
         let stdout = "Loading audio file: \"sp.wav\"\n\
 Not the format line\n\
@@ -536,6 +590,44 @@ hi\n";
         assert_eq!(info.engine, "whisper");
         assert_eq!(info.model, "base.en");
         assert_eq!(info.language, "default");
+    }
+
+    /// Covers the timeout path end to end: a child that hangs well past its
+    /// budget must be killed, reaped (no zombie left behind), and reported as
+    /// `AsrError::Timeout`, all without the caller waiting out the child's
+    /// actual (much longer) runtime. Before this test existed, nothing in the
+    /// suite exercised `run_with_timeout`'s timeout branch at all.
+    #[test]
+    fn timeout_kills_and_reaps_a_hanging_child_promptly() {
+        use std::fs;
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("hang.sh");
+        fs::write(&script, "#!/bin/sh\nsleep 30\n").expect("write fake binary");
+        let mut perms = fs::metadata(&script).expect("stat script").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).expect("chmod script");
+
+        let cli = VoxtypeCli::new()
+            .with_binary(script.to_str().expect("utf8 path"))
+            .with_timeout(Duration::from_millis(200));
+
+        let start = Instant::now();
+        let err = cli
+            .transcribe(&[0.1, -0.1, 0.2, -0.2], 16_000)
+            .expect_err("a hanging child must be reported as a timeout");
+        let elapsed = start.elapsed();
+
+        assert!(matches!(err, AsrError::Timeout { .. }), "got {err:?}");
+        // The child sleeps for 30s; if it were not killed and reaped
+        // promptly, this call would take that long (or hang forever waiting
+        // on a zombie). Bounding well under that proves both happened.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "transcribe() took {elapsed:?}; the timed-out child was not killed/reaped promptly"
+        );
     }
 
     /// Runs the real `voxtype` CLI, which this crate otherwise never touches
@@ -649,5 +741,4 @@ hi\n";
     fn default_invocation_passes_only_quiet() {
         assert_eq!(VoxtypeCli::new().global_args(), vec!["-q"]);
     }
-
 }

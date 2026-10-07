@@ -18,6 +18,12 @@ pub struct State {
     pub language: String,
     pub chunk_target_secs: f32,
     pub chunk_max_secs: f32,
+    /// Asks voxtype to translate non-English speech into English. This is
+    /// voxtype's own `--translate`, which replaces the transcript text; it is
+    /// not the reserved per-segment translation slot.
+    pub translate: bool,
+    /// CPU threads for inference. Zero leaves the choice to voxtype.
+    pub threads: u32,
 }
 
 impl Default for State {
@@ -28,6 +34,8 @@ impl Default for State {
             language: "en".to_owned(),
             chunk_target_secs: 7.0,
             chunk_max_secs: 15.0,
+            translate: false,
+            threads: 0,
         }
     }
 }
@@ -67,6 +75,26 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         .on_hover_text(t(
             "A language code such as en or es, a comma-separated list, or auto.",
         ));
+    });
+    ui.checkbox(
+        &mut app.settings.translate,
+        t("Translate non-English speech into English"),
+    )
+    .on_hover_text(t(
+        "voxtype transcribes the speech directly into English. Only useful when \
+         the conversation is not already in English.",
+    ));
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::Slider::new(&mut app.settings.threads, 0..=32).text(t("inference threads")),
+        );
+        if app.settings.threads == 0 {
+            ui.label(
+                egui::RichText::new(t("(voxtype decides)"))
+                    .small()
+                    .color(app.palette.secondary),
+            );
+        }
     });
     if let Some(backend) = app.engine.backend.as_deref() {
         ui.label(

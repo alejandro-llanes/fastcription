@@ -1,6 +1,4 @@
-use fc_core::{
-    AudioSource, ConversationStatus, EngineInfo, Segment, SourceKind, Track,
-};
+use fc_core::{AudioSource, ConversationStatus, EngineInfo, Segment, SourceKind, Track};
 use tempfile::TempDir;
 
 use crate::{ConversationFilter, NewConversation, Store, StoreError};
@@ -85,7 +83,9 @@ fn reopen_is_idempotent() {
         let id = store
             .create_conversation(&sample_conversation("first open", 1000))
             .unwrap();
-        store.finish_conversation(id, 2000, ConversationStatus::Completed).unwrap();
+        store
+            .finish_conversation(id, 2000, ConversationStatus::Completed)
+            .unwrap();
     }
     // Reopening must not error, must not re-run migrations destructively, and
     // must still see the row written before the close.
@@ -95,7 +95,9 @@ fn reopen_is_idempotent() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(version, 1);
-    let convs = store.list_conversations(&ConversationFilter::default()).unwrap();
+    let convs = store
+        .list_conversations(&ConversationFilter::default())
+        .unwrap();
     assert_eq!(convs.len(), 1);
     assert_eq!(convs[0].title, "first open");
 }
@@ -161,7 +163,9 @@ fn reap_active_marks_interrupted_and_keeps_segments() {
     let finished = store
         .create_conversation(&sample_conversation("finished normally", 0))
         .unwrap();
-    store.finish_conversation(finished, 100, ConversationStatus::Completed).unwrap();
+    store
+        .finish_conversation(finished, 100, ConversationStatus::Completed)
+        .unwrap();
     store
         .append_segments(active, &[sample_segment(1, 0, 100, "still here")])
         .unwrap();
@@ -299,8 +303,110 @@ fn list_conversations_filters_by_group_tag_and_query() {
     assert_eq!(by_query.len(), 1);
     assert_eq!(by_query[0].id, ungrouped_id);
 
-    let all = store.list_conversations(&ConversationFilter::default()).unwrap();
+    let all = store
+        .list_conversations(&ConversationFilter::default())
+        .unwrap();
     assert_eq!(all.len(), 2);
+}
+
+/// `%` and `_` are SQLite `LIKE` wildcards, but `query` is free-form user
+/// input, not a pattern the user authored on purpose. Searching for a title
+/// containing a literal `%` must not also match titles that merely contain
+/// the text around it, and a lone `_` must not match every single-character
+/// gap.
+#[test]
+fn list_conversations_query_treats_like_wildcards_as_literal_text() {
+    let (_dir, store) = open_temp();
+    store
+        .create_conversation(&sample_conversation("Q3 roadmap", 10))
+        .unwrap();
+    store
+        .create_conversation(&sample_conversation("100% done", 20))
+        .unwrap();
+    store
+        .create_conversation(&sample_conversation("100X done", 30))
+        .unwrap();
+
+    // A literal "%" must match only the title that actually contains one,
+    // not every title (which `LIKE '%100%'` would do if "%" were treated as
+    // a wildcard instead of literal text).
+    let hits = store
+        .list_conversations(&ConversationFilter {
+            query: Some("100%".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].title, "100% done");
+
+    // A literal "_" must not match "100X done" as if "_" meant "any one
+    // character".
+    let hits = store
+        .list_conversations(&ConversationFilter {
+            query: Some("100_done".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(hits.is_empty());
+}
+
+/// Deleting a conversation cascades to `segments`, but `segments_fts` is a
+/// separate external-content index kept in sync by triggers (schema.rs).
+/// This proves the cascade delete actually fires `segments_fts_ad` for each
+/// removed row, not just that the `segments` rows themselves are gone.
+#[test]
+fn deleting_a_conversation_removes_its_text_from_search_too() {
+    let (_dir, store) = open_temp();
+    let id = store
+        .create_conversation(&sample_conversation("searchable", 0))
+        .unwrap();
+    store
+        .append_segments(
+            id,
+            &[sample_segment(1, 0, 1000, "unforgettable giraffe fact")],
+        )
+        .unwrap();
+    assert_eq!(store.search("giraffe", 10).unwrap().len(), 1);
+
+    store.delete_conversation(id).unwrap();
+
+    assert_eq!(
+        store.search("giraffe", 10).unwrap().len(),
+        0,
+        "deleted conversation's text must not still be findable in FTS"
+    );
+}
+
+/// A corrupted or hand-edited row with a negative `start_ms`/`seq` must not
+/// silently wrap to a huge `u64` when read back (`i64::MIN as u64` would be
+/// the largest possible value, which would sort last and misrender any
+/// duration/timestamp built from it) -- it should be reported as the
+/// corruption it is and clamped to 0.
+#[test]
+fn negative_stored_values_are_clamped_not_wrapped() {
+    let (_dir, store) = open_temp();
+    let id = store
+        .create_conversation(&sample_conversation("corrupted row", 0))
+        .unwrap();
+    // Bypass the normal u64-typed API to simulate a row written by something
+    // other than `append_segments` (or just bit-rot) with a negative value
+    // in a column the domain type treats as unsigned.
+    store
+        .conn
+        .execute(
+            "INSERT INTO segments (conversation_id, seq, track, start_ms, end_ms, text)
+             VALUES (?1, -1, 'selected', -5, 100, 'ok')",
+            rusqlite::params![id.get()],
+        )
+        .unwrap();
+
+    let loaded = store.load_segments(id).unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].seq, 0, "negative seq must clamp to 0, not wrap");
+    assert_eq!(
+        loaded[0].start_ms, 0,
+        "negative start_ms must clamp to 0, not wrap to near u64::MAX"
+    );
 }
 
 #[test]
@@ -366,10 +472,14 @@ fn segments_load_ordered_by_start_then_seq() {
 #[test]
 fn appending_the_same_segment_twice_is_rejected() {
     let (_dir, store) = open_temp();
-    let id = store.create_conversation(&sample_conversation("dup", 1_700_000_000_000)).unwrap();
+    let id = store
+        .create_conversation(&sample_conversation("dup", 1_700_000_000_000))
+        .unwrap();
     let seg = sample_segment(0, 0, 1000, "once only");
 
-    store.append_segments(id, std::slice::from_ref(&seg)).unwrap();
+    store
+        .append_segments(id, std::slice::from_ref(&seg))
+        .unwrap();
     let err = store.append_segments(id, &[seg]).unwrap_err();
     assert!(
         matches!(err, StoreError::Sqlite(_)),

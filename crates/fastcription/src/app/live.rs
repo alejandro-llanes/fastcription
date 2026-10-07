@@ -11,6 +11,15 @@ use fc_core::{Pressure, Segment, Track};
 use crate::app::App;
 use crate::i18n::t;
 
+/// How many of the most recent segments the live view draws.
+///
+/// egui lays out every child of a scroll area each frame, and wrapped text
+/// cannot use the uniform-row fast path. A three-hour meeting produces well
+/// over a thousand segments, which would cost real frame time for lines nobody
+/// is looking at — the live view is for following along, and the whole
+/// transcript is a click away in the conversation's history.
+const LIVE_WINDOW: usize = 400;
+
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.heading(t("Live transcript"));
@@ -34,7 +43,15 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 ui.weak(t("Nothing transcribed yet. Press Start to begin."));
                 return;
             }
-            for segment in &app.segments {
+            let hidden = app.segments.len().saturating_sub(LIVE_WINDOW);
+            if hidden > 0 {
+                ui.weak(format!(
+                    "{hidden} {}",
+                    t("earlier lines — open this conversation in the sidebar to read them all")
+                ));
+                ui.add_space(4.0);
+            }
+            for segment in app.segments.iter().skip(hidden) {
                 row(ui, &app.palette, segment);
             }
             let mut pending: Vec<&Segment> = app.provisional.values().collect();
@@ -82,7 +99,30 @@ fn row(ui: &mut egui::Ui, palette: &crate::theme::Palette, segment: &Segment) {
     ui.add_space(4.0);
 }
 
+/// `mm:ss`, growing to `h:mm:ss` past an hour rather than counting minutes
+/// into three digits.
 fn timestamp(start_ms: u64) -> String {
     let total_secs = start_ms / 1000;
-    format!("{:02}:{:02}", total_secs / 60, total_secs % 60)
+    let (hours, minutes, seconds) = (total_secs / 3600, (total_secs % 3600) / 60, total_secs % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::timestamp;
+
+    #[test]
+    fn timestamps_grow_an_hour_field_instead_of_counting_to_ninety_minutes() {
+        assert_eq!(timestamp(0), "00:00");
+        assert_eq!(timestamp(9_000), "00:09");
+        assert_eq!(timestamp(61_000), "01:01");
+        assert_eq!(timestamp(3_599_000), "59:59");
+        assert_eq!(timestamp(3_600_000), "1:00:00");
+        assert_eq!(timestamp(5_400_000), "1:30:00");
+        assert_eq!(timestamp(36_000_000), "10:00:00");
+    }
 }

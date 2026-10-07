@@ -93,7 +93,10 @@ impl Store {
             ],
         )?;
         if changed > 0 {
-            tracing::warn!(count = changed, "reaped conversations left active by a dead process");
+            tracing::warn!(
+                count = changed,
+                "reaped conversations left active by a dead process"
+            );
         }
         Ok(changed)
     }
@@ -108,9 +111,18 @@ impl Store {
 
     /// Filtered, paginated list of conversations for the sidebar. Tags for the
     /// whole page are fetched in one follow-up query, not one per row.
-    pub fn list_conversations(&self, filter: &ConversationFilter) -> Result<Vec<ConversationSummary>> {
+    pub fn list_conversations(
+        &self,
+        filter: &ConversationFilter,
+    ) -> Result<Vec<ConversationSummary>> {
         let limit: i64 = filter.limit.map(i64::from).unwrap_or(-1);
         let offset: i64 = filter.offset.map(i64::from).unwrap_or(0);
+        // `query` is free text a user typed into a search box, not a LIKE
+        // pattern they authored on purpose: escape SQLite's own wildcards so
+        // searching for a title that happens to contain a literal `%` or `_`
+        // matches that literal text instead of matching "anything"/"any one
+        // character" there (see `ConversationFilter::query`'s doc comment).
+        let like_query = filter.query.as_deref().map(escape_like_pattern);
 
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.title, c.started_at, c.ended_at,
@@ -120,7 +132,7 @@ impl Store {
              FROM conversations c
              LEFT JOIN groups g ON g.id = c.group_id
              WHERE (?1 IS NULL OR c.group_id = ?1)
-               AND (?2 IS NULL OR c.title LIKE '%' || ?2 || '%')
+               AND (?2 IS NULL OR c.title LIKE '%' || ?2 || '%' ESCAPE '\\')
                AND (
                     ?3 IS NULL OR EXISTS (
                         SELECT 1 FROM conversation_tags ct
@@ -134,7 +146,7 @@ impl Store {
         let rows = stmt.query_map(
             params![
                 filter.group.map(GroupId::get),
-                filter.query,
+                like_query,
                 filter.tag.map(TagId::get),
                 limit,
                 offset,
@@ -218,6 +230,20 @@ impl Store {
         }
         Ok(map)
     }
+}
+
+/// Escapes `\`, `%` and `_` so `input` matches only its literal text when
+/// substituted into a `LIKE ... ESCAPE '\'` pattern, regardless of which of
+/// SQLite's own wildcard characters it happens to contain.
+fn escape_like_pattern(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for c in input.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
 }
 
 fn require_row(changed: usize, msg: impl FnOnce() -> String) -> Result<()> {

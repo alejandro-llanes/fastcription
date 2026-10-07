@@ -6,7 +6,6 @@ use fc_core::{Group, GroupId, UnixMillis};
 use rusqlite::params;
 
 use crate::error::Result;
-use crate::queries::conversations::not_found_or;
 use crate::Store;
 
 impl Store {
@@ -43,16 +42,6 @@ impl Store {
             )));
         }
         Ok(())
-    }
-
-    pub fn get_group(&self, id: GroupId) -> Result<Group> {
-        self.conn
-            .query_row(
-                "SELECT id, name, created_at FROM groups WHERE id = ?1",
-                params![id.get()],
-                row_to_group,
-            )
-            .map_err(|e| not_found_or(e, || format!("group {id} not found")))
     }
 
     pub fn list_groups(&self) -> Result<Vec<Group>> {

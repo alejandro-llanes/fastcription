@@ -57,7 +57,11 @@ pub struct AudioSource {
 
 impl AudioSource {
     /// A named source: a device or a sink monitor.
-    pub fn named(kind: SourceKind, name: impl Into<String>, description: impl Into<String>) -> Self {
+    pub fn named(
+        kind: SourceKind,
+        name: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
         Self {
             kind,
             name: name.into(),
@@ -103,9 +107,7 @@ impl AudioSource {
                     Some(vec!["--device".into(), self.name.clone()])
                 }
             }
-            SourceKind::SinkInput => self
-                .index
-                .map(|i| vec![format!("--monitor-stream={i}")]),
+            SourceKind::SinkInput => self.index.map(|i| vec![format!("--monitor-stream={i}")]),
         }
     }
 

@@ -547,6 +547,8 @@ impl App {
         let engine = self.settings.engine.clone();
         let model = self.settings.model.clone();
         let language = self.settings.language.clone();
+        let threads = self.settings.threads;
+        let translate = self.settings.translate;
         Box::new(move |_track| {
             let mut cli = fc_asr::VoxtypeCli::new();
             if let Some(path) = &binary {
@@ -560,6 +562,12 @@ impl App {
             }
             if !language.trim().is_empty() {
                 cli = cli.with_language(language.clone());
+            }
+            if threads > 0 {
+                cli = cli.with_threads(threads);
+            }
+            if translate {
+                cli = cli.with_translate(true);
             }
             Box::new(cli)
         })

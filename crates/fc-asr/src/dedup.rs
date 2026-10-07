@@ -21,11 +21,25 @@ fn normalize_word(w: &str) -> String {
         .to_lowercase()
 }
 
-/// How far back dedup will look for a match. 0.5 s of speech is a handful of
-/// words at most; this is a generous ceiling so a long genuine overlap (e.g.
-/// backpressure having grown the chunk length) is still caught, while keeping
-/// the comparison cheap.
-const MAX_OVERLAP_WORDS: usize = 12;
+/// How far back dedup will look for a match.
+///
+/// The actual duplicated audio between two committed chunks is always
+/// `overlap_ms` (default 0.5 s, fixed regardless of backpressure --
+/// `Segmenter::grow_target` grows the *target* chunk length, never the
+/// overlap). Even very fast speech (~400 words/minute, auctioneer-paced) is
+/// only ~6.7 words/second, so 0.5 s holds at most 3-4 words; 5 leaves a full
+/// word of margin on top of that.
+///
+/// This used to be 12, justified as "a generous ceiling so a long genuine
+/// overlap is still caught". That reasoning doesn't hold up: the overlap
+/// duration never grows, so a match that long was never duplicated audio in
+/// the first place. A length-12 match only fires when a speaker genuinely
+/// repeats a phrase that happens to straddle a chunk boundary (plausible in
+/// real meeting speech: "let's circle back, let's circle back on this point
+/// tomorrow"), and stripping that is exactly the real-word loss this module
+/// says is worse than a visible duplicate. Keeping the ceiling at the size of
+/// the physical overlap is what tells the two cases apart.
+const MAX_OVERLAP_WORDS: usize = 5;
 
 /// Drops the words at the head of `new_text` that duplicate the tail of
 /// `prev_text`, returning the remainder of `new_text` with its original
@@ -123,5 +137,31 @@ mod tests {
         assert_eq!(dedup_overlap("", "hello there"), "hello there");
         assert_eq!(dedup_overlap("hello there", ""), "");
         assert_eq!(dedup_overlap("", ""), "");
+    }
+
+    /// The worst realistic false-strip: a speaker genuinely says the same
+    /// longish phrase twice (for emphasis, or just a verbal habit), and the
+    /// repeat happens to land exactly on a chunk boundary -- the whole first
+    /// instance is the tail of `prev`, the whole second instance is the head
+    /// of `new`. That repeat is far longer than 0.5s of audio could ever
+    /// produce as a genuine overlap duplicate, so it must survive.
+    #[test]
+    fn long_genuine_repeat_at_a_chunk_boundary_is_not_stripped() {
+        let prev = "before that, we need to send the report today";
+        let new = "we need to send the report today and then follow up";
+        // The repeated phrase is 7 words -- longer than MAX_OVERLAP_WORDS --
+        // and none of the length-1..=5 suffix/prefix windows coincide
+        // (the repeat is offset by a full phrase, not by a small overlap),
+        // so nothing should be stripped.
+        assert_eq!(dedup_overlap(prev, new), new);
+    }
+
+    /// The direction that must still work: a short, real overlap (within the
+    /// physical bound of `overlap_ms`) is still caught and stripped.
+    #[test]
+    fn short_genuine_overlap_is_still_stripped_after_the_window_shrank() {
+        let prev = "the migration work is nearly done";
+        let new = "nearly done, we just need sign-off";
+        assert_eq!(dedup_overlap(prev, new), "we just need sign-off");
     }
 }

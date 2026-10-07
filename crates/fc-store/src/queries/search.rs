@@ -6,6 +6,7 @@ use rusqlite::params;
 
 use crate::error::Result;
 use crate::model::SearchHit;
+use crate::queries::segments::nonneg_u64;
 use crate::Store;
 
 impl Store {
@@ -33,8 +34,8 @@ impl Store {
             Ok(SearchHit {
                 conversation_id: ConversationId(row.get(0)?),
                 conversation_title: row.get(1)?,
-                start_ms: row.get::<_, i64>(2)? as u64,
-                end_ms: row.get::<_, i64>(3)? as u64,
+                start_ms: nonneg_u64(row.get(2)?, "segments.start_ms"),
+                end_ms: nonneg_u64(row.get(3)?, "segments.end_ms"),
                 snippet: row.get(4)?,
             })
         })?;

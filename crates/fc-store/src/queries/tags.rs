@@ -18,9 +18,11 @@ impl Store {
             params![name, color],
         )?;
         self.conn
-            .query_row("SELECT id FROM tags WHERE name = ?1", params![name], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT id FROM tags WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
             .map(TagId)
             .map_err(Into::into)
     }
@@ -31,7 +33,9 @@ impl Store {
             params![new_name, id.get()],
         )?;
         if changed == 0 {
-            return Err(crate::error::StoreError::NotFound(format!("tag {id} not found")));
+            return Err(crate::error::StoreError::NotFound(format!(
+                "tag {id} not found"
+            )));
         }
         Ok(())
     }
@@ -43,7 +47,9 @@ impl Store {
             .conn
             .execute("DELETE FROM tags WHERE id = ?1", params![id.get()])?;
         if changed == 0 {
-            return Err(crate::error::StoreError::NotFound(format!("tag {id} not found")));
+            return Err(crate::error::StoreError::NotFound(format!(
+                "tag {id} not found"
+            )));
         }
         Ok(())
     }

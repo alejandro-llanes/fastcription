@@ -150,8 +150,10 @@ crates/
   fc-asr/        segmenter (VAD, chunk boundaries, overlap, backpressure),
                  Transcriber trait, the `voxtype transcribe` adapter, dedup.
   fc-voxtype/    the only crate that knows voxtype exists: CLI probes, read-only
-                 config parse, systemd unit control, runtime-state watcher,
-                 meeting-mode wrappers.
+                 config parse, systemd unit control, runtime-state watcher, and
+                 the two meeting-mode calls import needs (list and export).
+                 The wrappers for driving meeting mode were removed: nothing
+                 delegates to it, and shipping unreachable code is a liability.
   fc-export/     txt / md / json / srt / vtt writers.
   fastcription/  the binary: eframe + fastframe, the session supervisor that
                  joins capture to ASR to store, and the egui views.

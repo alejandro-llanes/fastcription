@@ -320,12 +320,20 @@ impl Segmenter {
     /// already covered by the committed chunk this returns, so emitting it
     /// too would just be duplicate work for the ASR worker on a session
     /// that's already ending.
+    ///
+    /// `flush` is meant to be terminal, but it does not poison the
+    /// `Segmenter`: both buffers' start times are advanced past the audio
+    /// just flushed (there is no overlap tail to carry -- a flush is not a
+    /// cut on live audio, it is "give me everything"), so a `push` after
+    /// `flush` still gets correct, monotonic `start_ms` values rather than
+    /// reusing the timestamp of audio that has already been handed out.
     pub fn flush(&mut self) -> Vec<Chunk> {
         let mut out = Vec::new();
         if !self.main_buf.is_empty() {
             let seq = self.next_seq();
             let start_ms = self.main_buf_start_ms;
             let pcm = std::mem::take(&mut self.main_buf);
+            self.main_buf_start_ms = start_ms + samples_to_ms(pcm.len());
             out.push(Chunk {
                 track: self.track,
                 seq,
@@ -335,6 +343,7 @@ impl Segmenter {
             });
         }
         self.prov_buf.clear();
+        self.prov_buf_start_ms = samples_to_ms(self.total_samples_in as usize);
         self.frame_acc.clear();
         out
     }
@@ -578,5 +587,176 @@ mod tests {
         );
 
         let _ = total_samples(&chunks); // sanity: doesn't panic / overflow
+    }
+
+    /// Regression test for a real bug: `flush()` took `main_buf` (and
+    /// `prov_buf`) but never advanced their `*_start_ms` fields past the
+    /// audio just handed out, so a `push()` after `flush()` re-stamped new
+    /// audio with a timestamp that belonged to audio already returned --
+    /// silently breaking the "monotonic per track" timestamp guarantee for
+    /// any caller that reuses a `Segmenter` across a pause/resume or a
+    /// mid-session flush rather than discarding it at the true end of a
+    /// session.
+    #[test]
+    fn flush_then_push_keeps_committed_timestamps_monotonic() {
+        let cfg = SegmenterConfig {
+            growth_ladder_ms: vec![5_000],
+            max_chunk_ms: 5_000,
+            min_chunk_ms: 200,
+            provisional_enabled: false,
+            ..Default::default()
+        };
+        let mut seg = Segmenter::new(Track::Selected, cfg);
+
+        seg.push(&tone(0.5, 700));
+        let flushed = seg.flush();
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(flushed[0].start_ms, 0);
+        assert_eq!(flushed[0].duration_ms(), 700);
+
+        // Continuous speech past max_chunk_ms forces a committed cut; its
+        // start_ms must continue from where the flush left off (700ms), not
+        // restart at 0 (which would overlap/duplicate the audio already
+        // returned by flush).
+        let more = seg.push(&tone(0.5, 5_000));
+        let cut = more
+            .iter()
+            .find(|c| !c.provisional)
+            .expect("a forced committed cut");
+        assert_eq!(
+            cut.start_ms, 700,
+            "start_ms after flush must continue, not restart at 0"
+        );
+    }
+
+    /// Same bug, the provisional side: `prov_buf_start_ms` must also be
+    /// re-anchored by `flush()`, or a provisional chunk emitted after a flush
+    /// gets stamped with a stale (too-early) start time.
+    #[test]
+    fn flush_then_push_keeps_provisional_timestamps_correct_too() {
+        let cfg = SegmenterConfig {
+            growth_ladder_ms: vec![10_000],
+            max_chunk_ms: 10_000,
+            min_chunk_ms: 200,
+            provisional_enabled: true,
+            provisional_chunk_ms: 2_000,
+            silence_hangover_ms: 100_000,
+            ..Default::default()
+        };
+        let mut seg = Segmenter::new(Track::Selected, cfg);
+
+        seg.push(&tone(0.5, 900));
+        let flushed = seg.flush();
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(flushed[0].start_ms, 0);
+
+        let chunks = seg.push(&tone(0.5, 2_000));
+        let prov = chunks
+            .iter()
+            .find(|c| c.provisional)
+            .expect("a provisional chunk from the post-flush audio");
+        assert_eq!(
+            prov.start_ms, 900,
+            "provisional chunk after flush must start right after the flushed audio, not at 0"
+        );
+    }
+
+    /// A small, dependency-free xorshift PRNG so the randomized coverage test
+    /// below is deterministic and reproducible without pulling in `rand` just
+    /// for this one property test.
+    struct Xorshift32(u32);
+
+    impl Xorshift32 {
+        fn next_u32(&mut self) -> u32 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            self.0 = x;
+            x
+        }
+
+        /// Inclusive range, `lo..=hi`.
+        fn range(&mut self, lo: usize, hi: usize) -> usize {
+            lo + (self.next_u32() as usize) % (hi - lo + 1)
+        }
+    }
+
+    /// Property test: whatever sizes `push()` is called with -- a single
+    /// sample, a slab bigger than `max_chunk_ms`, anything in between -- every
+    /// input sample must reach exactly one committed chunk's worth of
+    /// coverage (overlap is fine, a gap is not), and the committed chunks must
+    /// cover the entire input once `flush()` is called. This is the "does
+    /// every input sample reach a chunk exactly once (modulo overlap)"
+    /// guarantee, exercised over randomised frame sizes rather than the few
+    /// fixed shapes the other tests use.
+    #[test]
+    fn randomized_frame_sizes_never_lose_or_gap_a_sample() {
+        let cfg = SegmenterConfig {
+            growth_ladder_ms: vec![1_100, 1_900, 2_600],
+            max_chunk_ms: 2_600,
+            min_chunk_ms: 300,
+            overlap_ms: 200,
+            silence_hangover_ms: 120,
+            provisional_enabled: true,
+            provisional_chunk_ms: 700,
+            ..Default::default()
+        };
+        let max_chunk_samples = ms_to_samples(cfg.max_chunk_ms);
+        let mut seg = Segmenter::new(Track::Selected, cfg);
+        let mut rng = Xorshift32(0xC0FFEE);
+
+        let mut total_input_samples: usize = 0;
+        let mut all_chunks: Vec<Chunk> = Vec::new();
+
+        for i in 0..400usize {
+            // Cycle through the specific edge sizes the brief calls out (1
+            // sample, 2 samples, well over max_chunk_ms) along with ordinary
+            // random small reads, and alternate tone/silence content so both
+            // the forced and the silence-boundary cut paths run.
+            let frame_len = match i % 7 {
+                0 => 1,
+                1 => 2,
+                6 => max_chunk_samples * 2 + 37,
+                _ => rng.range(1, max_chunk_samples / 3 + 1),
+            };
+            let is_speech = i % 3 != 0;
+            let frame: Vec<f32> = (0..frame_len)
+                .map(|j| {
+                    if is_speech {
+                        0.4 * (j as f32 * 0.37).sin()
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            total_input_samples += frame.len();
+            all_chunks.extend(seg.push(&frame));
+        }
+        all_chunks.extend(seg.flush());
+
+        let mut committed: Vec<_> = all_chunks.iter().filter(|c| !c.provisional).collect();
+        committed.sort_by_key(|c| c.start_ms);
+        assert!(
+            !committed.is_empty(),
+            "expected at least one committed chunk"
+        );
+        for pair in committed.windows(2) {
+            assert!(
+                pair[1].start_ms <= pair[0].start_ms + pair[0].duration_ms(),
+                "gap between committed chunks: {} ends at {}, next starts at {}",
+                pair[0].seq,
+                pair[0].start_ms + pair[0].duration_ms(),
+                pair[1].start_ms
+            );
+        }
+        let total_input_ms = samples_to_ms(total_input_samples);
+        let last = committed.last().unwrap();
+        assert!(
+            last.start_ms + last.duration_ms() >= total_input_ms,
+            "committed coverage ({} ms) must reach the full randomised input ({} ms)",
+            last.start_ms + last.duration_ms(),
+            total_input_ms
+        );
     }
 }

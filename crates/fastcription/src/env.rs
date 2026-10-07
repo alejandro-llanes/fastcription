@@ -164,18 +164,33 @@ pub fn probe_engine(binary: Option<&PathBuf>) -> EngineInfo {
     }
 }
 
-/// Maps the service's systemd state onto the three states the pill shows.
+/// Whether voxtype's dictation daemon is available, as the indicator shows it.
+///
+/// The systemd unit is the usual answer but not the only one: a daemon started
+/// by hand (`voxtype daemon`) provides dictation while `systemctl` reports the
+/// unit inactive or absent. The indicator exists to tell the user whether
+/// dictation works, so a live daemon counts however it was started, and its
+/// runtime state file is the evidence.
 pub fn service_status() -> crate::app::ServiceStatus {
     use crate::app::ServiceStatus as Pill;
-    match fc_voxtype::service::status() {
+    let unit = match fc_voxtype::service::status() {
         Ok(fc_voxtype::service::ServiceStatus::Found { active_state, .. }) => {
             if active_state == "active" {
-                Pill::Running
-            } else {
-                Pill::Stopped
+                return Pill::Running;
             }
+            Pill::Stopped
         }
         Ok(fc_voxtype::service::ServiceStatus::NotInstalled) | Err(_) => Pill::Unknown,
+    };
+
+    let daemon_alive = fc_voxtype::runtime::RuntimePaths::discover()
+        .ok()
+        .map(|paths| fc_voxtype::runtime::read_now(&paths).0.is_some())
+        .unwrap_or(false);
+    if daemon_alive {
+        Pill::Running
+    } else {
+        unit
     }
 }
 

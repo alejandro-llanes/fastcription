@@ -130,7 +130,10 @@ pub enum SessionState {
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
     /// Audio level for the meter. Dropping these is always safe.
-    Level { peak: f32, rms: f32 },
+    Level {
+        peak: f32,
+        rms: f32,
+    },
     /// A first-pass result from a short chunk, to be replaced by the committed
     /// segment that covers the same audio. Never persisted.
     Provisional(Segment),
@@ -139,18 +142,26 @@ pub enum SessionEvent {
     StateChanged(SessionState),
     PressureChanged(Pressure),
     /// The capture device went away; the pipeline is attempting to reconnect.
-    SourceLost { reason: String },
+    SourceLost {
+        reason: String,
+    },
     SourceRecovered,
     /// Something failed in a way the user needs to know about. Not fatal on its
     /// own: the session keeps whatever it already committed.
-    Failed { stage: &'static str, message: String },
+    Failed {
+        stage: &'static str,
+        message: String,
+    },
 }
 
 /// Errors shared across crate boundaries.
+///
+/// `fc-voxtype` has its own `VoxtypeError` for everything voxtype-specific
+/// (ARCHITECTURE.md §4: "the only crate that knows voxtype exists"), so this
+/// type only needs to carry what a crate below it in the dependency graph can
+/// actually produce.
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
     #[error("audio source {0} is no longer available")]
     SourceGone(String),
-    #[error("voxtype is not usable: {0}")]
-    VoxtypeUnavailable(String),
 }

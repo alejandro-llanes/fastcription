@@ -1,3 +1,0 @@
-No meeting currently in progress.
-
-Use 'voxtype meeting list' to see past meetings.

@@ -93,24 +93,6 @@ pub struct ExportOptions {
     pub metadata: bool,
 }
 
-/// `--diarization` override for `meeting start`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Diarization {
-    /// Attribute by audio source (You vs Remote). Best for 1:1 calls.
-    Simple,
-    /// ONNX speaker embeddings for multi-speaker meetings. Requires a build
-    /// with the `ml-diarization` feature.
-    Ml,
-}
-
-impl Diarization {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Simple => "simple",
-            Self::Ml => "ml",
-        }
-    }
-}
 
 /// `src/meeting/data.rs`'s `MeetingStatus` enum, as rendered by `{:?}` in
 /// `list`/`show` text (`Active`/`Paused`/`Completed`/`Cancelled`).
@@ -157,8 +139,6 @@ pub struct MeetingRecord {
     pub title: String,
     pub started_at: Option<String>,
     pub duration: Option<String>,
-    pub segment_count: Option<u64>,
-    pub speakers: Option<String>,
     pub status: Option<MeetingStatus>,
 }
 
@@ -190,10 +170,6 @@ fn key_values(text: &str) -> HashMap<String, String> {
     map
 }
 
-fn segment_count_from(s: Option<&String>) -> Option<u64> {
-    s.and_then(|s| s.split_whitespace().next())
-        .and_then(|n| n.parse().ok())
-}
 
 /// The one field every one of `list`/`show`/`status`'s outputs must carry.
 /// Its absence is the only thing that turns a permissive parse into an
@@ -217,10 +193,6 @@ fn is_no_meetings(text: &str) -> bool {
     text.to_lowercase().contains("no meetings found")
 }
 
-fn is_no_current_meeting(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    lower.contains("no meeting currently in progress") || lower.contains("no meeting in progress")
-}
 
 /// `voxtype meeting list [--limit N]`. Verified empty-list wording
 /// (`No meetings found.`, exit 0) against the real binary; the populated
@@ -269,151 +241,8 @@ fn parse_list_block(block: &str) -> Result<MeetingRecord> {
         title,
         started_at: fields.get("date").cloned(),
         duration: fields.get("duration").cloned(),
-        segment_count: None,
-        speakers: None,
         status: fields.get("status").map(|s| MeetingStatus::parse(s)),
     })
-}
-
-/// `voxtype meeting show <id>` (or `"latest"`). A nonexistent id is a
-/// nonzero exit on the real binary (verified: `Error loading meeting:
-/// Meeting not found: No meetings found`), which `run` already turns into a
-/// [`VoxtypeError::CommandFailed`] -- no special-casing needed here.
-pub fn show(binary: &Path, id: &str) -> Result<MeetingRecord> {
-    let out = run(binary, &["meeting", "show", id])?;
-    parse_show(&out)
-}
-
-/// Pure parsing half of [`show`]. Derived from `src/app/meeting.rs`'s
-/// `MeetingAction::Show` arm:
-///
-/// ```text
-/// <display title>
-/// <"=" repeated to the title's length>
-///
-/// ID:       <uuid>
-/// Started:  <started_at, "%Y-%m-%d %H:%M UTC">
-/// Ended:    <ended_at, same format>            -- only if the meeting ended
-/// Duration: <"{h}h {m}m {s}s", or "{m}m {s}s" under an hour> -- only if set
-/// Status:   <MeetingStatus Debug>
-/// Chunks:   <chunk_count>
-///
-/// Transcript:
-/// -----------
-/// Segments: <transcript.segments.len()>
-/// Words:    <transcript.word_count()>
-/// Speakers: <transcript.speakers(), ", "-joined>
-///
-/// Use 'voxtype meeting export <id>' to export the transcript.
-/// ```
-///
-/// Unlike `list`, there is a `Started:`/`Ended:` pair (not `Date:`), and
-/// `Segments:`/`Speakers:` do appear here, under their own `Transcript:`
-/// section.
-pub fn parse_show(text: &str) -> Result<MeetingRecord> {
-    let mut lines = text.lines();
-    let title = lines.next().unwrap_or_default().trim().to_string();
-    let rest: String = lines.collect::<Vec<_>>().join("\n");
-    let fields = key_values(&rest);
-    let id = require_id(&fields, "meeting show", text)?;
-    Ok(MeetingRecord {
-        id,
-        title,
-        started_at: fields.get("started").cloned(),
-        duration: fields.get("duration").cloned(),
-        segment_count: segment_count_from(fields.get("segments")),
-        speakers: fields.get("speakers").cloned(),
-        status: fields.get("status").map(|s| MeetingStatus::parse(s)),
-    })
-}
-
-/// `voxtype meeting status`: the single in-progress meeting, or `None`.
-/// Verified wording for "nothing in progress" against the real binary.
-/// Derived from `src/app/meeting.rs`'s `MeetingAction::Status` arm for the
-/// in-progress case -- there is no live meeting on this machine to capture
-/// that branch directly. Only two fields are ever printed:
-///
-/// ```text
-/// Meeting Status: <raw runtime word: recording | paused>
-/// Meeting ID: <uuid>
-/// ```
-///
-/// `idle` is filtered out upstream before printing (an idle or missing
-/// state file produces the same "No meeting currently in progress" text
-/// this module treats as `None`), so this parser never sees it as a status
-/// value. There is no title, duration, or segment/speaker count here --
-/// those only exist on `list`/`show`, which read from storage; `status`
-/// only reads the runtime state file.
-pub fn status(binary: &Path) -> Result<Option<MeetingRecord>> {
-    let out = run(binary, &["meeting", "status"])?;
-    parse_status(&out)
-}
-
-pub fn parse_status(text: &str) -> Result<Option<MeetingRecord>> {
-    if is_no_current_meeting(text) {
-        return Ok(None);
-    }
-    let fields = key_values(text);
-    let id = require_id(&fields, "meeting status", text)?;
-    Ok(Some(MeetingRecord {
-        id,
-        title: String::new(),
-        started_at: None,
-        duration: None,
-        segment_count: None,
-        speakers: None,
-        status: fields.get("status").map(|s| MeetingStatus::parse(s)),
-    }))
-}
-
-/// `voxtype meeting start [--title T] [--diarization simple|ml]`.
-pub fn start(binary: &Path, title: Option<&str>, diarization: Option<Diarization>) -> Result<()> {
-    let mut args: Vec<&str> = vec!["meeting", "start"];
-    if let Some(t) = title {
-        args.push("--title");
-        args.push(t);
-    }
-    if let Some(d) = diarization {
-        args.push("--diarization");
-        args.push(d.as_str());
-    }
-    run(binary, &args)?;
-    Ok(())
-}
-
-/// Verified against the real binary: with no meeting in progress this exits
-/// non-zero with `Error: No meeting in progress.` on stderr, which `run`
-/// surfaces as a normal [`VoxtypeError::CommandFailed`].
-pub fn stop(binary: &Path) -> Result<()> {
-    run(binary, &["meeting", "stop"])?;
-    Ok(())
-}
-
-pub fn pause(binary: &Path) -> Result<()> {
-    run(binary, &["meeting", "pause"])?;
-    Ok(())
-}
-
-pub fn resume(binary: &Path) -> Result<()> {
-    run(binary, &["meeting", "resume"])?;
-    Ok(())
-}
-
-pub fn label(binary: &Path, meeting_id: &str, speaker_id: &str, label: &str) -> Result<()> {
-    run(binary, &["meeting", "label", meeting_id, speaker_id, label])?;
-    Ok(())
-}
-
-/// Verified: without `--force` the real binary exits non-zero with a
-/// confirmation prompt on stderr instead of deleting anything, so `force`
-/// is not optional here the way it is optional on the CLI.
-pub fn delete(binary: &Path, meeting_id: &str, force: bool) -> Result<()> {
-    let mut args: Vec<&str> = vec!["meeting", "delete", meeting_id];
-    if force {
-        args.push("--force");
-    }
-    run(binary, &args)?;
-    Ok(())
 }
 
 /// One segment of an imported meeting's transcript, as `meeting export
