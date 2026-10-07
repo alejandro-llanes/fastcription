@@ -610,6 +610,44 @@ impl App {
         self.selected_source = reselect(chosen.as_ref(), &self.sources);
     }
 
+    /// Creates a group and reloads the library so it appears everywhere at
+    /// once: the sidebar filter and the history pane's assignment list.
+    fn create_group(&mut self, name: &str) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let outcome = {
+            let guard = match store.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.create_group(name, now_millis())
+        };
+        match outcome {
+            Ok(_) => self.reload_library(),
+            Err(err) => self.raise(format!("Could not create the group: {err}")),
+        }
+    }
+
+    /// Tag names are unique without regard to case in the store, so creating
+    /// one that already exists returns the existing tag rather than failing.
+    fn create_tag(&mut self, name: &str) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let outcome = {
+            let guard = match store.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.create_tag(name, None)
+        };
+        match outcome {
+            Ok(_) => self.reload_library(),
+            Err(err) => self.raise(format!("Could not create the tag: {err}")),
+        }
+    }
+
     fn raise(&mut self, message: impl Into<String>) {
         let message = message.into();
         tracing::warn!(%message, "raising a banner");

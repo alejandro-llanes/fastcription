@@ -14,6 +14,11 @@ pub struct State {
     pub search: String,
     pub group_filter: Option<GroupId>,
     pub tag_filter: BTreeSet<TagId>,
+    /// Draft names for the two creation fields. Without somewhere to create a
+    /// group or a tag, assigning one in the history pane has nothing to offer
+    /// and both features are dead on a fresh library.
+    pub new_group: String,
+    pub new_tag: String,
 }
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
@@ -40,6 +45,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             }
         }
     });
+    if let Some(name) = creator(ui, &mut app.sidebar.new_group, t("New group…"), "new-group") {
+        app.create_group(&name);
+    }
 
     ui.add_space(6.0);
     ui.label(
@@ -67,6 +75,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             }
         }
     });
+    if let Some(name) = creator(ui, &mut app.sidebar.new_tag, t("New tag…"), "new-tag") {
+        app.create_tag(&name);
+    }
 
     ui.add_space(8.0);
     ui.separator();
@@ -108,5 +119,40 @@ fn row(app: &mut App, ui: &mut egui::Ui, conversation: &fc_core::Conversation) {
     );
     if response.clicked() {
         app.open_history(conversation.id);
+    }
+}
+
+/// A one-line name field that commits on Enter or on the button, and returns
+/// the trimmed name once. Returns `None` while there is nothing to create, so
+/// a stray repaint cannot create the same group twice.
+fn creator(
+    ui: &mut egui::Ui,
+    draft: &mut String,
+    hint: &str,
+    id_salt: &str,
+) -> Option<String> {
+    let mut submitted = false;
+    ui.horizontal(|ui| {
+        let field = ui.add(
+            egui::TextEdit::singleline(draft)
+                .id_salt(id_salt)
+                .hint_text(hint)
+                .desired_width(120.0),
+        );
+        submitted = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if ui.small_button(t("+")).clicked() {
+            submitted = true;
+        }
+    });
+
+    if !submitted {
+        return None;
+    }
+    let name = draft.trim().to_owned();
+    draft.clear();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
     }
 }
