@@ -16,8 +16,10 @@ sit in a meeting and read what is being said, as it is said.
   always-on-top caption bar that sits over the meeting.
 - **Optionally captures your microphone too**, as a second track, so the
   transcript records both sides of the conversation.
-- **Keeps a library**: conversations with custom names, grouped, tagged and
-  full-text searchable, exported to text, Markdown, JSON, SRT or WebVTT.
+- **Keeps a library**: conversations with custom names, grouped and tagged,
+  searchable by what was actually said — not just by title — and exported to
+  text, Markdown, JSON, SRT or WebVTT.
+- **Imports past voxtype meetings** recorded by voxtype's own meeting mode.
 - **Starts and stops the voxtype systemd user service** from the UI.
 
 Everything runs locally. Audio does not leave the machine.
@@ -37,6 +39,13 @@ cargo run -p fastcription
 
 The first build compiles egui and winit from the forks fastframe pins, which
 takes a while.
+
+For a desktop entry, install the release binary onto `PATH` and copy
+`packaging/fastcription.desktop` into `~/.local/share/applications/`.
+
+The always-on-top caption overlay needs one window rule on Wayland, because
+winit cannot ask the compositor to keep a window above others.
+[docs/OVERLAY.md](docs/OVERLAY.md) has it for Hyprland, sway and river.
 
 ## How it works
 

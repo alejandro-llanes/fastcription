@@ -451,6 +451,21 @@ impl App {
             self.raise("Choose an audio source first.");
             return;
         };
+        // Refused up front rather than per chunk: without voxtype the session
+        // would record happily and fail every transcription, which looks like
+        // the app is working when nothing is being understood.
+        if self.voxtype.is_none() {
+            self.raise(
+                "voxtype was not found on PATH. Install it and run `voxtype setup --download`                  to fetch a model.",
+            );
+            return;
+        }
+        if self.settings.model.trim().is_empty() && self.models.is_empty() {
+            self.raise(
+                "No transcription model is installed. Run `voxtype setup model` to download one.",
+            );
+            return;
+        }
 
         // Re-resolved rather than trusted: a sink-input index goes stale when
         // the application that owned it restarts, and recording the wrong

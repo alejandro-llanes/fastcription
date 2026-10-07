@@ -535,3 +535,168 @@ mod tests {
         assert_eq!(parsed, expected);
     }
 }
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// A stand-in `voxtype` that prints the output the real one prints.
+    ///
+    /// The shapes it emits are the ones `fc-voxtype`'s fixtures were derived
+    /// from upstream source, so this tests the part fastcription owns — the
+    /// timestamp conversion, the segment mapping, the end time and the
+    /// idempotency — without needing a recorded meeting on the machine.
+    fn stub_voxtype(dir: &std::path::Path, started_at: &str) -> PathBuf {
+        let path = dir.join("voxtype");
+        let script = format!(
+            r#"#!/bin/sh
+case "$1 $2" in
+"meeting list")
+  cat <<'LIST'
+Recent Meetings
+===============
+
+Standup
+  ID: 3f29c5e1-8b77-4b1a-9c3b-1a2b3c4d5e6f
+  Date: 2026-10-07 14:30
+  Duration: 12m 34s
+  Status: Completed
+
+Still going
+  ID: 9999aaaa-0000-4b1a-9c3b-000000000009
+  Date: 2026-10-07 16:00
+  Duration: in progress
+  Status: Active
+LIST
+  ;;
+"meeting export")
+  cat <<'JSON'
+{{
+  "metadata": {{
+    "id": "3f29c5e1-8b77-4b1a-9c3b-1a2b3c4d5e6f",
+    "title": "Standup",
+    "startedAt": "{started_at}",
+    "endedAt": "2026-10-07T14:42:56+00:00",
+    "durationSecs": 754,
+    "status": "completed",
+    "chunkCount": 2
+  }},
+  "transcript": {{
+    "segments": [
+      {{ "id": 0, "startMs": 0, "endMs": 3200, "text": "Let's get started.", "source": "microphone", "speaker": "Alice", "chunkId": 0 }},
+      {{ "id": 1, "startMs": 3200, "endMs": 7400, "text": "Sounds good to me.", "source": "loopback", "speaker": "Bob", "chunkId": 0 }},
+      {{ "id": 2, "startMs": 7400, "endMs": 9000, "text": "   ", "source": "loopback", "chunkId": 1 }}
+    ],
+    "totalChunks": 2
+  }}
+}}
+JSON
+  ;;
+esac
+"#
+        );
+        let mut file = std::fs::File::create(&path).expect("create stub");
+        file.write_all(script.as_bytes()).expect("write stub");
+        drop(file);
+        std::fs::set_permissions(
+            &path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("chmod stub");
+        path
+    }
+
+    fn temp_store() -> (tempfile::TempDir, SharedStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("library.db")).expect("open store");
+        (dir, Arc::new(Mutex::new(store)))
+    }
+
+    #[test]
+    fn a_completed_meeting_imports_with_its_real_times_and_speakers() {
+        let bin_dir = tempfile::tempdir().expect("tempdir");
+        let binary = stub_voxtype(bin_dir.path(), "2026-10-07T14:30:22+00:00");
+        let (_dir, store) = temp_store();
+
+        let outcome = import_meetings(&store, &binary).expect("import");
+        // The meeting still in progress has no transcript yet, so it is skipped
+        // rather than imported half-finished.
+        assert_eq!(outcome.added, 1, "failures: {:?}", outcome.failed);
+        assert_eq!(outcome.skipped, 1);
+        assert!(outcome.failed.is_empty());
+
+        let guard = store.lock().unwrap();
+        let rows = guard
+            .list_conversations(&ConversationFilter::default())
+            .expect("list");
+        assert_eq!(rows.len(), 1);
+
+        let conversation = guard.get_conversation(rows[0].id).expect("conversation");
+        assert_eq!(conversation.title, "Standup");
+        assert_eq!(conversation.started_at, 1_791_383_422_000);
+        assert_eq!(
+            conversation.voxtype_meeting_id.as_deref(),
+            Some("3f29c5e1-8b77-4b1a-9c3b-1a2b3c4d5e6f")
+        );
+        // The last segment ends 9000 ms in, even though its text is blank.
+        assert_eq!(conversation.ended_at, Some(1_791_383_422_000 + 9_000));
+        assert_eq!(conversation.engine.engine, "voxtype");
+
+        let segments = guard.load_segments(rows[0].id).expect("segments");
+        assert_eq!(segments.len(), 2, "blank segments must not be stored");
+        assert_eq!(segments[0].text, "Let's get started.");
+        assert_eq!(segments[0].speaker.as_deref(), Some("Alice"));
+        assert_eq!(segments[1].start_ms, 3_200);
+        assert_eq!(segments[1].end_ms, 7_400);
+        assert_eq!(segments[1].speaker.as_deref(), Some("Bob"));
+    }
+
+    /// Importing twice must not duplicate a library.
+    #[test]
+    fn importing_twice_adds_nothing_the_second_time() {
+        let bin_dir = tempfile::tempdir().expect("tempdir");
+        let binary = stub_voxtype(bin_dir.path(), "2026-10-07T14:30:22+00:00");
+        let (_dir, store) = temp_store();
+
+        let first = import_meetings(&store, &binary).expect("first import");
+        assert_eq!(first.added, 1);
+
+        let second = import_meetings(&store, &binary).expect("second import");
+        assert_eq!(second.added, 0);
+        assert_eq!(second.skipped, 2);
+
+        let guard = store.lock().unwrap();
+        let rows = guard
+            .list_conversations(&ConversationFilter::default())
+            .expect("list");
+        assert_eq!(rows.len(), 1, "a second import must not duplicate");
+    }
+
+    /// A meeting whose start time is unreadable is reported, not stored with a
+    /// guessed timestamp that would sort it to 1970.
+    #[test]
+    fn an_unreadable_start_time_fails_the_meeting_rather_than_guessing() {
+        let bin_dir = tempfile::tempdir().expect("tempdir");
+        let binary = stub_voxtype(bin_dir.path(), "not a timestamp");
+        let (_dir, store) = temp_store();
+
+        let outcome = import_meetings(&store, &binary).expect("import");
+        // The `Date:` line from the listing is the documented fallback, so this
+        // still imports — from 2026-10-07 14:30 local rather than from nothing.
+        assert_eq!(outcome.added, 1);
+        let guard = store.lock().unwrap();
+        let rows = guard
+            .list_conversations(&ConversationFilter::default())
+            .expect("list");
+        let conversation = guard.get_conversation(rows[0].id).expect("conversation");
+        let offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+        let expected = time::macros::date!(2026 - 10 - 07)
+            .with_hms(14, 30, 0)
+            .unwrap()
+            .assume_offset(offset)
+            .unix_timestamp()
+            * 1_000;
+        assert_eq!(conversation.started_at, expected);
+    }
+}

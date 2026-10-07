@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=fastcription
+GenericName=Realtime transcription
+Comment=Read a conversation as text while it happens
+Exec=fastcription
+Icon=fastcription
+Terminal=false
+Categories=AudioVideo;Audio;Utility;
+Keywords=transcription;subtitles;captions;meeting;speech;voxtype;
+StartupNotify=true
+StartupWMClass=fastcription
