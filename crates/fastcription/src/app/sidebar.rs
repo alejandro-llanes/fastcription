@@ -21,7 +21,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     ui.add(egui::TextEdit::singleline(&mut app.sidebar.search).hint_text(t("Search…")));
     ui.add_space(6.0);
 
-    ui.label(RichText::new(t("Groups")).small().color(app.palette.secondary));
+    ui.label(
+        RichText::new(t("Groups"))
+            .small()
+            .color(app.palette.secondary),
+    );
     ui.horizontal_wrapped(|ui| {
         if ui
             .selectable_label(app.sidebar.group_filter.is_none(), t("All"))
@@ -38,7 +42,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     });
 
     ui.add_space(6.0);
-    ui.label(RichText::new(t("Tags")).small().color(app.palette.secondary));
+    ui.label(
+        RichText::new(t("Tags"))
+            .small()
+            .color(app.palette.secondary),
+    );
     ui.horizontal_wrapped(|ui| {
         for tag in app.tags.clone() {
             let selected = app.sidebar.tag_filter.contains(&tag.id);
@@ -80,12 +88,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                         .get(&conversation.id)
                         .cloned()
                         .unwrap_or_default();
-                    if !app
-                        .sidebar
-                        .tag_filter
-                        .iter()
-                        .all(|tag| tags.contains(tag))
-                    {
+                    if !app.sidebar.tag_filter.iter().all(|tag| tags.contains(tag)) {
                         continue;
                     }
                 }

@@ -55,6 +55,7 @@ pub fn show(ctx: &egui::Context, shared: &Shared) {
         ViewportId::from_hash_of("fastcription-overlay"),
         ViewportBuilder::default()
             .with_title("fastcription captions")
+            .with_app_id("fastcription-overlay")
             .with_inner_size([760.0, 170.0])
             .with_min_inner_size([320.0, 90.0])
             .with_decorations(false)

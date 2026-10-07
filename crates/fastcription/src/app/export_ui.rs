@@ -17,13 +17,7 @@ pub enum Format {
 }
 
 impl Format {
-    const ALL: [Self; 5] = [
-        Self::Text,
-        Self::Markdown,
-        Self::Json,
-        Self::Srt,
-        Self::Vtt,
-    ];
+    const ALL: [Self; 5] = [Self::Text, Self::Markdown, Self::Json, Self::Srt, Self::Vtt];
 
     fn label(self) -> &'static str {
         match self {

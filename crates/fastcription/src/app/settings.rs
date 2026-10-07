@@ -54,8 +54,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             .text(t("target seconds")),
     );
     ui.add(
-        egui::Slider::new(&mut app.settings.chunk_max_secs, 7.0..=20.0)
-            .text(t("max seconds (the segmenter grows into this under pressure)")),
+        egui::Slider::new(&mut app.settings.chunk_max_secs, 7.0..=20.0).text(t(
+            "max seconds (the segmenter grows into this under pressure)",
+        )),
     );
 
     ui.add_space(8.0);

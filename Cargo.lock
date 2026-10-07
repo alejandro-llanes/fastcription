@@ -1012,6 +1012,8 @@ dependencies = [
  "fc-export",
  "fc-store",
  "fc-voxtype",
+ "tempfile",
+ "thiserror 2.0.21",
  "time",
  "tracing",
  "tracing-subscriber",

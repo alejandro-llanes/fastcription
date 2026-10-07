@@ -72,7 +72,11 @@ fn row(ui: &mut egui::Ui, palette: &crate::theme::Palette, segment: &Segment) {
     if let Some(translation) = &segment.translation {
         ui.horizontal(|ui| {
             ui.add_space(24.0);
-            ui.label(RichText::new(translation).italics().color(palette.secondary));
+            ui.label(
+                RichText::new(translation)
+                    .italics()
+                    .color(palette.secondary),
+            );
         });
     }
     ui.add_space(4.0);
