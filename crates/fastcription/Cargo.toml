@@ -1,0 +1,21 @@
+[package]
+name = "fastcription"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fastcription"
+path = "src/main.rs"
+
+[dependencies]
+fc-core = { workspace = true }
+fc-store = { workspace = true }
+fc-audio = { workspace = true }
+fc-asr = { workspace = true }
+fc-voxtype = { workspace = true }
+fc-export = { workspace = true }
+anyhow = { workspace = true }
+crossbeam-channel = { workspace = true }
+tracing = { workspace = true }
