@@ -108,14 +108,27 @@ fn classify_sink_input(entry: &Value) -> Option<AudioSource> {
 }
 
 fn parse_sources(raw: Value) -> Vec<AudioSource> {
-    as_array(raw).iter().filter_map(classify_source).collect()
+    let entries = as_array(raw);
+    let sources: Vec<AudioSource> = entries.iter().filter_map(classify_source).collect();
+    report_skipped("source", entries.len(), sources.len());
+    sources
 }
 
 fn parse_sink_inputs(raw: Value) -> Vec<AudioSource> {
-    as_array(raw)
-        .iter()
-        .filter_map(classify_sink_input)
-        .collect()
+    let entries = as_array(raw);
+    let inputs: Vec<AudioSource> = entries.iter().filter_map(classify_sink_input).collect();
+    report_skipped("sink input", entries.len(), inputs.len());
+    inputs
+}
+
+/// A dropped entry is deliberate — one malformed stream must not hide every
+/// other source from the picker — but silence about it makes a missing device
+/// impossible to explain, so the count is logged.
+fn report_skipped(kind: &str, seen: usize, kept: usize) {
+    let skipped = seen.saturating_sub(kept);
+    if skipped > 0 {
+        tracing::debug!(kind, skipped, seen, "skipped unusable pactl entries");
+    }
 }
 
 fn parse_sinks(raw: Value) -> Vec<SinkInfo> {

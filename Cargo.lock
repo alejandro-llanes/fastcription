@@ -1132,7 +1132,6 @@ dependencies = [
  "hound",
  "tempfile",
  "thiserror 2.0.21",
- "tracing",
 ]
 
 [[package]]
@@ -1141,7 +1140,6 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "fc-core",
- "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tracing",
@@ -1162,7 +1160,6 @@ dependencies = [
  "fc-core",
  "serde",
  "serde_json",
- "thiserror 2.0.21",
  "time",
 ]
 
@@ -1191,7 +1188,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "toml",
- "tracing",
 ]
 
 [[package]]

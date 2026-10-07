@@ -10,4 +10,3 @@ fc-core = { workspace = true }
 hound = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
