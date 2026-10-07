@@ -128,41 +128,56 @@ solves the analogous problem with `dedup_bleed_through`).
 
 ## 4. Module layout
 
-One binary crate. Split into a workspace only when something is genuinely reused.
+A cargo workspace of six library crates plus the binary.
+
+> **Deviation from the first sketch.** This document originally called for one
+> binary crate with modules, splitting "only when something is genuinely
+> reused". The split came early for a different reason: each concern compiles
+> and tests independently, so work on the store cannot be blocked by a
+> half-written capture path, and `cargo test -p fc-asr` does not build egui.
+> The cost is a handful of extra manifests and an explicit dependency graph,
+> which is a fair price.
+
+```
+crates/
+  fc-core/       domain types every other crate speaks in: AudioSource, Segment,
+                 Track, Conversation, Group, Tag, EngineInfo, SessionEvent.
+                 No I/O, no toolkit, nothing that could pull one in.
+  fc-store/      SQLite library: migrations, conversations, segments, groups,
+                 tags, FTS5 search. Segments persisted as they commit.
+  fc-audio/      source enumeration (pactl -f json) and capture (parec),
+                 behind a CaptureBackend trait; peak/RMS metering.
+  fc-asr/        segmenter (VAD, chunk boundaries, overlap, backpressure),
+                 Transcriber trait, the `voxtype transcribe` adapter, dedup.
+  fc-voxtype/    the only crate that knows voxtype exists: CLI probes, read-only
+                 config parse, systemd unit control, runtime-state watcher,
+                 meeting-mode wrappers.
+  fc-export/     txt / md / json / srt / vtt writers.
+  fastcription/  the binary: eframe + fastframe, the session supervisor that
+                 joins capture to ASR to store, and the egui views.
+```
+
+The dependency graph is a DAG with `fc-core` at the bottom and nothing but the
+binary depending on more than one sibling.
+
+Inside the binary crate:
+
 
 ```
 src/
-  main.rs            eframe bootstrap; fastframe wiring (log, theme, fonts, text,
-                     icons, instance, tray, shell, i18n, update)
+  main.rs            eframe bootstrap; fastframe wiring (log, theme, fonts,
+                     text, icons, instance, tray, shell, update)
+  session.rs         the supervisor: owns the capture threads, the segmenter,
+                     the ASR workers and the store handle; the only place that
+                     knows how the crates fit together
   app/
-    mod.rs           App state, the Event/Command channels, repaint plumbing
-    live.rs          live transcript view: auto-scroll, sticky bottom, segment rows
+    mod.rs           App state, drains SessionEvent each frame, repaint plumbing
+    live.rs          live transcript: auto-scroll, sticky bottom, segment rows
     overlay.rs       always-on-top caption window (last N lines)
     sidebar.rs       groups tree, tag filter, conversation list, search box
     history.rs       conversation detail, rename, regroup, retag, speaker labels
-    settings.rs      source, engine/model, chunking, service control, translation flag
+    settings.rs      source, engine/model, chunking, service control, translation
     export_ui.rs     format picker and destination
-  audio/
-    sources.rs       enumeration via `pactl -f json` (sources, sink monitors, sink-inputs)
-    capture.rs       CaptureBackend trait + parec backend; reconnect on device loss
-    levels.rs        peak/RMS for the meter
-  asr/
-    segmenter.rs     ring buffer, VAD gate, chunk boundaries, overlap
-    transcriber.rs   Transcriber trait
-    voxtype_cli.rs   `voxtype -q transcribe` adapter + stdout parser
-    voxtype_meeting.rs  delegate a whole session to meeting mode (archive mode)
-    dedup.rs         overlap tail/head reconciliation
-  store/
-    schema.rs        versioned migrations
-    model.rs         Conversation, Segment, Group, Tag
-    queries.rs       inserts, listing, FTS5 search
-    import.rs        read-only import of existing voxtype meetings
-  export/            txt · md · json · srt · vtt
-  voxtype/
-    cli.rs           locate the binary, version check, `info devices|models|engines`
-    config.rs        read-only parse of ~/.config/voxtype/config.toml
-    service.rs       systemd user unit control
-    runtime.rs       inotify watch of state / meeting_state; status --follow
 ```
 
 ### Transcriber trait

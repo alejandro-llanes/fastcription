@@ -38,8 +38,22 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "7"
 time = { version = "0.3", features = ["formatting", "macros", "local-offset"] }
 tempfile = "3"
+toml = "0.9"
 
 [profile.release]
 opt-level = 3
 lto = "thin"
 strip = "debuginfo"
+
+# Owned by crates/fastcription: the fork pins fastframe's README requires for
+# any app built on it. Patch every egui crate fastcription actually depends on
+# from one revision — Cargo warns about a patch for a crate that is unused —
+# and move egui and winit together, since the egui revision is built against
+# this exact winit.
+[patch.crates-io]
+eframe = { git = "https://github.com/crmne/egui", rev = "ba6790fe7cf46e58e8d27ce1524cbfdee745e938" }
+egui = { git = "https://github.com/crmne/egui", rev = "ba6790fe7cf46e58e8d27ce1524cbfdee745e938" }
+egui_extras = { git = "https://github.com/crmne/egui", rev = "ba6790fe7cf46e58e8d27ce1524cbfdee745e938" }
+emath = { git = "https://github.com/crmne/egui", rev = "ba6790fe7cf46e58e8d27ce1524cbfdee745e938" }
+epaint = { git = "https://github.com/crmne/egui", rev = "ba6790fe7cf46e58e8d27ce1524cbfdee745e938" }
+winit = { git = "https://github.com/crmne/winit", rev = "ed7caa9023f10b397f5b6ec8284a840cbd8a6f65" }
