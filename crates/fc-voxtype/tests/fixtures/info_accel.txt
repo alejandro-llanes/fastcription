@@ -1,0 +1,11 @@
+Acceleration
+  State:    cpu-only
+  Backend:  (none in play)
+  Variant:  avx2
+  Daemon:   pid 2800853
+
+This binary has no GPU support. Switch variants with: voxtype setup variant --to <NAME>
+
+Evidence
+  binary: /usr/lib/voxtype/voxtype-avx2 (variant avx2)
+  journal: whisper_init_with_params_no_state: use gpu    = 0

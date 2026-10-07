@@ -1,0 +1,7 @@
+Meeting ID:     20261007-170000
+Meeting Title:  Design review
+Meeting Status: active
+Started:        2026-10-07 17:00:00
+Duration:       4m18s
+Segments:       7
+Speakers:       2

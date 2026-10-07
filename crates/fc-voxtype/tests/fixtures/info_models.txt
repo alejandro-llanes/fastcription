@@ -1,0 +1,52 @@
+Model catalog  (/home/user/.local/share/voxtype/models)
+
+whisper
+             tiny
+             tiny.en
+             base
+  installed  base.en (default)
+             small
+             small.en
+             medium
+             medium.en
+             large-v3
+             large-v3-turbo
+
+parakeet
+             parakeet-tdt-0.6b-v2
+             parakeet-tdt-0.6b-v2-int8
+             parakeet-tdt-0.6b-v3 (default)
+             parakeet-tdt-0.6b-v3-int8
+             parakeet-unified-en-0.6b
+
+moonshine  (download via: voxtype setup model)
+             base (default)
+             tiny
+             base-ja
+             base-zh
+             tiny-ja
+             tiny-zh
+             tiny-ko
+             tiny-ar
+
+sensevoice
+             small  (download: sensevoice-small)
+             small-fp32  (download: sensevoice-small-fp32)
+
+paraformer  (download via: voxtype setup model)
+             paraformer-zh (default)
+             paraformer-en
+
+dolphin  (download via: voxtype setup model)
+             dolphin-base (default)
+
+omnilingual  (download via: voxtype setup model)
+             omnilingual-300m (default)
+
+cohere  (download via: voxtype setup model)
+             cohere-transcribe-q4f16 (default)
+             cohere-transcribe-q4
+             cohere-transcribe-int8
+             cohere-transcribe-fp16
+
+Download one with: voxtype setup --download --model <NAME>

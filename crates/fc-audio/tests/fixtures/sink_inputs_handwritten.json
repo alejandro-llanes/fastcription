@@ -1,0 +1,47 @@
+[
+  {
+    "index": 150,
+    "driver": "PipeWire",
+    "sink": 3,
+    "sample_specification": "float32le 2ch 48000Hz",
+    "channel_map": "front-left,front-right",
+    "properties": {
+      "application.name": "Zoom",
+      "media.name": "Zoom Meeting",
+      "application.process.binary": "zoom",
+      "application.icon_name": "Zoom"
+    }
+  },
+  {
+    "index": 151,
+    "driver": "PipeWire",
+    "sink": 3,
+    "sample_specification": "float32le 2ch 48000Hz",
+    "channel_map": "front-left,front-right",
+    "properties": {
+      "application.process.binary": "firefox",
+      "media.name": "Playback"
+    }
+  },
+  {
+    "index": 152,
+    "driver": "PipeWire",
+    "sink": 3,
+    "sample_specification": "float32le 2ch 48000Hz",
+    "channel_map": "front-left,front-right",
+    "properties": {
+      "node.name": "stream.0"
+    }
+  },
+  {
+    "index": 153,
+    "driver": "PipeWire",
+    "sink": 3,
+    "sample_specification": "float32le 2ch 48000Hz",
+    "channel_map": "front-left,front-right",
+    "properties": {
+      "application.name": "fastcription",
+      "media.name": "fastcription"
+    }
+  }
+]

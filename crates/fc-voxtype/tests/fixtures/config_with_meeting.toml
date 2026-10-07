@@ -1,0 +1,20 @@
+engine = "parakeet"
+
+[whisper]
+model = "base.en"
+language = ["en", "fr"]
+
+[audio]
+device = "pipewire"
+
+[meeting]
+enabled = true
+chunk_duration_secs = 45
+storage_path = "/home/user/voxtype-meetings"
+
+[meeting.audio]
+mic_device = "default"
+loopback_device = "disabled"
+
+[meeting.diarization]
+backend = "ml"

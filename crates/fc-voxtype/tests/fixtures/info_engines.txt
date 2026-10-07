@@ -1,0 +1,11 @@
+Transcription engines
+  compiled  whisper ● active
+            parakeet
+            moonshine
+            sensevoice
+            paraformer
+            dolphin
+            omnilingual
+            cohere
+
+Switch with: voxtype config set engine <NAME>

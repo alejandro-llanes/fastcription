@@ -114,7 +114,7 @@ impl Store {
 
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.title, c.started_at, c.ended_at,
-                    c.source_name, c.source_desc, c.source_application,
+                    c.source_kind, c.source_name, c.source_desc, c.source_application,
                     g.name AS group_name,
                     (SELECT COUNT(*) FROM segments s WHERE s.conversation_id = c.id) AS segment_count
              FROM conversations c
@@ -143,11 +143,12 @@ impl Store {
                 let id: i64 = row.get(0)?;
                 let started_at: UnixMillis = row.get(2)?;
                 let ended_at: Option<UnixMillis> = row.get(3)?;
+                let kind_str: String = row.get(4)?;
                 let source = AudioSource {
-                    kind: SourceKind::Device, // not used by `label()`; avoids a 4th join column
-                    name: row.get(4)?,
-                    description: row.get(5)?,
-                    application: row.get(6)?,
+                    kind: SourceKind::parse(&kind_str).unwrap_or(SourceKind::Device),
+                    name: row.get(5)?,
+                    description: row.get(6)?,
+                    application: row.get(7)?,
                     index: None,
                 };
                 Ok((
@@ -157,9 +158,9 @@ impl Store {
                         title: row.get(1)?,
                         started_at,
                         duration_ms: ended_at.map(|e| e.saturating_sub(started_at) as u64),
-                        segment_count: row.get::<_, i64>(8)? as u64,
+                        segment_count: row.get::<_, i64>(9)? as u64,
                         source_label: source.label(),
-                        group_name: row.get(7)?,
+                        group_name: row.get(8)?,
                         tags: Vec::new(),
                     },
                 ))

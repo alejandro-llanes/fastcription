@@ -1,0 +1,26 @@
+Recent Meetings
+===============
+
+ID:       20261006-091500
+Title:    1:1 with Sam
+Started:  2026-10-06 09:15:00
+Duration: 32m10s
+Segments: 58
+Speakers: 2
+Status:   completed
+
+ID:       20261007-143022
+Title:    Standup
+Started:  2026-10-07 14:30:22
+Duration: 12m34s
+Segments: 42
+Speakers: 3
+Status:   completed
+
+ID:       20261007-160000
+Title:    Design review
+Started:  2026-10-07 16:00:00
+Duration: 5m02s
+Segments: 9
+Speakers: 1
+Status:   cancelled

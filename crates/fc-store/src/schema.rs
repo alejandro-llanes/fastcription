@@ -6,7 +6,7 @@
 
 use rusqlite::Connection;
 
-use crate::error::Result;
+use crate::error::{Result, StoreError};
 
 /// Each entry is the SQL that takes the schema from `index` to `index + 1`.
 /// `user_version` after a fresh open equals `MIGRATIONS.len()`.
@@ -69,6 +69,11 @@ CREATE INDEX idx_conversations_started_at ON conversations(started_at);
 CREATE INDEX idx_conversation_tags_tag ON conversation_tags(tag_id);
 CREATE INDEX idx_segments_conversation_order ON segments(conversation_id, start_ms, seq);
 
+-- A chunk is appended exactly once. Without this, a retried append after an
+-- ambiguous commit would silently duplicate lines in the user's transcript;
+-- with it, the second attempt fails loudly and the caller can tell.
+CREATE UNIQUE INDEX idx_segments_identity ON segments(conversation_id, track, seq);
+
 -- External-content FTS5 index over segment text. "External content" means the
 -- indexed text stays in `segments` only; the triggers below are what keep
 -- `segments_fts` truthful as rows are written and removed.
@@ -101,12 +106,14 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     let current = current as usize;
 
     if current > MIGRATIONS.len() {
-        tracing::warn!(
-            current,
-            known = MIGRATIONS.len(),
-            "database schema is newer than this build understands"
-        );
-        return Ok(());
+        // Running queries against a schema this build has never seen risks
+        // writing rows a newer build would read as corrupt. Refusing to open
+        // costs the user a downgrade warning; proceeding could cost them a
+        // transcript.
+        return Err(StoreError::SchemaTooNew {
+            found: current,
+            known: MIGRATIONS.len(),
+        });
     }
 
     for (i, step) in MIGRATIONS.iter().enumerate().skip(current) {

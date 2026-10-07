@@ -1,0 +1,4 @@
+[
+  {"start_ms": 0, "end_ms": 3200, "text": "Let's get started.", "speaker_id": "SPEAKER_00", "speaker_label": "Alice", "confidence": 0.94},
+  {"start_ms": 3200, "end_ms": 7400, "text": "Sounds good to me.", "speaker_id": "SPEAKER_01", "speaker_label": "Bob", "confidence": 0.88}
+]

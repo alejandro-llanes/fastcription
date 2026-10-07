@@ -1,0 +1,10 @@
+Audio input devices
+  default (default)
+  pipewire
+  sysdefault:CARD=PCH
+  front:CARD=PCH,DEV=0
+  surround40:CARD=PCH,DEV=0
+  surround51:CARD=PCH,DEV=0
+  surround71:CARD=PCH,DEV=0
+
+Select one with: voxtype config set audio.device <NAME>

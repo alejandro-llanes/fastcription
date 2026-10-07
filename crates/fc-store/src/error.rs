@@ -22,6 +22,12 @@ pub enum StoreError {
     #[error("database path has no usable data directory")]
     NoDataDir,
 
+    /// The library was written by a newer build of fastcription. Opening it
+    /// anyway would mean writing rows against a schema this build does not
+    /// know, so it refuses.
+    #[error("library schema is version {found}, but this build only knows {known}")]
+    SchemaTooNew { found: usize, known: usize },
+
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
 

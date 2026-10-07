@@ -19,3 +19,20 @@ fc-export = { workspace = true }
 anyhow = { workspace = true }
 crossbeam-channel = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+dirs = { workspace = true }
+time = { workspace = true }
+
+eframe = { version = "0.36.1", default-features = false, features = ["glow", "wayland", "x11", "persistence"] }
+egui = { version = "0.36.1", default-features = false, features = ["default_fonts"] }
+egui_extras = { version = "0.36.1", default-features = false, features = ["svg"] }
+
+fastframe-log = { git = "https://github.com/crmne/fastframe", rev = "bb79dbd", default-features = false }
+fastframe-instance = { git = "https://github.com/crmne/fastframe", rev = "bb79dbd" }
+fastframe-fonts = { git = "https://github.com/crmne/fastframe", rev = "bb79dbd" }
+fastframe-text = { git = "https://github.com/crmne/fastframe", rev = "bb79dbd" }
+fastframe-scroll = { git = "https://github.com/crmne/fastframe", rev = "bb79dbd" }
+fastframe-icons = { git = "https://github.com/crmne/fastframe", rev = "bb79dbd" }
+fastframe-theme = { git = "https://github.com/crmne/fastframe", rev = "bb79dbd" }
+fastframe-shell = { git = "https://github.com/crmne/fastframe", rev = "bb79dbd" }
+fastframe-tray = { git = "https://github.com/crmne/fastframe", rev = "bb79dbd" }
