@@ -21,7 +21,7 @@ Verified against voxtype 1.0.1 (`voxtype-bin`) and upstream `main`.
 | Surface | Detail |
 | --- | --- |
 | `voxtype transcribe <file>` | 16 kHz mono WAV in, transcript on stdout. No daemon required. Honors `--engine --model --language --threads --translate`. |
-| `voxtype meeting …` | `start/stop/pause/resume/status/list/show/export/label/summarize/delete`. Export: `text`, `markdown`, `json`, `srt`, `vtt`. |
+| `voxtype meeting …` | `start/stop/pause/resume/status/list/show/export/label/summarize/delete`. Export: `text`, `markdown`, `json` **only**. Upstream's `MEETING_MODE.md` and README advertise SRT and VTT, but the 1.0.1 binary's `--help` does not offer them — trust the binary. fastcription writes SRT and VTT itself. |
 | Meeting control IPC | Trigger files in `$XDG_RUNTIME_DIR/voxtype/`: `meeting_start` (optional title), `meeting_stop`, `meeting_pause`, `meeting_resume`, `meeting_start_diarization`. The CLI only writes these files; the daemon polls them. |
 | Daemon state | `$XDG_RUNTIME_DIR/voxtype/state` → `idle` \| `recording` \| `transcribing`. `meeting_state` → two lines, `status\nmeeting_id`. Also `pid`, `version`, `voxtype.lock`. |
 | Status stream | `voxtype status --format json --extended --follow` emits a JSON line per state change (model, device, backend). |
@@ -263,11 +263,12 @@ Committed segments are inserted as they arrive (D7). Groups are flat for now; th
 `group_id` column is nullable so nesting can be added later without touching
 `segments`.
 
-**Export** formats match voxtype's set — `txt`, `md`, `json`, `srt`, `vtt` — so a
-fastcription transcript and a voxtype transcript are interchangeable downstream.
-Each exporter takes the same `(Conversation, Vec<Segment>, ExportOptions)`, where
-options cover timestamps, speaker labels and a metadata header, mirroring
-`voxtype meeting export`.
+**Export** covers `txt`, `md`, `json`, `srt` and `vtt`. The first three match
+what `voxtype meeting export` produces, so those transcripts are interchangeable
+downstream; the subtitle formats are fastcription's own, since the 1.0.1 binary
+does not offer them whatever its documentation says. Each exporter takes the same
+`(Conversation, Vec<Segment>, ExportOptions)`, where the options cover timestamps,
+speaker labels and a metadata header, mirroring voxtype's flags.
 
 ---
 

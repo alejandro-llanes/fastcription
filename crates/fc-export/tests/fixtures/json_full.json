@@ -1,0 +1,64 @@
+{
+  "metadata": {
+    "title": "Design sync",
+    "started_at": 1760000000000,
+    "ended_at": 1760005404000,
+    "status": "completed",
+    "source": "System audio",
+    "engine": "whisper",
+    "model": "base.en",
+    "language": "en"
+  },
+  "segments": [
+    {
+      "track": "selected",
+      "seq": 0,
+      "start_ms": 0,
+      "end_ms": 5000,
+      "text": "Let's get started everyone.",
+      "translation": null,
+      "speaker": "Alice",
+      "confidence": 0.95
+    },
+    {
+      "track": "microphone",
+      "seq": 0,
+      "start_ms": 5000,
+      "end_ms": 9000,
+      "text": "Sounds good to me.",
+      "translation": "Suena bien.",
+      "speaker": "Bob",
+      "confidence": 0.9
+    },
+    {
+      "track": "selected",
+      "seq": 1,
+      "start_ms": 9000,
+      "end_ms": 12000,
+      "text": "Great, no objections then.",
+      "translation": null,
+      "speaker": null,
+      "confidence": 0.6
+    },
+    {
+      "track": "selected",
+      "seq": 3,
+      "start_ms": 12500,
+      "end_ms": 12500,
+      "text": "Mm-hm.",
+      "translation": null,
+      "speaker": "Alice",
+      "confidence": 0.5
+    },
+    {
+      "track": "microphone",
+      "seq": 1,
+      "start_ms": 5400000,
+      "end_ms": 5404000,
+      "text": "An hour and a half in, still going.",
+      "translation": null,
+      "speaker": "Bob",
+      "confidence": 0.85
+    }
+  ]
+}
