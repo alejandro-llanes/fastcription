@@ -8,7 +8,8 @@ request.
 
 The short version, for someone who already has a GPU box:
 
-1. Install CUDA and build whisper.cpp with it.
+1. Install whisper.cpp **with a CUDA backend** — on Arch that is two
+   packages, not a build.
 2. Download `large-v3-turbo`.
 3. Run `whisper-server` with `--inference-path /v1/audio/transcriptions`.
 4. Reach it over Tailscale, or open the port on your LAN.
@@ -46,16 +47,60 @@ nvidia-smi --query-gpu=name,memory.total,compute_cap --format=csv,noheader
 # NVIDIA GeForce RTX 5070, 12227 MiB, 12.0
 ```
 
+You also need the proprietary or open NVIDIA kernel driver, not nouveau — if
+`nvidia-smi` answered, you have one.
+
 On Arch (and Omarchy) the packaged toolkit is well past that floor:
 
 ```sh
 sudo pacman -S cuda
 ```
 
+On Arch you can skip this: the `ggml-cuda` package in step 2 depends on `cuda`
+and pacman will pull it in. You only need the toolkit explicitly if you are
+going to compile something yourself.
+
 Other distributions: <https://developer.nvidia.com/cuda-downloads>. If `nvcc`
 is not on your `PATH` afterwards, it is usually at `/opt/cuda/bin/nvcc`.
 
-## 2. Build whisper.cpp with CUDA
+## 2. Get a whisper.cpp that has CUDA
+
+### Arch and Omarchy: install the backend package
+
+```sh
+sudo pacman -S whisper-cpp ggml-cuda
+```
+
+**`whisper-cpp` on its own gives you a CPU-only server**, and nothing it prints
+says a package is missing. Arch links `whisper-cpp` against the shared system
+`ggml`, and ggml loads its compute backends at runtime as separate shared
+objects from `/usr/lib/ggml/`. The base `ggml` package ships only the CPU ones —
+`libggml-cpu-alderlake.so` and a dozen siblings, named after **CPU**
+microarchitectures, not GPUs. `ggml-cuda` is the package that puts
+`libggml-cuda.so` in that directory.
+
+It is a drop-in. Install it and restart the server: no rebuild, no source
+checkout, no configuration, and the `--model` path and command line do not
+change. Keep it at the same version as `ggml`, which is how the repos ship it.
+
+It pulls in `cuda` and `nccl` — about 510 MB installed. (`nccl` is multi-GPU
+collective communication, useless on a single card, but it is a hard dependency
+of the package.)
+
+There is no architecture flag to get right, either; the packaged build already
+covers Blackwell, as its own banner says:
+
+```
+CUDA : ARCHS = 750,800,860,890,900,1200,1210 | BLACKWELL_NATIVE_FP4 = 1
+```
+
+`1200` is compute capability 12.0, the RTX 50-series.
+
+Other distributions may well package the backends the same way — look for a
+`ggml-cuda`, `whisper.cpp-cuda` or `-cuda`-suffixed variant before building
+anything.
+
+### Other distributions: build it yourself
 
 ```sh
 git clone https://github.com/ggerganov/whisper.cpp
@@ -68,31 +113,72 @@ cmake --build build -j --config Release
 RTX 50-series. whisper.cpp's own README shows `86` in this example, which is
 Ampere (RTX 30-series); building with that on a Blackwell card leaves you
 running PTX compiled for a different architecture, or failing outright. Use the
-number your card reported above: `120` for RTX 50-series, `89` for RTX 40,
+number your card reported in step 1: `120` for RTX 50-series, `89` for RTX 40,
 `86` for RTX 30.
 
-Confirm the build found the GPU — `whisper-cli` prints the backend it loaded:
+This puts the binaries in `build/bin/`, so the commands below become
+`./build/bin/whisper-server` rather than plain `whisper-server`.
+
+### Telling the two apart
+
+The startup log is the check, and the only reliable one. **CPU-only** looks like
+this — one backend, loaded from a CPU shared object, model held in system RAM:
+
+```
+load_backend: loaded CPU backend from /usr/lib/ggml/libggml-cpu-alderlake.so
+whisper_init_with_params_no_state: use gpu    = 1
+whisper_init_with_params_no_state: devices    = 1
+whisper_init_with_params_no_state: backends   = 1
+whisper_model_load:          CPU total size =  1623.92 MB
+whisper_backend_init_gpu: device 0: CPU (type: 0)
+whisper_backend_init_gpu: no GPU found
+```
+
+**`use gpu = 1` is the request, not the outcome** — it only says the server
+asked for a GPU, which it does by default. `no GPU found` is the answer, and
+`backends = 1` is why: there was no CUDA backend to load. Working, the same
+lines read:
+
+```
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 11813 MiB):
+load_backend: loaded CUDA backend from /usr/lib/ggml/libggml-cuda.so
+load_backend: loaded CPU backend from /usr/lib/ggml/libggml-cpu-alderlake.so
+whisper_init_with_params_no_state: devices    = 2
+whisper_init_with_params_no_state: backends   = 2
+whisper_model_load:        CUDA0 total size =  1623.92 MB
+whisper_backend_init_gpu: using CUDA0 backend
+```
+
+Two backends, and the model's size reported against `CUDA0` instead of `CPU`.
+
+From outside the process, `nvidia-smi` names it:
 
 ```sh
-./build/bin/whisper-cli -m models/ggml-large-v3-turbo.bin -f samples/jfk.wav 2>&1 | grep -i cuda
+nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
+# 3669662, whisper-server, 1950 MiB
 ```
+
+A server running on the GPU holds the model in VRAM the whole time it is up, so
+it appears here even while idle. One that shows nothing is transcribing on the
+CPU.
 
 ## 3. Download a model
 
-whisper.cpp ships a script that fetches from
-<https://huggingface.co/ggerganov/whisper.cpp>:
+The models live at <https://huggingface.co/ggerganov/whisper.cpp>, one file per
+model, named `ggml-<name>.bin`. The packages do not ship any — pick a directory
+and fetch it:
+
+```sh
+mkdir -p ~/whisper/models && cd ~/whisper/models
+curl -L -O \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin
+```
+
+From a source checkout there is a script that does the same thing and puts it in
+`models/`:
 
 ```sh
 sh ./models/download-ggml-model.sh large-v3-turbo
-```
-
-It lands in `models/ggml-large-v3-turbo.bin`. To download by hand, or onto a
-machine without the repository checked out, the files are at
-`https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-<name>.bin`:
-
-```sh
-curl -L -o ggml-large-v3-turbo.bin \
-  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin
 ```
 
 Sizes, read from the HuggingFace repository:
@@ -138,21 +224,45 @@ Reasons to pick something else:
 Multilingual models (everything without `.en`) handle English fine; the `.en`
 variants are simply better at English for their size. Turbo is multilingual.
 
-**This section is reasoned from the model architecture and published
-comparisons, not measured on your card.** Once it is running, the honest
-measurement is the one that matters: watch the **transcription behind**
-indicator in fastcription's status bar during a real meeting. If it never
-appears, the server is keeping up.
+### What the GPU is worth
+
+Measured on an RTX 5070 with `large-v3-turbo` over a 7-second window — encoder
+time per pass, which is the part a live caption waits on:
+
+| Backend | Encode, per pass | |
+| --- | --- | --- |
+| CUDA | **85 ms** | |
+| CPU, 24 threads | 2,796 ms | 33× slower |
+| CPU, 4 threads (the default) | 10,256 ms | 121× slower |
+
+The CPU row is the one worth dwelling on. At nearly three seconds per pass on a
+seven-second window — ten, at the default thread count — a CPU-only server
+cannot produce live captions at all, and no amount of raising **seconds between
+passes** rescues it; it only makes the captions arrive later in bigger pieces.
+If realtime transcription feels hopeless, check step 2 before changing anything
+else.
+
+Model load is a separate ~2.1 s. A server pays it once at startup, not per
+request.
+
+Past that, the measurement that matters is from a real meeting: watch the
+**transcription behind** indicator in fastcription's status bar. If it never
+appears, the server is keeping up. The model comparison above is reasoned from
+architecture and published numbers rather than measured here; the backend
+comparison in this table was measured.
 
 ## 5. Run the server
 
 ```sh
-./build/bin/whisper-server \
+whisper-server \
   --model models/ggml-large-v3-turbo.bin \
   --host 0.0.0.0 \
   --port 8080 \
   --inference-path /v1/audio/transcriptions
 ```
+
+From a source build the binary is `./build/bin/whisper-server` instead; the
+arguments are the same.
 
 **`--inference-path` is not optional.** `whisper-server` serves `/inference` by
 default, which is not where voxtype posts; without it every request is a 404 and
@@ -168,8 +278,8 @@ Description=whisper.cpp server for fastcription
 After=network-online.target
 
 [Service]
-ExecStart=%h/whisper.cpp/build/bin/whisper-server \
-  --model %h/whisper.cpp/models/ggml-large-v3-turbo.bin \
+ExecStart=/usr/bin/whisper-server \
+  --model %h/whisper/models/ggml-large-v3-turbo.bin \
   --host 0.0.0.0 --port 8080 \
   --inference-path /v1/audio/transcriptions
 Restart=on-failure
@@ -179,10 +289,21 @@ RestartSec=5
 WantedBy=default.target
 ```
 
+`ExecStart` has to be an absolute path — systemd does not search `PATH` for it.
+From a source build that is `%h/whisper.cpp/build/bin/whisper-server`. Point
+`--model` wherever you actually put the file.
+
 ```sh
 systemctl --user daemon-reload
 systemctl --user enable --now whisper-server
 systemctl --user status whisper-server
+```
+
+Check it came up on the GPU, not silently on the CPU:
+
+```sh
+systemctl --user status whisper-server | grep -iE 'cuda|no GPU'
+nvidia-smi --query-compute-apps=process_name,used_memory --format=csv
 ```
 
 A user unit only runs while you are logged in. For a headless box, either
@@ -314,7 +435,9 @@ uploads a larger recording than the one before it.
 | 401 or 403 | The server wants a bearer token and the **API key** field is empty, or has the wrong one. |
 | Transcripts arrive but are wrong or empty | The server loaded a different model than you think. Check its startup log. |
 | **transcription behind** keeps appearing | The server cannot keep up. Try `large-v3-turbo` if you are on `large-v3`, check the GPU is actually being used, or raise **seconds between passes**. |
-| It works, but the GPU sits idle | whisper.cpp was built without `-DGGML_CUDA=1`, or for the wrong `CMAKE_CUDA_ARCHITECTURES`. Rebuild and check `whisper-cli`'s backend line. |
+| It works, but the GPU sits idle, and the log says `no GPU found` | There is no CUDA backend for it to use. On Arch, `sudo pacman -S ggml-cuda` and restart — `whisper-cpp` alone is CPU-only. From a source build, it was built without `-DGGML_CUDA=1` or for the wrong `CMAKE_CUDA_ARCHITECTURES`. See step 2. |
+| `use gpu = 1` in the log, but still slow | That line is the request, not the result. Read on for `backends = 2` and `CUDA0 total size`; `backends = 1` and `CPU total size` mean it is on the CPU. |
+| Everything is on the GPU and it is still behind | Confirm with `nvidia-smi` that the model is resident, then try `large-v3-turbo` if you are on `large-v3`, or raise **seconds between passes**. |
 
 ## Other servers
 
