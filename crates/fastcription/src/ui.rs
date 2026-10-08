@@ -316,11 +316,37 @@ pub fn icon_button(
     response
 }
 
-/// A small coloured capsule carrying one word of state.
-pub fn badge(ui: &mut Ui, text: &str, color: Color32) -> Response {
+/// An opaque chip for content that sits over the spectrum.
+///
+/// The footer draws the spectrum behind itself, which means nothing on it can
+/// be read against a predictable background: the colour behind a label
+/// depends on how loud that band happens to be. Rather than make the bar
+/// nearly opaque — which is the same as not drawing the spectrum — everything
+/// carrying words gets one of these, and the scrim behind them is free to be
+/// light.
+///
+/// Filled with the **window** colour specifically. The palette guarantees
+/// every colour that spells out words is readable against `window`, and that
+/// is the guarantee being borrowed here.
+pub fn plate<R>(ui: &mut Ui, palette: &Palette, body: impl FnOnce(&mut Ui) -> R) -> R {
     egui::Frame::default()
-        .fill(color.gamma_multiply(0.18))
-        .stroke(Stroke::new(1.0, color.gamma_multiply(0.45)))
+        .fill(palette.window)
+        .corner_radius(CONTROL_RADIUS)
+        .inner_margin(Margin::symmetric(10, 4))
+        .show(ui, body)
+        .inner
+}
+
+/// A small capsule carrying one word of state, in colour.
+///
+/// The fill is the window colour, not a tint of `color`. Tinting the
+/// background towards the text put the two within 3:1 of each other on both
+/// base palettes — the chip looked right and its word was the least readable
+/// thing on the bar.
+pub fn badge(ui: &mut Ui, palette: &Palette, text: &str, color: Color32) -> Response {
+    egui::Frame::default()
+        .fill(palette.window)
+        .stroke(Stroke::new(1.0, color.gamma_multiply(0.5)))
         .corner_radius(CONTROL_RADIUS)
         .inner_margin(Margin::symmetric(8, 3))
         .show(ui, |ui| {
@@ -350,6 +376,35 @@ mod tests {
     fn a_word_break_is_not_spaced_as_well() {
         assert_eq!(spaced_caps("a b"), "A B");
         assert_eq!(spaced_caps("to do"), "T\u{2009}O D\u{2009}O");
+    }
+
+    /// A chip's own word has to be readable on it. The first version tinted
+    /// the fill towards the text colour, which pulled the two together: the
+    /// accent's word measured 4.05:1 on its own chip against a 4.5 floor, and
+    /// `dim`'s measured 2.95:1. Filling with the window colour instead
+    /// borrows the guarantee the palette already makes.
+    #[test]
+    fn a_chip_is_opaque_and_its_word_is_readable_on_it() {
+        use crate::theme::{contrast_ratio, Palette, DECORATION_CONTRAST, WORDS_CONTRAST};
+        use fastframe_theme::{Base, Palette as _};
+
+        for base in [Base::Dark, Base::Light] {
+            let palette: Palette = Palette::base(base);
+            assert_eq!(palette.window.a(), 255, "{base:?}: a chip must be opaque");
+            for (what, color, floor) in [
+                ("accent", palette.accent, WORDS_CONTRAST),
+                ("warning", palette.warning, WORDS_CONTRAST),
+                ("danger", palette.danger, WORDS_CONTRAST),
+                ("dim", palette.dim, DECORATION_CONTRAST),
+                ("secondary", palette.secondary, WORDS_CONTRAST),
+            ] {
+                let ratio = contrast_ratio(color, palette.window);
+                assert!(
+                    ratio >= floor,
+                    "{base:?}: {what} on a chip is {ratio:.2}:1, needs {floor}:1"
+                );
+            }
+        }
     }
 
     #[test]

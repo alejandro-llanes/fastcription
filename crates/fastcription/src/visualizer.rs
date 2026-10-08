@@ -49,6 +49,25 @@ const EASE_TAU: f32 = 0.035;
 /// is pressed looks like a crash.
 const IDLE_TAU: f32 = 0.25;
 
+/// Roughly how far apart bars are placed, in points.
+///
+/// Bars are not drawn one per band. Across the footer's full span that would
+/// be eighty points of bar apiece — a row of boxes rather than a spectrum —
+/// and in the 140-point fallback slot it would be four. Columns are spaced at
+/// about this pitch instead and their heights interpolated from the bands, so
+/// the same style reads correctly at every width it is drawn at.
+const BAR_PITCH: f32 = 12.0;
+
+/// Fewest and most bars, whatever the width works out to.
+///
+/// The floor keeps a narrow strip from becoming three fat blocks; the ceiling
+/// is where more bars stop being distinguishable and start being a fill.
+const BAR_COUNT: std::ops::RangeInclusive<usize> = 8..=160;
+
+/// Below this width a bar is too thin for a halo to read as anything but a
+/// smudge, so it is not drawn.
+const GLOW_MIN_BAR: f32 = 6.0;
+
 /// Columns per band when a style draws a continuous shape rather than bars.
 ///
 /// The curve styles interpolate between band values; this is how finely. Four
@@ -219,10 +238,22 @@ impl Visualizer {
             ui.available_width()
         };
         let (rect, response) = ui.allocate_exact_size(Vec2::new(width, size.y), Sense::hover());
-        if !ui.is_rect_visible(rect) {
-            return Some(response);
-        }
+        self.paint_at(ui, rect, palette, style);
+        Some(response)
+    }
 
+    /// Draws into a rect the caller already owns, allocating nothing.
+    ///
+    /// The status bar draws the spectrum full-bleed as its own background and
+    /// lays a translucent bar over the lower part of it, which needs the whole
+    /// strip rather than a slot reserved inside it.
+    pub fn paint_at(&mut self, ui: &Ui, rect: Rect, palette: &Palette, style: Style) {
+        if !style.visible() || !ui.is_rect_visible(rect) {
+            return;
+        }
+        // Stepping twice in one frame is harmless — the second call measures a
+        // `dt` of almost nothing and moves nothing — so a caller that draws the
+        // same visualiser in two places does not have to coordinate.
         self.step(Instant::now());
         // Without this the window only redraws when something else asks it to,
         // and the easing would advance in jerks whenever an event happened to
@@ -231,9 +262,7 @@ impl Visualizer {
         if self.animating() {
             ui.ctx().request_repaint();
         }
-
         self.paint(ui, rect, palette, style);
-        Some(response)
     }
 
     fn paint(&self, ui: &Ui, rect: Rect, palette: &Palette, style: Style) {
@@ -265,14 +294,19 @@ impl Visualizer {
 
     /// Analyser bars, optionally mirrored about the centre line.
     fn bars(&self, painter: &egui::Painter, rect: Rect, palette: &Palette, mirrored: bool) {
-        let slot = rect.width() / BANDS as f32;
+        let columns = ((rect.width() / BAR_PITCH).round() as usize)
+            .clamp(*BAR_COUNT.start(), *BAR_COUNT.end());
+        let slot = rect.width() / columns as f32;
         // A quarter of each slot is the gap. Narrower and the bars merge into
         // a solid block at the widths this is drawn at; wider and there is
         // more gap than bar.
         let bar = (slot * 0.75).max(1.0);
-        for (i, &value) in self.shown.iter().enumerate() {
-            let tint = self.tint(palette, i as f32 / (BANDS - 1) as f32);
-            let x = rect.left() + slot * i as f32 + (slot - bar) / 2.0;
+        let glow = bar >= GLOW_MIN_BAR;
+        for column in 0..columns {
+            let t = column as f32 / (columns - 1).max(1) as f32;
+            let value = self.sample(t);
+            let tint = self.tint(palette, t);
+            let x = rect.left() + slot * column as f32 + (slot - bar) / 2.0;
             // Every bar keeps a visible stub at silence. A row of bars that
             // vanishes completely looks like the visualiser broke, where a
             // flat row reads as "listening, nothing to hear".
@@ -294,15 +328,16 @@ impl Visualizer {
             // and comes out a capsule, so a silent strip reads as a dotted
             // line rather than as a row of bars at rest.
             let radius = (bar * 0.3).min(extent * 0.4);
-            // The glow: the same bar again, wider and barely opaque. egui has
-            // no blur, and a larger translucent rounded rectangle behind the
-            // solid one is what a blur looks like from a distance.
-            let glow = bar_rect.expand(bar * 0.35);
-            painter.rect_filled(
-                glow,
-                radius + bar * 0.1,
-                tint.gamma_multiply(0.12 * value.max(0.1)),
-            );
+            if glow {
+                // egui has no blur, and a larger translucent rounded rectangle
+                // behind the solid one is what a blur looks like from a
+                // distance.
+                painter.rect_filled(
+                    bar_rect.expand(bar * 0.35),
+                    radius + bar * 0.1,
+                    tint.gamma_multiply(0.12 * value.max(0.1)),
+                );
+            }
             painter.rect_filled(bar_rect, radius, tint);
         }
     }

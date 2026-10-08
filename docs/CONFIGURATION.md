@@ -214,6 +214,35 @@ readable against the panel behind it (WCAG AA, AAA for the transcript itself).
 A theme file named here that has since been deleted falls back to the
 desktop's rather than to nothing.
 
+### Compact mode
+
+| | |
+| --- | --- |
+| **Give compact mode its own theme** | When ticked, a second theme picker appears and compact mode uses it. Unticked, it follows the theme above. |
+| Default | Unticked |
+| Persists | Yes |
+| Takes effect | On entering or leaving compact mode |
+
+The two modes are the same window, so only one palette is ever live;
+switching modes re-resolves it. The setting exists because the two are looked
+at in different circumstances — the full window is worked in, and the caption
+strip sits over somebody else's video call for an hour, where a plainer or
+darker palette can be much easier to read off.
+
+| | |
+| --- | --- |
+| **visualiser height** | How tall the spectrum is drawn in the caption strip, 14–72 points. |
+| Default | 26 |
+| Persists | Yes |
+| Takes effect | Immediately |
+
+Every point it takes is a point the captions do not get, which is why the
+range stops where two lines of the largest transcript size would no longer
+fit. A value outside the range, or one that is not a number at all, is
+clamped or falls back to the default rather than reaching the layout — the
+settings file is plain text, and a strip with no room for captions is the one
+thing compact mode must never become.
+
 ### Audio visualiser
 
 | | |
@@ -225,7 +254,7 @@ desktop's rather than to nothing.
 
 | | |
 | --- | --- |
-| **Show it in the full window too** | Whether the status bar shows the visualiser instead of the percentage level meter. Compact mode always shows it. |
+| **Show it in the full window too** | Whether the footer draws the spectrum behind itself. Unticked, it shows a percentage level meter on a plate instead. Compact mode always shows the visualiser. |
 | Default | On |
 | Persists | Yes |
 | Takes effect | Immediately |

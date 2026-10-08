@@ -32,17 +32,31 @@ const MAIN_MIN_SIZE: [f32; 2] = [760.0, 480.0];
 /// The source picker's width. Wide enough for a sink input's application name
 /// and most device descriptions, narrow enough that the transport still fits
 /// beside it at the window's 760 pt minimum.
-/// The visualiser's size in the status bar, where it stands in for the level
-/// meter it replaces and so is about that wide.
+/// How tall the readouts' half of the footer is.
+const STATUS_BAR_HEIGHT: f32 = 52.0;
+
+/// How far the spectrum reaches above that bar.
+///
+/// The bar is translucent and the spectrum is drawn behind it, so the loud
+/// bands break out of the top rather than being clipped flat by it. This is
+/// the only piece of the window that is purely for the look of the thing, and
+/// it is 22 points.
+const STATUS_SPECTRUM_RISE: f32 = 22.0;
+
+/// How opaque the footer is over the spectrum behind it.
+///
+/// Nothing on the bar is read against this. Every label sits on an opaque
+/// plate and every state word on a chip, which is what lets the scrim be
+/// light enough for the spectrum to actually show — the first attempt drew
+/// the labels straight onto it, and the arithmetic said the bar had to be 96%
+/// opaque to keep them readable, which is the same as not drawing a spectrum
+/// at all. The scrim's remaining job is to stop the bands being so loud
+/// behind the plates that the bar stops reading as a bar.
+const SCRIM: f32 = 0.55;
+
+/// The fallback level meter's size, for when the spectrum is turned off.
 const STATUS_VISUALIZER_WIDTH: f32 = 140.0;
 const STATUS_VISUALIZER_HEIGHT: f32 = 16.0;
-
-/// The visualiser's height in the compact strip.
-///
-/// Small: the captions are what compact mode is for, and every point this
-/// takes is a point of text. Enough to read as a spectrum rather than as a
-/// smudge.
-const COMPACT_VISUALIZER_HEIGHT: f32 = 26.0;
 
 /// The compact strip's one button, square and round-cornered into a circle.
 const COMPACT_BUTTON: f32 = 26.0;
@@ -134,8 +148,14 @@ impl App {
         self.notice_panel(ui);
         // Below the notices and above the sidebar, so it spans the window:
         // what it carries is about the session, not about either pane.
+        // Tall enough for the readouts, plus a strip above them the spectrum
+        // can rise into. The panel reserves both, so the transcript stops
+        // above the bars rather than scrolling behind them — the one thing
+        // this layout must not borrow from a music player, where whatever
+        // slides under the bar was never going to be read.
         egui::Panel::bottom("status")
-            .frame(crate::ui::bar(&self.palette, false))
+            .exact_size(STATUS_BAR_HEIGHT + STATUS_SPECTRUM_RISE)
+            .frame(egui::Frame::NONE)
             .show(ui, |ui| self.status_bar(ui));
 
         egui::Panel::left("sidebar")
@@ -313,6 +333,10 @@ impl App {
             return;
         }
         self.compact = compact;
+        // Compact mode may wear a different palette, and `poll_theme` only
+        // re-resolves when something it watches changed. Forgetting what was
+        // applied is what makes the next frame notice.
+        self.theme_applied = None;
         if compact {
             self.apply_compact(ctx);
         } else {
@@ -385,6 +409,16 @@ impl App {
             return false;
         }
         response.on_hover_text(hover).clicked()
+    }
+
+    /// The compact strip's visualiser height, clamped to what the strip can
+    /// actually give it.
+    ///
+    /// A value restored from disk is not trusted: the settings file is plain
+    /// text a user can edit, and a height taller than the strip would leave no
+    /// captions at all — which is the one thing compact mode exists to show.
+    pub(super) fn compact_visualizer_height(&self) -> f32 {
+        super::settings::clamp_visualizer_height(self.settings.compact_visualizer_height)
     }
 
     /// What the compact button and `Ctrl+Space` both mean: transcribing, or
@@ -478,7 +512,7 @@ impl App {
                                     ui,
                                     &self.palette,
                                     self.settings.visualizer,
-                                    egui::vec2(room, COMPACT_VISUALIZER_HEIGHT),
+                                    egui::vec2(room, self.compact_visualizer_height()),
                                 );
                             }
                         });
@@ -716,89 +750,106 @@ impl App {
         use crate::ui;
 
         let palette = self.palette.clone();
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 14.0;
+        let strip = ui.max_rect();
+        let bar = egui::Rect::from_min_max(
+            egui::Pos2::new(strip.left(), strip.bottom() - STATUS_BAR_HEIGHT),
+            strip.max,
+        );
 
-            // The meter reads the *selected* source, which is usually the other
-            // end of a call. A microphone icon here said the opposite, and a
-            // user watching a flat meter while the remote side talked had every
-            // reason to think they had picked the wrong thing.
-            let source = self
-                .selected_source
-                .and_then(|index| self.sources.get(index))
-                .map(|source| source.label());
-            let hover = match &source {
-                Some(label) => tf("Input level from {}", &[label]),
-                None => t("No audio source is selected").to_owned(),
-            };
+        // Painted in three passes, because the spectrum goes *behind* the bar
+        // rather than beside it: the ground first, then the spectrum across
+        // the whole strip, then a translucent bar over the lower part of it.
+        // The bars that reach above the bar are left uncovered, which is what
+        // makes the thing look like it is coming up out of the floor instead
+        // of sitting in a box.
+        let painter = ui.painter();
+        painter.rect_filled(strip, 0, palette.window);
+        let spectrum = self.settings.visualizer_in_main;
+        if spectrum {
+            self.visualizer
+                .paint_at(ui, strip, &palette, self.settings.visualizer);
+        }
+        let painter = ui.painter();
+        painter.rect_filled(bar, 0, palette.panel.gamma_multiply(SCRIM));
+        painter.hline(
+            bar.x_range(),
+            bar.top(),
+            egui::Stroke::new(1.0, palette.outline),
+        );
 
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                ui::label(ui, &palette, t("input"));
-                let spectrum = self
-                    .settings
-                    .visualizer_in_main
-                    .then(|| {
-                        self.visualizer.show(
+        let content = bar.shrink2(egui::vec2(12.0, 8.0));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(content), |ui| {
+            ui.horizontal_centered(|ui| {
+                ui.spacing_mut().item_spacing.x = 14.0;
+
+                // The meter reads the *selected* source, which is usually the
+                // other end of a call. A microphone icon here said the
+                // opposite, and a user watching a flat meter while the remote
+                // side talked had every reason to think they had picked the
+                // wrong thing.
+                let source = self
+                    .selected_source
+                    .and_then(|index| self.sources.get(index))
+                    .map(|source| source.label());
+                let hover = match &source {
+                    Some(label) => tf("Input level from {}", &[label]),
+                    None => t("No audio source is selected").to_owned(),
+                };
+
+                ui::plate(ui, &palette, |ui| {
+                    ui.horizontal_centered(|ui| {
+                        ui.spacing_mut().item_spacing.x = 14.0;
+                        ui::readout(
                             ui,
                             &palette,
-                            self.settings.visualizer,
-                            egui::vec2(STATUS_VISUALIZER_WIDTH, STATUS_VISUALIZER_HEIGHT),
-                        )
-                    })
-                    .flatten();
-                match spectrum {
-                    Some(response) => {
-                        response.on_hover_text(hover);
-                    }
-                    None => {
-                        ui.add(
-                            egui::ProgressBar::new(self.level_peak.clamp(0.0, 1.0))
-                                .desired_width(STATUS_VISUALIZER_WIDTH)
-                                .desired_height(STATUS_VISUALIZER_HEIGHT)
-                                .show_percentage(),
-                        )
-                        .on_hover_text(hover);
-                    }
+                            t("elapsed"),
+                            &format_elapsed(self.elapsed()),
+                            self.state == SessionState::Recording,
+                        );
+                        if let Some(label) = source {
+                            separator(ui, &palette);
+                            ui::readout(
+                                ui,
+                                &palette,
+                                t("source"),
+                                &elide(&label, SOURCE_READOUT_CHARS),
+                                false,
+                            );
+                        }
+                    });
+                });
+
+                // Only when the spectrum is not drawn: with it behind the bar
+                // there is already a picture of the input, and a percentage
+                // beside it would be saying the same thing twice.
+                if !spectrum {
+                    ui::plate(ui, &palette, |ui| {
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            ui::label(ui, &palette, t("input"));
+                            ui.add(
+                                egui::ProgressBar::new(self.level_peak.clamp(0.0, 1.0))
+                                    .desired_width(STATUS_VISUALIZER_WIDTH)
+                                    .desired_height(STATUS_VISUALIZER_HEIGHT)
+                                    .show_percentage(),
+                            )
+                            .on_hover_text(hover);
+                        });
+                    });
                 }
-            });
 
-            separator(ui, &palette);
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 1.0;
-                ui::readout(
-                    ui,
-                    &palette,
-                    t("elapsed"),
-                    &format_elapsed(self.elapsed()),
-                    self.state == SessionState::Recording,
-                );
-            })
-            .response
-            .on_hover_text(t("How long this conversation has been recording"));
+                if self.pressure == Pressure::Lagging {
+                    ui::badge(
+                        ui,
+                        &palette,
+                        t("transcription behind \u{2014} words arrive late"),
+                        palette.warning,
+                    );
+                }
 
-            if let Some(label) = source {
-                separator(ui, &palette);
-                ui::readout(
-                    ui,
-                    &palette,
-                    t("source"),
-                    &elide(&label, SOURCE_READOUT_CHARS),
-                    false,
-                );
-            }
-
-            if self.pressure == Pressure::Lagging {
-                separator(ui, &palette);
-                ui.add(crate::icons::Icon::StatusWarn.image(palette.warning, 14.0));
-                ui.colored_label(
-                    palette.warning,
-                    t("transcription behind \u{2014} words arrive late"),
-                );
-            }
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                service_pill(ui, &palette, self.voxtype_service);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    service_pill(ui, &palette, self.voxtype_service);
+                });
             });
         });
     }
@@ -961,7 +1012,8 @@ impl App {
                 .start(self.themes_dir.clone(), None, &self.theme_waker);
         }
         let rescanned = self.theme_catalog.poll();
-        let chosen = self.theme_applied.as_ref() != Some(&self.settings.theme);
+        let wanted = self.wanted_theme();
+        let chosen = self.theme_applied.as_ref() != Some(&wanted);
         if !rescanned && !chosen {
             return;
         }
@@ -971,11 +1023,26 @@ impl App {
         // A theme from the desktop, or from a file, has not been held to
         // anything.
         palette.enforce_contrast();
-        self.theme_applied = Some(self.settings.theme.clone());
+        self.theme_applied = Some(wanted);
         if palette != self.palette {
             self.palette = palette;
             self.palette.apply(ctx);
         }
+    }
+
+    /// Which theme should be in force right now.
+    ///
+    /// Compact mode may have one of its own. `None` there means "whatever the
+    /// full window is using", which is the default; the two modes are the same
+    /// window, so only one palette is ever live and switching modes
+    /// re-resolves it.
+    fn wanted_theme(&self) -> crate::theme::ThemeChoice {
+        if self.compact {
+            if let Some(theme) = &self.settings.compact_theme {
+                return theme.clone();
+            }
+        }
+        self.settings.theme.clone()
     }
 
     /// The palette the current [`crate::theme::ThemeChoice`] names.
@@ -994,7 +1061,7 @@ impl App {
                 .or_else(|| self.theme_catalog.themes().first())
                 .map(|theme| theme.palette.clone())
         };
-        match &self.settings.theme {
+        match &self.wanted_theme() {
             ThemeChoice::System => desktop(),
             ThemeChoice::Dark => Some(crate::theme::Palette::base(Base::Dark)),
             ThemeChoice::Light => Some(crate::theme::Palette::base(Base::Light)),
@@ -1245,7 +1312,7 @@ fn service_pill(ui: &mut egui::Ui, palette: &crate::theme::Palette, status: Serv
     // right of the bar, the two used to be laid out in reverse and needed a
     // comment explaining why the label came first.
     let _ = icon;
-    crate::ui::badge(ui, text, color);
+    crate::ui::badge(ui, palette, text, color);
 }
 
 fn notice_icon(kind: NoticeKind) -> crate::icons::Icon {

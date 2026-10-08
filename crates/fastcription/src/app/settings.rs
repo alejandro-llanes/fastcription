@@ -65,6 +65,22 @@ pub struct State {
     pub theme: ThemeChoice,
     /// Which shape the audio visualiser draws.
     pub visualizer: visualizer::Style,
+    /// How tall the visualiser is in the compact strip, in points.
+    ///
+    /// A setting because compact mode is used at whatever distance the meeting
+    /// happens to be at, and because the trade is a real one: every point here
+    /// is a point the captions do not get. The range stops well short of the
+    /// strip's height so there is always room for at least two lines.
+    pub compact_visualizer_height: f32,
+    /// The palette compact mode uses, when it should not be the main
+    /// window's.
+    ///
+    /// `None` means "the same as the full window", which is the default and
+    /// what most people will want. It is separate because the two are looked
+    /// at in different circumstances: the full window is worked in, and the
+    /// caption strip sits over somebody else's video call for an hour, where a
+    /// darker or plainer palette can be much easier to read off.
+    pub compact_theme: Option<ThemeChoice>,
     /// Whether the full window shows the visualiser as well as compact mode.
     ///
     /// Separate from the style because the two places are used differently:
@@ -101,10 +117,38 @@ impl Default for State {
             transcript_pt: transcript::DEFAULT_PT,
             theme: ThemeChoice::default(),
             visualizer: visualizer::Style::default(),
+            compact_visualizer_height: COMPACT_VISUALIZER_DEFAULT,
+            compact_theme: None,
             visualizer_in_main: true,
             remote_probe: None,
             remote_probe_rx: None,
         }
+    }
+}
+
+/// Default, smallest and largest height for compact mode's visualiser.
+///
+/// The ceiling leaves room for two lines of transcript at the largest text
+/// size the app offers, which is the least that is worth reading; the floor is
+/// where the bars stop being distinguishable from a line.
+pub const COMPACT_VISUALIZER_DEFAULT: f32 = 26.0;
+pub const COMPACT_VISUALIZER_RANGE: std::ops::RangeInclusive<f32> = 14.0..=72.0;
+
+/// The compact visualiser's height, clamped to what the strip can give it.
+///
+/// A value restored from disk is not trusted. The settings file is plain text
+/// a user can edit, and a height taller than the strip would leave no
+/// captions at all — which is the one thing compact mode exists to show. A
+/// value that is not a number at all falls back to the default rather than
+/// reaching the layout, where it would poison every rect it touched.
+pub fn clamp_visualizer_height(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(
+            *COMPACT_VISUALIZER_RANGE.start(),
+            *COMPACT_VISUALIZER_RANGE.end(),
+        )
+    } else {
+        COMPACT_VISUALIZER_DEFAULT
     }
 }
 
@@ -525,52 +569,62 @@ fn server(app: &mut App, ui: &mut Ui) {
 fn appearance(app: &mut App, ui: &mut Ui) {
     let palette = app.palette.clone();
 
+    // Collected first: the pickers below borrow `app.settings` mutably while
+    // the catalog would still be borrowed from `app`.
+    let named: Vec<String> = app
+        .theme_catalog
+        .picker_themes()
+        .map(|theme| theme.filename.clone())
+        .collect();
+
     card(ui, &palette, t("Theme"), |ui| {
-        let current = app.settings.theme.label();
-        egui::ComboBox::from_id_salt("settings-theme")
-            .selected_text(current)
-            .width(220.0)
-            .show_ui(ui, |ui| {
-                ui.selectable_value(
-                    &mut app.settings.theme,
-                    ThemeChoice::System,
-                    ThemeChoice::System.label(),
-                );
-                ui.selectable_value(
-                    &mut app.settings.theme,
-                    ThemeChoice::Dark,
-                    ThemeChoice::Dark.label(),
-                );
-                ui.selectable_value(
-                    &mut app.settings.theme,
-                    ThemeChoice::Light,
-                    ThemeChoice::Light.label(),
-                );
-                // Collected first: the picker borrows `app.settings` mutably
-                // while the catalog is borrowed from `app`.
-                let named: Vec<String> = app
-                    .theme_catalog
-                    .picker_themes()
-                    .map(|theme| theme.filename.clone())
-                    .collect();
-                if !named.is_empty() {
-                    ui.separator();
-                }
-                for filename in named {
-                    let choice = ThemeChoice::Named(filename);
-                    let label = choice.label();
-                    ui.selectable_value(&mut app.settings.theme, choice, label);
-                }
-            });
+        theme_picker(ui, "settings-theme", &mut app.settings.theme, &named);
         hint(
             ui,
             &palette,
             t(
-                "The full window and compact mode share one theme — they are the \
-               same window. Following the desktop keeps fastcription in step with \
-               Omarchy as you switch themes.",
+                "Following the desktop keeps fastcription in step with Omarchy as \
+               you switch themes.",
             ),
         );
+    });
+
+    card(ui, &palette, t("Compact mode"), |ui| {
+        let mut separate = app.settings.compact_theme.is_some();
+        if ui
+            .checkbox(&mut separate, t("Give compact mode its own theme"))
+            .on_hover_text(t(
+                "The caption strip sits over somebody else's call for an hour, \
+                 where a plainer or darker palette can be much easier to read off \
+                 than the one you like to work in.",
+            ))
+            .changed()
+        {
+            // Seeded from the main window's rather than from the default, so
+            // ticking the box changes nothing until something is picked.
+            app.settings.compact_theme = separate.then(|| app.settings.theme.clone());
+        }
+        if let Some(theme) = app.settings.compact_theme.as_mut() {
+            ui.add_space(4.0);
+            theme_picker(ui, "settings-compact-theme", theme, &named);
+        }
+
+        ui.add_space(10.0);
+        ui.add(
+            egui::Slider::new(
+                &mut app.settings.compact_visualizer_height,
+                COMPACT_VISUALIZER_RANGE,
+            )
+            .step_by(1.0)
+            .fixed_decimals(0)
+            .suffix(" pt")
+            .text(t("visualiser height")),
+        )
+        .on_hover_text(t(
+            "How tall the spectrum is drawn in the caption strip. Every point it \
+             takes is a point the captions do not get, so the range stops where \
+             two lines of text would no longer fit.",
+        ));
     });
 
     card(ui, &palette, t("Audio visualiser"), |ui| {
@@ -717,6 +771,30 @@ fn system(app: &mut App, ui: &mut Ui) {
     });
 }
 
+/// The theme dropdown, which both the window and compact mode need.
+///
+/// `named` is collected by the caller because this borrows the choice mutably
+/// and the list of palettes comes from the same `App`.
+fn theme_picker(ui: &mut Ui, id_salt: &str, choice: &mut ThemeChoice, named: &[String]) {
+    egui::ComboBox::from_id_salt(id_salt)
+        .selected_text(choice.label())
+        .width(220.0)
+        .show_ui(ui, |ui| {
+            for fixed in [ThemeChoice::System, ThemeChoice::Dark, ThemeChoice::Light] {
+                let label = fixed.label();
+                ui.selectable_value(choice, fixed, label);
+            }
+            if !named.is_empty() {
+                ui.separator();
+            }
+            for filename in named {
+                let option = ThemeChoice::Named(filename.clone());
+                let label = option.label();
+                ui.selectable_value(choice, option, label);
+            }
+        });
+}
+
 /// An editable choice: a dropdown of what voxtype reports, which still accepts
 /// a value that is not in the list, because `voxtype info` can fail while
 /// transcription works perfectly well.
@@ -785,6 +863,48 @@ mod tests {
     fn the_first_tab_is_the_one_that_matters_first() {
         assert_eq!(Tab::default(), Tab::Audio);
         assert_eq!(Tab::ALL[0], Tab::Audio);
+    }
+
+    /// The strip is 170 points tall and the captions are the point of it, so
+    /// a height out of range — or not a number, from a hand-edited settings
+    /// file — must not reach the layout.
+    #[test]
+    fn a_visualiser_height_is_clamped_to_what_the_strip_can_spare() {
+        let (low, high) = (
+            *COMPACT_VISUALIZER_RANGE.start(),
+            *COMPACT_VISUALIZER_RANGE.end(),
+        );
+        assert_eq!(clamp_visualizer_height(0.0), low);
+        assert_eq!(clamp_visualizer_height(10_000.0), high);
+        assert_eq!(clamp_visualizer_height(-5.0), low);
+        assert_eq!(
+            clamp_visualizer_height(f32::NAN),
+            COMPACT_VISUALIZER_DEFAULT
+        );
+        assert_eq!(
+            clamp_visualizer_height(f32::INFINITY),
+            COMPACT_VISUALIZER_DEFAULT
+        );
+        // A sensible value is left exactly alone.
+        assert_eq!(clamp_visualizer_height(40.0), 40.0);
+        assert_eq!(
+            clamp_visualizer_height(COMPACT_VISUALIZER_DEFAULT),
+            COMPACT_VISUALIZER_DEFAULT
+        );
+    }
+
+    /// The default has to sit inside its own range, or the slider opens with
+    /// its handle off the end of the track.
+    #[test]
+    fn the_default_height_is_inside_the_range() {
+        assert!(COMPACT_VISUALIZER_RANGE.contains(&COMPACT_VISUALIZER_DEFAULT));
+    }
+
+    /// `None` is "the same as the full window", which is what keeps the new
+    /// setting invisible to anyone who does not want it.
+    #[test]
+    fn compact_follows_the_main_theme_until_told_otherwise() {
+        assert_eq!(State::default().compact_theme, None);
     }
 
     /// Defaults have to keep the app behaving as it did for someone who never

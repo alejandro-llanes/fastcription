@@ -27,7 +27,7 @@ fn inner(app: &mut App, ui: &mut egui::Ui, id: ConversationId) {
     ui.horizontal(|ui| {
         crate::ui::label(ui, &app.palette, t("conversation"));
         if recording {
-            crate::ui::badge(ui, t("REC"), app.palette.accent);
+            crate::ui::badge(ui, &app.palette, t("REC"), app.palette.accent);
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // No Delete while this is the row the session is appending to: the

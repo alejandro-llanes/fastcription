@@ -207,20 +207,29 @@ owns the title while it is on, and none of these appear — see
 
 ### The status bar
 
-Along the foot of the window, as a row of labelled readouts, and none of it is
-a control:
+The spectrum of the *selected* source is drawn across the whole foot of the
+window, and the footer sits over it, translucent, with the loud bands
+breaking out of the top. It deliberately does not read your microphone: the
+side you cannot hear is the one you need to see arriving. Unticking "Show it
+in the full window too" under **Settings → Appearance** puts a percentage
+meter here instead.
 
-- **INPUT** — the spectrum of the *selected* source, updated 20 times a
-  second. Hovering says `Input level from <source>`, or "No audio source is
-  selected". It deliberately does not read your microphone: the side you
-  cannot hear is the one you need to see arriving. Turning the visualiser off,
-  or unticking "Show it in the full window too" under **Settings →
-  Appearance**, puts a percentage bar back here instead.
+Nothing on the bar is read straight off the spectrum. The readouts sit on an
+opaque plate and each state word on its own chip, which is what lets the bar
+be see-through at all — labels drawn directly onto it would have needed the
+bar to be 96% opaque to stay readable, and a bar you cannot see through is
+not worth drawing a spectrum behind.
+
+None of it is a control:
+
 - **ELAPSED** — `HH:MM:SS` of recording time, which stops while paused, and
   brightens while it is running. Hovering says "How long this conversation has
   been recording".
 - **SOURCE** — what is being recorded, shortened to fit. It is a reminder of a
   choice already made; the control that makes it is in the top bar.
+- **transcription behind** — a chip, and only while transcription cannot keep
+  up. See section 18.
+- **voxtype** — the daemon's state, as a chip on the right.
 - **"transcription behind — words arrive late"** — appears only while
   transcription cannot keep up, that is while one pass takes longer than the
   **seconds between passes** setting. No audio is lost when this shows; the
@@ -341,8 +350,10 @@ Along the foot of the strip:
   conversation with a gap in it, not two conversations. `Ctrl+.` still stops.
 - **The clock**, `HH:MM:SS` of recording time.
 - **The audio visualiser**, in whatever style you chose under
-  **Settings → Appearance**. It is the quickest answer to "is this thing still
-  hearing the call?" when the captions have not moved for a while.
+  **Settings → Appearance**, and at whatever height you set there. It is the
+  quickest answer to "is this thing still hearing the call?" when the captions
+  have not moved for a while. Every point of height it takes is a point the
+  captions do not get, which is why it is yours to set.
 - **Restore**, on the right.
 
 Compact mode answers every shortcut the full window does — the size keys and
@@ -350,6 +361,12 @@ the transport keys — but all of them need keyboard focus, which the
 recommended compositor rule deliberately withholds so your meeting keeps it.
 That is why the record button is there: reaching the transport used to mean
 restoring the window, pressing a button and shrinking again.
+
+**Compact mode can wear its own theme.** Under **Settings → Appearance →
+Compact mode**, tick "Give compact mode its own theme" and pick one. The strip
+sits over somebody else's call for an hour, where a plainer or darker palette
+is often much easier to read off than the one you like to work in. Left
+unticked, it follows the main window.
 
 **Compact mode is the main window.** There is one window; hiding fastcription
 to the tray hides the captions with it. Stop compact mode before hiding, or
