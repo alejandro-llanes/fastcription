@@ -16,12 +16,12 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Sender;
 use fc_core::{AudioSource, SessionEvent};
 
-use crate::{levels, sources};
+use crate::{levels, sources, spectrum};
 
 /// One read's worth of normalized samples, in capture order.
 pub type PcmFrame = Vec<f32>;
 
-const SAMPLE_RATE: usize = 16_000;
+use crate::SAMPLE_RATE;
 const LEVEL_HZ: usize = 20;
 const LEVEL_WINDOW_SAMPLES: usize = SAMPLE_RATE / LEVEL_HZ;
 const BASE_BACKOFF: Duration = Duration::from_millis(250);
@@ -282,6 +282,8 @@ fn run_one_session(
     );
     let mut leftover: Option<u8> = None;
     let mut level_window: Vec<f32> = Vec::with_capacity(LEVEL_WINDOW_SAMPLES * 2);
+    // Allocated once, outside the read loop: this is the audio path.
+    let mut analyzer = spectrum::Analyzer::new();
     let mut buf = [0u8; 4096];
     let mut pcm_receiver_gone = false;
 
@@ -315,9 +317,16 @@ fn run_one_session(
         while level_window.len() >= LEVEL_WINDOW_SAMPLES {
             let (peak, rms) = {
                 let window = &level_window[..LEVEL_WINDOW_SAMPLES];
+                // The analyser keeps its own rolling history, so it is given
+                // the whole block and transforms the newest 512 samples of it.
+                analyzer.push(window);
                 (levels::peak(window), levels::rms(window))
             };
-            let _ = event_tx.send(SessionEvent::Level { peak, rms });
+            let _ = event_tx.send(SessionEvent::Level {
+                peak,
+                rms,
+                bands: analyzer.bands(),
+            });
             level_window.drain(..LEVEL_WINDOW_SAMPLES);
         }
 

@@ -12,9 +12,18 @@ mod bounded;
 pub mod capture;
 pub mod levels;
 pub mod sources;
+pub mod spectrum;
 
 pub use capture::{CaptureBackend, ParecCapture, PcmFrame};
 pub use sources::{default_source, enumerate, resolve};
+pub use spectrum::{Analyzer, BANDS};
+
+/// What every source is resampled to on capture, and the rate voxtype wants.
+///
+/// At the crate root rather than inside [`capture`] because [`spectrum`] has
+/// to agree with it: a band boundary in Hz is only a bin index if both halves
+/// believe the same thing about the sample rate.
+pub const SAMPLE_RATE: usize = 16_000;
 
 /// Errors from source enumeration and capture.
 #[derive(Debug, thiserror::Error)]

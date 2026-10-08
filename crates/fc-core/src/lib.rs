@@ -139,16 +139,30 @@ pub enum SessionState {
     Finishing,
 }
 
+/// How many frequency bands the visualiser is given.
+///
+/// Here rather than in `fc-audio`, which produces them, because
+/// [`SessionEvent::Level`] carries them and `fc-core` is the crate `fc-audio`
+/// depends on rather than the other way round. `fc_audio::BANDS` re-exports
+/// this, so there is still one number.
+pub const SPECTRUM_BANDS: usize = 24;
+
 /// Everything the capture and transcription pipeline reports to the UI.
 ///
 /// One channel carries all of it so the UI has a single place to drain and a
 /// single ordering. Levels are frequent and lossy; segments are not.
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
-    /// Audio level for the meter. Dropping these is always safe.
+    /// Audio level for the meter, and the spectrum for the visualiser.
+    /// Dropping these is always safe.
     Level {
         peak: f32,
         rms: f32,
+        /// Band magnitudes, 0.0 to 1.0, low frequency first. Produced by
+        /// `fc_audio::spectrum`; carried here because this is the event the
+        /// capture thread already sends at the right rate, and a second
+        /// channel for it would be a second thing to keep in step.
+        bands: [f32; SPECTRUM_BANDS],
     },
     /// A first-pass result from a short chunk, to be replaced by the committed
     /// segment that covers the same audio. Never persisted.
