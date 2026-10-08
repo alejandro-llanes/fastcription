@@ -233,32 +233,48 @@ pub fn line_menu(response: &Response, segment: &Segment) {
 /// for its heading, so it is offered only once there is one.
 pub fn copy_buttons(ui: &mut egui::Ui, conversation: Option<&Conversation>, segments: &[Segment]) {
     let empty = segments.is_empty();
-    if ui
-        .add_enabled(!empty, egui::Button::new(t("Copy")))
-        .on_hover_text(t("The whole transcript as plain text"))
-        .clicked()
-    {
-        ui.ctx().copy_text(plain(segments));
-    }
-
     let record = conversation.filter(|_| !empty);
-    let button = ui.add_enabled(record.is_some(), egui::Button::new(t("Copy as Markdown")));
-    match record {
-        Some(conversation) if button.clicked() => {
-            ui.ctx().copy_text(fc_export::export(
-                conversation,
-                segments,
-                fc_export::ExportFormat::Markdown,
-                &COPY_OPTIONS,
-            ));
+
+    let plain_button = |ui: &mut egui::Ui| {
+        if ui
+            .add_enabled(!empty, egui::Button::new(t("Copy")))
+            .on_hover_text(t("The whole transcript as plain text"))
+            .clicked()
+        {
+            ui.ctx().copy_text(plain(segments));
         }
-        Some(_) => {}
-        None => {
-            button.on_disabled_hover_text(t(
-                "Markdown carries a heading naming the conversation, and there is no \
-                 conversation to name yet.",
-            ));
+    };
+    let markdown_button = |ui: &mut egui::Ui| {
+        let button = ui.add_enabled(record.is_some(), egui::Button::new(t("Copy as Markdown")));
+        match record {
+            Some(conversation) if button.clicked() => {
+                ui.ctx().copy_text(fc_export::export(
+                    conversation,
+                    segments,
+                    fc_export::ExportFormat::Markdown,
+                    &COPY_OPTIONS,
+                ));
+            }
+            Some(_) => {}
+            None => {
+                button.on_disabled_hover_text(t(
+                    "Markdown carries a heading naming the conversation, and there is no \
+                     conversation to name yet.",
+                ));
+            }
         }
+    };
+
+    // Emitted back to front in a right-aligned row, so the pair reads "Copy,
+    // Copy as Markdown" on screen either way. A header that aligns its
+    // controls to the right places the first widget rightmost, which had the
+    // longer, rarer button sitting where the eye looks first.
+    if ui.layout().prefer_right_to_left() {
+        markdown_button(ui);
+        plain_button(ui);
+    } else {
+        plain_button(ui);
+        markdown_button(ui);
     }
 }
 

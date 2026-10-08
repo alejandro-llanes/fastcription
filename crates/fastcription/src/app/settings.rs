@@ -149,7 +149,7 @@ impl Tab {
 const CONTENT_WIDTH: f32 = 720.0;
 
 pub fn show(app: &mut App, ui: &mut Ui) {
-    ui.heading(t("Settings"));
+    crate::ui::label(ui, &app.palette.clone(), t("settings"));
     ui.add_space(8.0);
     tab_row(app, ui);
     ui.add_space(12.0);
@@ -231,6 +231,7 @@ fn card<R>(ui: &mut Ui, palette: &Palette, title: &str, body: impl FnOnce(&mut U
             // column of them comes out ragged — each one a different width,
             // none of them lining up with the next.
             ui.set_width(ui.available_width());
+            crate::ui::inset_controls(ui, palette);
             ui.label(RichText::new(title).strong().color(palette.text));
             ui.add_space(8.0);
             body(ui)

@@ -25,14 +25,25 @@ use crate::i18n::{t, tf};
 const LIVE_WINDOW: usize = 400;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
-    // Wrapped, because at the window's minimum width the heading, the size
+    let palette = app.palette.clone();
+    crate::ui::pane(ui, &palette, |ui| {
+        header(app, ui, &palette);
+        ui.add_space(10.0);
+        body(app, ui);
+    });
+}
+
+/// The panel's own title row: what this is, how big to draw it, and the two
+/// ways out of it.
+fn header(app: &mut App, ui: &mut egui::Ui, palette: &crate::theme::Palette) {
+    // Wrapped, because at the window's minimum width the label, the size
     // slider and the two copy buttons do not fit on one line.
     ui.horizontal_wrapped(|ui| {
-        ui.heading(t("Live transcript"));
-        ui.separator();
-        // Labelled in front and showing its value: a bare slider with a word
-        // after it reads as a stray control rather than as a text size.
-        ui.label(t("Text size"));
+        crate::ui::label(ui, palette, t("live transcript"));
+        ui.add_space(10.0);
+        // An explicit width: in a wrapped row the slider otherwise takes
+        // whatever is left, which on a wide window is most of the header.
+        ui.spacing_mut().slider_width = 110.0;
         ui.add(
             egui::Slider::new(&mut app.settings.transcript_pt, transcript::PT_RANGE)
                 .step_by(1.0)
@@ -43,14 +54,16 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             "How large the transcript is drawn, here and in compact mode. \
              Ctrl+= and Ctrl+- do the same, and Ctrl+0 goes back to 22.",
         ));
-        ui.separator();
-        let conversation = app
-            .live_conversation
-            .and_then(|id| app.conversations.iter().find(|c| c.id == id));
-        transcript::copy_buttons(ui, conversation, &app.segments);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let conversation = app
+                .live_conversation
+                .and_then(|id| app.conversations.iter().find(|c| c.id == id));
+            transcript::copy_buttons(ui, conversation, &app.segments);
+        });
     });
-    ui.separator();
+}
 
+fn body(app: &mut App, ui: &mut egui::Ui) {
     let waiting = app.segments.is_empty() && app.provisional.is_empty();
     if waiting && app.state == SessionState::Idle {
         egui::ScrollArea::vertical()

@@ -7,6 +7,11 @@ use crate::app::{transcript, App, PendingDelete};
 use crate::i18n::t;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui, id: ConversationId) {
+    let palette = app.palette.clone();
+    crate::ui::pane(ui, &palette, |ui| inner(app, ui, id));
+}
+
+fn inner(app: &mut App, ui: &mut egui::Ui, id: ConversationId) {
     let Some(index) = app.conversations.iter().position(|c| c.id == id) else {
         ui.weak(t("This conversation is gone."));
         return;
@@ -20,13 +25,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: ConversationId) {
 
     let recording = app.is_recording(conversation.id);
     ui.horizontal(|ui| {
-        ui.heading(t("Conversation"));
+        crate::ui::label(ui, &app.palette, t("conversation"));
         if recording {
-            ui.label(
-                RichText::new(t("recording"))
-                    .strong()
-                    .color(app.palette.danger),
-            );
+            crate::ui::badge(ui, t("REC"), app.palette.accent);
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // No Delete while this is the row the session is appending to: the

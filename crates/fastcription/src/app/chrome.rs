@@ -52,6 +52,11 @@ const COMBO_WIDTH: f32 = 230.0;
 /// `COMBO_WIDTH` at the default text size.
 const COMBO_CHARS: usize = 34;
 
+/// How much of the source's name the footer readout spells out. Shorter than
+/// the picker's: this one is a reminder of a choice already made, not the
+/// control that makes it.
+const SOURCE_READOUT_CHARS: usize = 28;
+
 impl App {
     /// Re-applies everything tied to an `egui::Context`: fonts, text
     /// rendering, icons, and the current palette. Called once per window —
@@ -123,23 +128,40 @@ impl App {
 
         self.delete_confirmation(&ctx);
 
-        egui::Panel::top("top-bar").show(ui, |ui| self.top_bar(ui));
+        egui::Panel::top("top-bar")
+            .frame(crate::ui::bar(&self.palette, true))
+            .show(ui, |ui| self.top_bar(ui));
         self.notice_panel(ui);
         // Below the notices and above the sidebar, so it spans the window:
         // what it carries is about the session, not about either pane.
-        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        egui::Panel::bottom("status")
+            .frame(crate::ui::bar(&self.palette, false))
+            .show(ui, |ui| self.status_bar(ui));
 
         egui::Panel::left("sidebar")
             .resizable(true)
             .default_size(260.0)
             .size_range(200.0..=420.0)
+            .frame(
+                egui::Frame::default()
+                    .fill(self.palette.panel)
+                    .inner_margin(egui::Margin::symmetric(10, 10)),
+            )
             .show(ui, |ui| super::sidebar::show(self, ui));
 
-        egui::CentralPanel::default().show(ui, |ui| match self.main_view {
-            MainView::Live => super::live::show(self, ui),
-            MainView::History(id) => super::history::show(self, ui, id),
-            MainView::Settings => super::settings::show(self, ui),
-        });
+        // The ground the panels sit on, and the frame the transcript is read
+        // out of.
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::default()
+                    .fill(self.palette.window)
+                    .inner_margin(egui::Margin::same(12)),
+            )
+            .show(ui, |ui| match self.main_view {
+                MainView::Live => super::live::show(self, ui),
+                MainView::History(id) => super::history::show(self, ui, id),
+                MainView::Settings => super::settings::show(self, ui),
+            });
     }
 
     /// Every key the window answers to.
@@ -510,6 +532,17 @@ impl App {
                         if top < area.top() && index > 0 {
                             break;
                         }
+                        // That exception still may not slice a row in half. An
+                        // utterance can run longer than the whole strip — a
+                        // speaker who does not pause builds one segment for as
+                        // long as it takes — so the galley is pushed down until
+                        // the first row that still fits starts exactly at the
+                        // top edge, and the clip falls between rows.
+                        let top = if top < area.top() {
+                            top + first_visible_row(&galley, area.top() - top)
+                        } else {
+                            top
+                        };
                         painter.galley(
                             egui::Pos2::new(area.left(), top),
                             galley,
@@ -534,39 +567,61 @@ impl App {
     /// as well, and below about a thousand points — the window's minimum is
     /// 760 — the right-hand controls were simply off the edge.
     fn top_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if ui
-                .selectable_label(self.main_view == MainView::Live, t("Live"))
-                .clicked()
-            {
-                self.main_view = MainView::Live;
-            }
-            ui.separator();
+        use crate::ui;
 
+        let palette = self.palette.clone();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+
+            // What the session is doing, first and in colour, because it is
+            // the one thing on this bar that changes by itself.
+            let (state, colour) = match self.state {
+                SessionState::Recording => (t("REC"), palette.accent),
+                SessionState::Paused => (t("PAUSED"), palette.warning),
+                SessionState::Finishing => (t("FINISHING"), palette.warning),
+                SessionState::Idle => (t("IDLE"), palette.dim),
+            };
+            ui.add_space(2.0);
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.add(dot(colour, self.state == SessionState::Recording));
+                ui.label(
+                    RichText::new(state)
+                        .size(ui::LABEL_PT + 1.0)
+                        .color(colour)
+                        .strong(),
+                );
+            });
+
+            ui.add_space(4.0);
             source_combo(self, ui, "top-bar-source");
 
-            ui.separator();
-            ui.add(crate::icons::Icon::Mic.image(self.palette.secondary, 14.0))
-                .on_hover_text(t("Also transcribe your own microphone, as a second track"));
-            mic_checkbox(self, ui, t("Mic"));
-
-            ui.separator();
+            ui.add_space(4.0);
             self.transport(ui);
 
+            ui.add_space(4.0);
+            mic_checkbox(self, ui, t("Mic"));
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .selectable_label(self.main_view == MainView::Settings, t("Settings"))
-                    .clicked()
-                {
-                    self.main_view = MainView::Settings;
-                }
-                if ui
-                    .selectable_label(self.compact, t("Compact"))
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if ui::icon_button(ui, &palette, crate::icons::Icon::Compact, self.compact)
                     .on_hover_text(t("Captions only, always on top (Ctrl+M). Esc comes back."))
                     .clicked()
                 {
                     let ctx = ui.ctx().clone();
                     self.set_compact(&ctx, true);
+                }
+                // Right-to-left, so this is added after the button it sits to
+                // the left of.
+                let chosen = usize::from(self.main_view == MainView::Settings);
+                if let Some(index) =
+                    ui::segmented(ui, &palette, &[t("Live"), t("Settings")], chosen)
+                {
+                    self.main_view = if index == 0 {
+                        MainView::Live
+                    } else {
+                        MainView::Settings
+                    };
                 }
             });
         });
@@ -579,8 +634,9 @@ impl App {
     /// across the narrowest window the app allows.
     fn transport(&mut self, ui: &mut egui::Ui) {
         use crate::icons::Icon;
-        let tint = self.palette.text;
+        use crate::ui::{self, Tone};
 
+        let palette = self.palette.clone();
         let can_start = matches!(self.state, SessionState::Idle | SessionState::Paused)
             && !self.library_read_only;
         let start_label = if self.state == SessionState::Paused {
@@ -588,32 +644,62 @@ impl App {
         } else {
             t("Start")
         };
-        let start = ui.add_enabled(
-            can_start,
-            egui::Button::image_and_text(Icon::Play.image(tint, 14.0), start_label),
-        );
+        // Primary only when pressing it would do something: a lit button that
+        // refuses is worse than a dim one that explains itself on hover.
+        let tone = if can_start {
+            Tone::Primary
+        } else {
+            Tone::Normal
+        };
+        let tint = if can_start {
+            palette.on_accent
+        } else {
+            palette.text
+        };
+        let start = ui
+            .scope(|ui| {
+                if !can_start {
+                    ui.disable();
+                }
+                ui::pill(
+                    ui,
+                    &palette,
+                    tone,
+                    Some(Icon::Play.image(tint, 14.0)),
+                    start_label,
+                )
+            })
+            .inner;
         if self.library_read_only {
             start.on_disabled_hover_text(crate::env::read_only_library(&self.library_path));
         } else if start.on_hover_text(t("Ctrl+R")).clicked() {
             self.start_or_resume();
         }
 
+        let recording = self.state == SessionState::Recording;
+        let stoppable = matches!(self.state, SessionState::Recording | SessionState::Paused);
         if ui
-            .add_enabled(
-                self.state == SessionState::Recording,
-                egui::Button::image_and_text(Icon::Pause.image(tint, 14.0), t("Pause")),
-            )
-            .on_hover_text(t("Ctrl+Space"))
+            .scope(|ui| {
+                if !recording {
+                    ui.disable();
+                }
+                ui::icon_button(ui, &palette, Icon::Pause, false)
+            })
+            .inner
+            .on_hover_text(t("Pause (Ctrl+Space)"))
             .clicked()
         {
             self.pause();
         }
         if ui
-            .add_enabled(
-                matches!(self.state, SessionState::Recording | SessionState::Paused),
-                egui::Button::image_and_text(Icon::Stop.image(tint, 14.0), t("Stop")),
-            )
-            .on_hover_text(t("Ctrl+."))
+            .scope(|ui| {
+                if !stoppable {
+                    ui.disable();
+                }
+                ui::icon_button(ui, &palette, Icon::Stop, false)
+            })
+            .inner
+            .on_hover_text(t("Stop (Ctrl+.)"))
             .clicked()
         {
             self.stop();
@@ -627,66 +713,92 @@ impl App {
     /// None of it is a control, which is why it is down here and not next to
     /// the buttons.
     fn status_bar(&mut self, ui: &mut egui::Ui) {
+        use crate::ui;
+
+        let palette = self.palette.clone();
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 14.0;
+
             // The meter reads the *selected* source, which is usually the other
             // end of a call. A microphone icon here said the opposite, and a
             // user watching a flat meter while the remote side talked had every
             // reason to think they had picked the wrong thing.
-            let hover = match self
+            let source = self
                 .selected_source
                 .and_then(|index| self.sources.get(index))
-            {
-                Some(source) => tf("Input level from {}", &[&source.label()]),
+                .map(|source| source.label());
+            let hover = match &source {
+                Some(label) => tf("Input level from {}", &[label]),
                 None => t("No audio source is selected").to_owned(),
             };
-            ui.add(crate::icons::Icon::Monitor.image(self.palette.secondary, 14.0))
-                .on_hover_text(hover.clone());
-            // The spectrum in place of the bar, when there is one. It answers
-            // the same question — is anything being heard — and answers it from
-            // further away, which is the distance this app is read from. The
-            // percentage goes with it, so the bar stays available for anyone
-            // who wants the number or does not want the movement.
-            let spectrum = self
-                .settings
-                .visualizer_in_main
-                .then(|| {
-                    self.visualizer.show(
-                        ui,
-                        &self.palette,
-                        self.settings.visualizer,
-                        egui::vec2(STATUS_VISUALIZER_WIDTH, STATUS_VISUALIZER_HEIGHT),
-                    )
-                })
-                .flatten();
-            match spectrum {
-                Some(response) => {
-                    response.on_hover_text(hover);
+
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui::label(ui, &palette, t("input"));
+                let spectrum = self
+                    .settings
+                    .visualizer_in_main
+                    .then(|| {
+                        self.visualizer.show(
+                            ui,
+                            &palette,
+                            self.settings.visualizer,
+                            egui::vec2(STATUS_VISUALIZER_WIDTH, STATUS_VISUALIZER_HEIGHT),
+                        )
+                    })
+                    .flatten();
+                match spectrum {
+                    Some(response) => {
+                        response.on_hover_text(hover);
+                    }
+                    None => {
+                        ui.add(
+                            egui::ProgressBar::new(self.level_peak.clamp(0.0, 1.0))
+                                .desired_width(STATUS_VISUALIZER_WIDTH)
+                                .desired_height(STATUS_VISUALIZER_HEIGHT)
+                                .show_percentage(),
+                        )
+                        .on_hover_text(hover);
+                    }
                 }
-                None => {
-                    ui.add(
-                        egui::ProgressBar::new(self.level_peak.clamp(0.0, 1.0))
-                            .desired_width(90.0)
-                            .show_percentage(),
-                    )
-                    .on_hover_text(hover);
-                }
+            });
+
+            separator(ui, &palette);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui::readout(
+                    ui,
+                    &palette,
+                    t("elapsed"),
+                    &format_elapsed(self.elapsed()),
+                    self.state == SessionState::Recording,
+                );
+            })
+            .response
+            .on_hover_text(t("How long this conversation has been recording"));
+
+            if let Some(label) = source {
+                separator(ui, &palette);
+                ui::readout(
+                    ui,
+                    &palette,
+                    t("source"),
+                    &elide(&label, SOURCE_READOUT_CHARS),
+                    false,
+                );
             }
 
-            ui.separator();
-            ui.label(format_elapsed(self.elapsed()))
-                .on_hover_text(t("How long this conversation has been recording"));
-
             if self.pressure == Pressure::Lagging {
-                ui.separator();
-                ui.add(crate::icons::Icon::StatusWarn.image(self.palette.warning, 14.0));
+                separator(ui, &palette);
+                ui.add(crate::icons::Icon::StatusWarn.image(palette.warning, 14.0));
                 ui.colored_label(
-                    self.palette.warning,
+                    palette.warning,
                     t("transcription behind \u{2014} words arrive late"),
                 );
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                service_pill(ui, &self.palette, self.voxtype_service);
+                service_pill(ui, &palette, self.voxtype_service);
             });
         });
     }
@@ -981,6 +1093,10 @@ pub(super) fn source_combo(app: &mut App, ui: &mut egui::Ui, id_salt: &str) {
         None => t("No audio source").to_owned(),
     };
     ui.add_enabled_ui(!locked, |ui| {
+        // The picker is the widest control on the bar and the one a reader
+        // checks before pressing Start, so it is given the height of the row
+        // rather than egui's default, which left it sitting in a dent.
+        ui.spacing_mut().interact_size.y = crate::ui::CONTROL_HEIGHT;
         let combo = egui::ComboBox::from_id_salt(id_salt)
             // Elided here rather than by the widget: `ComboBox::width` sizes
             // the drop-down menu, not the button, so the button grew to the
@@ -1006,11 +1122,8 @@ pub(super) fn source_combo(app: &mut App, ui: &mut egui::Ui, id_salt: &str) {
             combo.response.on_hover_text(current);
         }
     });
-    if ui
-        .add(
-            egui::Button::image(crate::icons::Icon::Reconnect.image(app.palette.secondary, 13.0))
-                .small(),
-        )
+    let palette = app.palette.clone();
+    if crate::ui::icon_button(ui, &palette, crate::icons::Icon::Reconnect, false)
         .on_hover_text(t("Look for audio sources again"))
         .clicked()
     {
@@ -1021,13 +1134,90 @@ pub(super) fn source_combo(app: &mut App, ui: &mut egui::Ui, id_salt: &str) {
 /// The second-track toggle, disabled for the same reason the source picker is:
 /// the mic track is opened when the session starts and not after.
 pub(super) fn mic_checkbox(app: &mut App, ui: &mut egui::Ui, label: &str) {
+    use crate::ui::{self, Tone};
+
     let locked = app.source_locked();
+    let palette = app.palette.clone();
+    let on = app.mic_track;
+    // A pill that is lit when the track is on, rather than a checkbox. The bar
+    // is a row of pills; one checkbox in the middle of it read as a leftover.
+    let tone = if on { Tone::Primary } else { Tone::Normal };
+    let tint = if on { palette.on_accent } else { palette.text };
     let response = ui
-        .add_enabled_ui(!locked, |ui| ui.checkbox(&mut app.mic_track, label))
+        .add_enabled_ui(!locked, |ui| {
+            ui::pill(
+                ui,
+                &palette,
+                tone,
+                Some(crate::icons::Icon::Mic.image(tint, 14.0)),
+                label,
+            )
+        })
         .inner;
     if locked {
         response.on_disabled_hover_text(t("Stop the recording to change the source"));
+    } else {
+        if response
+            .on_hover_text(t("Also transcribe your own microphone, as a second track"))
+            .clicked()
+        {
+            app.mic_track = !on;
+        }
     }
+}
+
+/// How far into a galley to start so that no row is cut through its glyphs.
+///
+/// `hidden` is how much of the galley's height has to go, measured from its
+/// top. The answer is the top of the first row that begins at or after that,
+/// which is always a clean boundary. A galley with no rows, or one whose last
+/// row still starts before the cut, falls back to hiding exactly what was
+/// asked — there is nothing better to do, and it is no worse than the clip
+/// would have been on its own.
+fn first_visible_row(galley: &egui::Galley, hidden: f32) -> f32 {
+    galley
+        .rows
+        .iter()
+        .map(|row| row.pos.y)
+        .find(|&y| y >= hidden)
+        .unwrap_or(hidden)
+}
+
+/// A filled circle, for the state light on the top bar.
+///
+/// `lit` gives it the halo. Only the recording state gets one: a glow that is
+/// always there says nothing, and the point of this dot is to be the thing
+/// that changes.
+fn dot(color: egui::Color32, lit: bool) -> impl egui::Widget {
+    move |ui: &mut egui::Ui| {
+        let size = egui::Vec2::splat(10.0);
+        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+        if ui.is_rect_visible(rect) {
+            let painter = ui.painter();
+            if lit {
+                for (grow, alpha) in [(4.0_f32, 0.12_f32), (2.0, 0.22)] {
+                    painter.circle_filled(
+                        rect.center(),
+                        rect.width() / 2.0 + grow,
+                        color.gamma_multiply(alpha),
+                    );
+                }
+            }
+            painter.circle_filled(rect.center(), rect.width() / 2.0, color);
+        }
+        response
+    }
+}
+
+/// A hairline between two readouts, shorter than the row so it reads as a
+/// divider rather than as a border.
+fn separator(ui: &mut egui::Ui, palette: &crate::theme::Palette) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, 24.0), egui::Sense::hover());
+    ui.painter().rect_filled(
+        egui::Rect::from_center_size(rect.center(), egui::vec2(1.0, 24.0)),
+        0,
+        palette.outline,
+    );
 }
 
 fn service_pill(ui: &mut egui::Ui, palette: &crate::theme::Palette, status: ServiceStatus) {
@@ -1051,11 +1241,11 @@ fn service_pill(ui: &mut egui::Ui, palette: &crate::theme::Palette, status: Serv
             palette.dim,
         ),
     };
-    // Added label first: the status bar aligns this to the right, where the
-    // first widget placed is the rightmost one, so this is what puts the icon
-    // on the left of the words.
-    ui.colored_label(color, text);
-    ui.add(icon.image(color, 14.0));
+    // One capsule rather than an icon and a label side by side: aligned to the
+    // right of the bar, the two used to be laid out in reverse and needed a
+    // comment explaining why the label came first.
+    let _ = icon;
+    crate::ui::badge(ui, text, color);
 }
 
 fn notice_icon(kind: NoticeKind) -> crate::icons::Icon {

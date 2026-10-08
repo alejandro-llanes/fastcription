@@ -164,6 +164,18 @@ capture is restarted.
 
 ## 5. Recording
 
+### The top bar
+
+Left to right: a **state light** — a coloured dot and one word, `REC`,
+`PAUSED`, `FINISHING` or `IDLE`, the dot haloed while recording — then the
+**source picker** and its refresh button, then **Start**, **Pause** and
+**Stop**, then the **Mic** toggle. On the right, **Live / Settings** as one
+switch, and the button that enters compact mode.
+
+Start is the only filled button, and only while pressing it would do
+something: a lit control that refuses is worse than a dim one that explains
+itself when you hover. Mic lights up the same way when the second track is on.
+
 **Start** (`Ctrl+R`) begins a new conversation. It is refused, with a notice,
 if there is no source selected ("Choose an audio source first."), no voxtype,
 no model, or a library that will not take writes. The Start button is greyed
@@ -195,16 +207,20 @@ owns the title while it is on, and none of these appear — see
 
 ### The status bar
 
-Along the foot of the window, and none of it is a control:
+Along the foot of the window, as a row of labelled readouts, and none of it is
+a control:
 
-- **The audio visualiser** — the spectrum of the *selected* source, updated
-  20 times a second. Hovering says `Input level from <source>`, or "No audio
-  source is selected". It deliberately does not read your microphone: the side
-  you cannot hear is the one you need to see arriving. Turning the visualiser
-  off, or unticking "Show it in the full window too" under
-  **Settings → Appearance**, puts the old percentage bar back here.
-- **The clock** — `HH:MM:SS` of recording time, which stops while paused.
-  Hovering says "How long this conversation has been recording".
+- **INPUT** — the spectrum of the *selected* source, updated 20 times a
+  second. Hovering says `Input level from <source>`, or "No audio source is
+  selected". It deliberately does not read your microphone: the side you
+  cannot hear is the one you need to see arriving. Turning the visualiser off,
+  or unticking "Show it in the full window too" under **Settings →
+  Appearance**, puts a percentage bar back here instead.
+- **ELAPSED** — `HH:MM:SS` of recording time, which stops while paused, and
+  brightens while it is running. Hovering says "How long this conversation has
+  been recording".
+- **SOURCE** — what is being recorded, shortened to fit. It is a reminder of a
+  choice already made; the control that makes it is in the top bar.
 - **"transcription behind — words arrive late"** — appears only while
   transcription cannot keep up, that is while one pass takes longer than the
   **seconds between passes** setting. No audio is lost when this shows; the

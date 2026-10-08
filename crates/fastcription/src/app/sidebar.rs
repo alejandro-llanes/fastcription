@@ -159,20 +159,23 @@ pub fn marked_spans(snippet: &str) -> Vec<(String, bool)> {
 }
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
-    ui.heading(t("Conversations"));
+    let palette = app.palette.clone();
+    crate::ui::label(ui, &palette, t("conversations"));
+    ui.add_space(6.0);
+    // Full width: a search box narrower than the list it filters looks like it
+    // belongs to something else on the panel.
     if ui
-        .add(egui::TextEdit::singleline(&mut app.sidebar.search).hint_text(t("Search…")))
+        .add_sized(
+            [ui.available_width(), crate::ui::CONTROL_HEIGHT],
+            egui::TextEdit::singleline(&mut app.sidebar.search).hint_text(t("Search…")),
+        )
         .changed()
     {
         app.sidebar.typed_at = Some(std::time::Instant::now());
     }
-    ui.add_space(6.0);
+    ui.add_space(10.0);
 
-    ui.label(
-        RichText::new(t("Groups"))
-            .small()
-            .color(app.palette.secondary),
-    );
+    crate::ui::label(ui, &palette, t("groups"));
     ui.horizontal_wrapped(|ui| {
         if ui
             .selectable_label(app.sidebar.group_filter.is_none(), t("All"))
@@ -202,12 +205,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         app.create_group(&name);
     }
 
-    ui.add_space(6.0);
-    ui.label(
-        RichText::new(t("Tags"))
-            .small()
-            .color(app.palette.secondary),
-    );
+    ui.add_space(10.0);
+    crate::ui::label(ui, &palette, t("tags"));
     ui.horizontal_wrapped(|ui| {
         for tag in app.tags.clone() {
             let selected = app.sidebar.tag_filter.contains(&tag.id);

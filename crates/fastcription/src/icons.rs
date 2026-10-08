@@ -35,5 +35,8 @@ fastframe_icons::icons! {
         /// word "Restore", and the two arrows say "make this big again" in a
         /// shape anyone has already seen on a video player.
         Restore => lucide "maximize-2",
+        /// Enter compact mode: the opposite of `Restore`, and drawn as its
+        /// mirror so the pair reads as one toggle.
+        Compact => lucide "minimize-2",
     }
 }
