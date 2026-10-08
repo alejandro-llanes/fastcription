@@ -26,8 +26,6 @@ pub struct Selection {
     pub owner: Id,
     /// Character range into the row's galley text, half-open.
     pub range: (usize, usize),
-    /// Where the drag started, so extending it in either direction works.
-    anchor: usize,
     /// The selected words.
     pub text: String,
     /// The whole line, for the lookup to explain the words in the light of.
@@ -75,27 +73,38 @@ pub fn interact(
     let raw = |pos: Pos2| galley.cursor_from_pos(pos - rect.min).index.0;
     let at = |pos: Pos2| raw(pos).clamp(bounds.0, bounds.1);
 
+    // The anchor lives in egui's frame-to-frame memory, not in the selection.
+    // At the moment a drag starts the range is empty, and an empty selection
+    // is `None` — which is no place to keep the one thing the next frame
+    // needs. The first version kept it there, and no drag ever grew past its
+    // first frame.
+    let anchor_key = owner.with("selection-anchor");
+
     if response.double_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             // Unclamped on purpose: a double-click on the speaker or the
             // timestamp must select nothing, not the first word of the line.
             let range = word_at(&chars, raw(pos), bounds);
-            *selection = make(owner, range, range.0, &chars, source);
+            *selection = make(owner, range, &chars, source);
         }
-    } else if response.drag_started() {
-        if let Some(pos) = response.interact_pointer_pos() {
-            let index = at(pos);
-            *selection = make(owner, (index, index), index, &chars, source);
+        return response;
+    }
+    if response.drag_started() {
+        // Where the button went down, not where the pointer was when egui
+        // decided this was a drag: the two differ by the drag threshold, which
+        // at caption sizes is most of a character.
+        let origin = ui
+            .input(|i| i.pointer.press_origin())
+            .or_else(|| response.interact_pointer_pos());
+        if let Some(pos) = origin {
+            ui.data_mut(|d| d.insert_temp(anchor_key, at(pos)));
         }
-    } else if response.dragged() {
-        if let (Some(pos), Some(current)) = (
-            response.interact_pointer_pos(),
-            selection.as_ref().filter(|s| s.owner == owner),
-        ) {
+    }
+    if response.dragged() {
+        let anchor = ui.data(|d| d.get_temp::<usize>(anchor_key));
+        if let (Some(pos), Some(anchor)) = (response.interact_pointer_pos(), anchor) {
             let head = at(pos);
-            let anchor = current.anchor;
-            let range = (anchor.min(head), anchor.max(head));
-            *selection = make(owner, range, anchor, &chars, source);
+            *selection = make(owner, (anchor.min(head), anchor.max(head)), &chars, source);
         }
     } else if response.clicked() {
         *selection = None;
@@ -107,7 +116,6 @@ pub fn interact(
 fn make(
     owner: Id,
     range: (usize, usize),
-    anchor: usize,
     chars: &[char],
     source: &Source<'_>,
 ) -> Option<Selection> {
@@ -119,7 +127,6 @@ fn make(
     Some(Selection {
         owner,
         range,
-        anchor,
         text: text.to_owned(),
         context: fc_core::single_line(source.text),
         conversation: source.conversation,
@@ -253,8 +260,8 @@ mod tests {
             start_ms: Some(3),
         };
         let c = chars("hello there");
-        assert!(make(Id::new("r"), (5, 6), 5, &c, &source).is_none()); // the space
-        let sel = make(Id::new("r"), (0, 5), 0, &c, &source).unwrap();
+        assert!(make(Id::new("r"), (5, 6), &c, &source).is_none()); // the space
+        let sel = make(Id::new("r"), (0, 5), &c, &source).unwrap();
         assert_eq!(sel.text, "hello");
         assert_eq!(sel.context, "hello there");
         assert_eq!(sel.start_ms, Some(3));
