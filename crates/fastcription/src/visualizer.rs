@@ -49,6 +49,37 @@ const EASE_TAU: f32 = 0.035;
 /// is pressed looks like a crash.
 const IDLE_TAU: f32 = 0.25;
 
+/// How long the display's reference level takes to fall, in seconds.
+///
+/// The bands are an honest measurement and honest measurements of a meeting
+/// are *quiet*: a monitor at a normal system volume puts speech around
+/// -50 dBFS in any one band, which is a fifth of the way up the bar. Drawn
+/// literally the visualiser is a row of stubs whatever is happening, and the
+/// shape — the part actually worth looking at — is squashed into the bottom
+/// of the strip.
+///
+/// So the display auto-ranges, the way a meter with no fixed scale does. It
+/// tracks the loudest band it has seen recently and scales to that, which
+/// makes a quiet room and a loud one both fill the strip and leaves the shape
+/// the same either way. The reference rises instantly and falls on this time
+/// constant, so one loud syllable does not shrink everything else for the
+/// next second.
+const GAIN_TAU: f32 = 2.5;
+
+/// The quietest reference the display will scale to.
+///
+/// Without a floor, silence divides by nothing and the room's noise is
+/// amplified into a light show. This caps the gain at about eight times,
+/// which is the difference between a quiet meeting and a loud one, not the
+/// difference between silence and a cough.
+const GAIN_FLOOR: f32 = 0.12;
+
+/// Where the loudest band sits once the display has settled on its range.
+///
+/// Not 1.0: a band that is always exactly at the ceiling has nowhere to go
+/// when someone actually raises their voice.
+const GAIN_TARGET: f32 = 0.92;
+
 /// Roughly how far apart bars are placed, in points.
 ///
 /// Bars are not drawn one per band. Across the footer's full span that would
@@ -148,6 +179,9 @@ pub struct Visualizer {
     /// `None` until the first frame, so the first `dt` is not the time since
     /// the process started.
     last: Option<Instant>,
+    /// The loudest band seen recently, which the display scales to. See
+    /// [`GAIN_TAU`].
+    reference: f32,
     /// Set by [`Self::idle`]; makes the decay slow rather than instant.
     idling: bool,
 }
@@ -162,6 +196,7 @@ impl Default for Visualizer {
             shown: [0.0; BANDS],
             phase: 0.0,
             last: None,
+            reference: 0.0,
             idling: true,
         }
     }
@@ -213,6 +248,22 @@ impl Visualizer {
         for (shown, &target) in self.shown.iter_mut().zip(self.target.iter()) {
             *shown += (target - *shown) * k;
         }
+
+        // Instant up, slow down: the reference is what the display divides by,
+        // and a reference that fell as fast as the audio would simply undo the
+        // auto-ranging on every gap between words.
+        let loudest = self.shown.iter().copied().fold(0.0, f32::max);
+        if loudest >= self.reference {
+            self.reference = loudest;
+        } else {
+            self.reference += (loudest - self.reference) * (1.0 - (-dt / GAIN_TAU).exp());
+        }
+    }
+
+    /// What the display multiplies the bands by, so the loudest recent one
+    /// lands near the top of the strip.
+    fn gain(&self) -> f32 {
+        GAIN_TARGET / self.reference.max(GAIN_FLOOR)
     }
 
     /// Draws the visualiser at `size`, or across the full available width when
@@ -283,13 +334,20 @@ impl Visualizer {
         crate::theme::shift_hue(palette.accent, fraction * HUE_SPREAD)
     }
 
-    /// The spectrum sampled at `t` in 0..1, interpolating between bands.
+    /// The spectrum sampled at `t` in 0..1, interpolating between bands and
+    /// scaled by the display's current range.
+    ///
+    /// Every style reads the spectrum through here, so the auto-ranging
+    /// applies to all of them and none of them has to know about it. Silence
+    /// stays silent: the gain multiplies zero by a larger number and gets
+    /// zero.
     fn sample(&self, t: f32) -> f32 {
         let position = t.clamp(0.0, 1.0) * (BANDS - 1) as f32;
         let low = position.floor() as usize;
         let high = (low + 1).min(BANDS - 1);
         let blend = position - low as f32;
-        self.shown[low] * (1.0 - blend) + self.shown[high] * blend
+        let raw = self.shown[low] * (1.0 - blend) + self.shown[high] * blend;
+        (raw * self.gain()).min(1.0)
     }
 
     /// Analyser bars, optionally mirrored about the centre line.
@@ -424,7 +482,13 @@ impl Visualizer {
         // the shape reads as something lit from within rather than as an
         // outline. Sized from the quietest part of the edge so it never spills
         // past it.
-        let level = self.shown.iter().sum::<f32>() / BANDS as f32;
+        // Through `sample`, like the edge, so the core brightens with the
+        // scaled display rather than with the raw measurement — otherwise the
+        // ring's outline auto-ranges and its glow does not.
+        let level = (0..BANDS)
+            .map(|i| self.sample(i as f32 / (BANDS - 1) as f32))
+            .sum::<f32>()
+            / BANDS as f32;
         if level > 0.01 {
             painter.circle_filled(
                 centre,
@@ -565,6 +629,67 @@ mod tests {
                 - bands.iter().cloned().fold(1.0, f32::min);
             assert!(spread > 0.1, "flat at {step}: {bands:?}");
         }
+    }
+
+    /// The point of auto-ranging: a meeting's bands arrive far below full
+    /// scale, and drawn literally they are stubs at the bottom of the strip.
+    #[test]
+    fn a_quiet_spectrum_is_lifted_towards_the_top() {
+        let mut visualizer = Visualizer::default();
+        visualizer.feed([0.18; BANDS]);
+        let mut now = Instant::now();
+        visualizer.step(now);
+        for _ in 0..40 {
+            now += std::time::Duration::from_millis(25);
+            visualizer.step(now);
+        }
+        let shown = visualizer.sample(0.5);
+        assert!(
+            shown > 0.8,
+            "a steady quiet spectrum should fill the strip, got {shown}"
+        );
+    }
+
+    /// And the thing auto-ranging must never do: invent a signal. Silence
+    /// multiplied by any gain is still silence.
+    #[test]
+    fn silence_is_not_amplified_into_a_light_show() {
+        let mut visualizer = Visualizer::default();
+        visualizer.feed([0.0; BANDS]);
+        let mut now = Instant::now();
+        for _ in 0..40 {
+            visualizer.step(now);
+            now += std::time::Duration::from_millis(25);
+        }
+        assert_eq!(visualizer.sample(0.5), 0.0);
+        // The gain is capped rather than dividing by nothing.
+        assert!(visualizer.gain().is_finite());
+        assert!(visualizer.gain() <= GAIN_TARGET / GAIN_FLOOR + 1e-3);
+    }
+
+    /// The reference falls slowly so one loud syllable does not shrink
+    /// everything else for the next second.
+    #[test]
+    fn the_reference_falls_slower_than_the_audio() {
+        let mut visualizer = Visualizer::default();
+        visualizer.feed([0.9; BANDS]);
+        let mut now = Instant::now();
+        visualizer.step(now);
+        for _ in 0..20 {
+            now += std::time::Duration::from_millis(25);
+            visualizer.step(now);
+        }
+        let loud = visualizer.reference;
+        assert!(loud > 0.8, "setup: expected a loud reference, got {loud}");
+
+        visualizer.feed([0.1; BANDS]);
+        now += std::time::Duration::from_millis(200);
+        visualizer.step(now);
+        assert!(
+            visualizer.reference > 0.5,
+            "the reference should still be near the recent peak, got {}",
+            visualizer.reference
+        );
     }
 
     /// A window that was not drawn for a while — hidden to the tray — must not

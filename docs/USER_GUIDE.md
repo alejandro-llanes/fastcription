@@ -340,21 +340,24 @@ again. The window goes back to the size it had.
 The strip shows the last settled lines, then the line being spoken in
 italics. Before anything has been said it reads "Waiting for speech…".
 
-Along the foot of the strip:
+Along the foot of the strip, the spectrum runs the full width and the
+controls sit over it:
 
-- **The record button**, on the left. One button that starts, pauses and
+- **The record button**, in the centre. One button that starts, pauses and
   resumes: press it to stop transcribing, press it again to carry on. It is
   filled with the accent colour while recording, so the strip also says
   *whether* anything is being transcribed. It pauses rather than stops,
   because a toggle has to be reversible — pressing it twice leaves one
   conversation with a gap in it, not two conversations. `Ctrl+.` still stops.
-- **The clock**, `HH:MM:SS` of recording time.
-- **The audio visualiser**, in whatever style you chose under
-  **Settings → Appearance**, and at whatever height you set there. It is the
-  quickest answer to "is this thing still hearing the call?" when the captions
-  have not moved for a while. Every point of height it takes is a point the
-  captions do not get, which is why it is yours to set.
+- **The clock**, `HH:MM:SS` of recording time, on the left.
 - **Restore**, on the right.
+
+Everything between them is spectrum, in whatever style you chose under
+**Settings → Appearance** and at whatever height you set there. It is the
+quickest answer to "is this thing still hearing the call?" when the captions
+have not moved for a while. The height is the height of this whole row, so
+every point it takes is a point the captions do not get — which is why it is
+yours to set.
 
 Compact mode answers every shortcut the full window does — the size keys and
 the transport keys — but all of them need keyboard focus, which the

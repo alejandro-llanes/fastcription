@@ -231,17 +231,21 @@ darker palette can be much easier to read off.
 
 | | |
 | --- | --- |
-| **visualiser height** | How tall the spectrum is drawn in the caption strip, 14–72 points. |
-| Default | 26 |
+| **visualiser height** | How tall the spectrum is drawn in the caption strip, 32–72 points. |
+| Default | 44 |
 | Persists | Yes |
 | Takes effect | Immediately |
 
-Every point it takes is a point the captions do not get, which is why the
-range stops where two lines of the largest transcript size would no longer
-fit. A value outside the range, or one that is not a number at all, is
-clamped or falls back to the default rather than reaching the layout — the
-settings file is plain text, and a strip with no room for captions is the one
-thing compact mode must never become.
+This is the height of the whole controls row, because the clock and the two
+buttons sit *over* the spectrum rather than beside it — which is why the
+floor is what those buttons need rather than what the bars need. The ceiling
+leaves the captions 74 of the strip's 170 points, two lines at the default
+transcript size.
+
+A value outside the range, or one that is not a number at all, is clamped or
+falls back to the default rather than reaching the layout — the settings file
+is plain text, and a strip with no room for captions is the one thing compact
+mode must never become.
 
 ### Audio visualiser
 
@@ -273,6 +277,18 @@ monochrome theme stays monochrome.
 The preview in this tab is fed a synthetic spectrum, because with nothing
 being recorded every style would otherwise look identical. It says so
 underneath. It is the only place in the app that draws audio nobody made.
+
+**The display auto-ranges.** The bands are an honest measurement and honest
+measurements of a meeting are quiet: a monitor at a normal system volume puts
+speech around -50 dBFS in any one band, which is a fifth of the way up the
+bar. Drawn literally the visualiser is a row of stubs whatever is happening,
+and the shape — the part worth looking at — is squashed into the bottom of
+the strip. So the display tracks the loudest band it has seen in the last few
+seconds and scales to that, the way a meter with no fixed scale does. A quiet
+room and a loud one both fill the strip and the shape is the same either way.
+The reference rises instantly and falls slowly, so one loud syllable does not
+shrink everything else for a second afterwards, and silence stays silent —
+the gain multiplies zero and gets zero.
 
 **Cost.** The transform is a few thousand multiplies twenty times a second,
 far less than the `pactl` read that delivered the samples, and the analyser

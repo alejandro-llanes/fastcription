@@ -128,11 +128,13 @@ impl Default for State {
 
 /// Default, smallest and largest height for compact mode's visualiser.
 ///
-/// The ceiling leaves room for two lines of transcript at the largest text
-/// size the app offers, which is the least that is worth reading; the floor is
-/// where the bars stop being distinguishable from a line.
-pub const COMPACT_VISUALIZER_DEFAULT: f32 = 26.0;
-pub const COMPACT_VISUALIZER_RANGE: std::ops::RangeInclusive<f32> = 14.0..=72.0;
+/// This is the height of the whole controls row, since the clock and the two
+/// buttons are placed over the spectrum rather than beside it. The floor is
+/// therefore what those buttons need, not what the bars need; the ceiling
+/// leaves the captions 74 of the strip's 170 points, which is two lines at
+/// the default transcript size.
+pub const COMPACT_VISUALIZER_DEFAULT: f32 = 44.0;
+pub const COMPACT_VISUALIZER_RANGE: std::ops::RangeInclusive<f32> = 32.0..=72.0;
 
 /// The compact visualiser's height, clamped to what the strip can give it.
 ///
@@ -621,9 +623,10 @@ fn appearance(app: &mut App, ui: &mut Ui) {
             .text(t("visualiser height")),
         )
         .on_hover_text(t(
-            "How tall the spectrum is drawn in the caption strip. Every point it \
-             takes is a point the captions do not get, so the range stops where \
-             two lines of text would no longer fit.",
+            "How tall the spectrum is drawn in the caption strip, and with it the \
+             row the clock and buttons sit over. Every point it takes is a point \
+             the captions do not get, so the range stops where two lines of text \
+             would no longer fit.",
         ));
     });
 

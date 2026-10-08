@@ -58,7 +58,10 @@ const SCRIM: f32 = 0.55;
 const STATUS_VISUALIZER_WIDTH: f32 = 140.0;
 const STATUS_VISUALIZER_HEIGHT: f32 = 16.0;
 
-/// The compact strip's one button, square and round-cornered into a circle.
+/// The compact strip's buttons, square and round-cornered into circles.
+///
+/// `COMPACT_VISUALIZER_RANGE`'s floor is set from this: the row is as tall as
+/// the spectrum, and the buttons sit in the middle of it.
 const COMPACT_BUTTON: f32 = 26.0;
 
 const COMBO_WIDTH: f32 = 230.0;
@@ -381,7 +384,7 @@ impl App {
     /// reversible: pressing it twice has to leave one conversation with a gap
     /// in it, not two conversations. `Ctrl+.` still stops, from here as well
     /// as from the full window.
-    fn compact_toggle_button(&mut self, ui: &mut egui::Ui) -> bool {
+    fn compact_toggle_button(&mut self, ui: &mut egui::Ui, at: egui::Rect) -> bool {
         use crate::icons::Icon;
 
         let (icon, hover, active) = match self.state {
@@ -401,9 +404,15 @@ impl App {
         let enabled = self.state != SessionState::Finishing && !self.library_read_only;
         let button = egui::Button::image(icon.image(tint, 14.0))
             .fill(fill)
-            .corner_radius(COMPACT_BUTTON / 2.0)
-            .min_size(egui::vec2(COMPACT_BUTTON, COMPACT_BUTTON));
-        let response = ui.add_enabled(enabled, button);
+            .corner_radius(COMPACT_BUTTON / 2.0);
+        let response = ui
+            .scope_builder(egui::UiBuilder::new().max_rect(at), |ui| {
+                if !enabled {
+                    ui.disable();
+                }
+                ui.put(at, button)
+            })
+            .inner;
         if self.library_read_only {
             response.on_disabled_hover_text(crate::env::read_only_library(&self.library_path));
             return false;
@@ -483,41 +492,74 @@ impl App {
             )
             .show(ui, |ui| {
                 let mut toggle = false;
-                egui::Panel::bottom("compact-controls").show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        toggle = self.compact_toggle_button(ui);
-                        ui.label(
-                            RichText::new(format_elapsed(self.elapsed()))
-                                .small()
-                                .color(self.palette.secondary),
+                // The controls float over the spectrum rather than sitting
+                // beside it: the strip is 760 points of which the captions
+                // want every one, and a row that spends a third of its width
+                // on a clock and two buttons leaves the spectrum a slot
+                // instead of a span. Transparent frame and an exact height,
+                // because everything in here is placed by hand.
+                let row = self.compact_visualizer_height();
+                egui::Panel::bottom("compact-controls")
+                    .exact_size(row)
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        let rect = ui.max_rect();
+                        self.visualizer
+                            .paint_at(ui, rect, &self.palette, self.settings.visualizer);
+                        // The same arrangement as the main window's footer:
+                        // a light scrim so the strip still reads as a strip,
+                        // and anything carrying words on an opaque chip of
+                        // its own rather than straight onto the spectrum.
+                        ui.painter().rect_filled(
+                            rect,
+                            0,
+                            self.palette.window.gamma_multiply(SCRIM),
                         );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            leave = ui
-                                .add(
-                                    egui::Button::image(
-                                        crate::icons::Icon::Restore.image(self.palette.text, 14.0),
-                                    )
-                                    .fill(self.palette.surface)
-                                    .corner_radius(COMPACT_BUTTON / 2.0)
-                                    .min_size(egui::vec2(COMPACT_BUTTON, COMPACT_BUTTON)),
-                                )
-                                .on_hover_text(t("Back to the full window (Esc)"))
-                                .clicked();
-                            // Between the clock and the Restore button, taking
-                            // whatever is left. Laid out right-to-left, so it
-                            // is added after the button it sits to the left of.
-                            let room = ui.available_width() - 8.0;
-                            if room > 40.0 {
-                                self.visualizer.show(
-                                    ui,
-                                    &self.palette,
-                                    self.settings.visualizer,
-                                    egui::vec2(room, self.compact_visualizer_height()),
-                                );
-                            }
+
+                        let middle = egui::Rect::from_center_size(
+                            rect.center(),
+                            egui::vec2(COMPACT_BUTTON, COMPACT_BUTTON),
+                        );
+                        toggle = self.compact_toggle_button(ui, middle);
+
+                        // Left of the clock and right of Restore, the row is
+                        // nothing but spectrum, which is the point.
+                        let clock = egui::Rect::from_min_max(
+                            egui::Pos2::new(rect.left(), rect.top()),
+                            egui::Pos2::new(middle.left() - 8.0, rect.bottom()),
+                        );
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(clock), |ui| {
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    crate::ui::plate(ui, &self.palette, |ui| {
+                                        ui.label(
+                                            RichText::new(format_elapsed(self.elapsed()))
+                                                .small()
+                                                .monospace()
+                                                .color(self.palette.secondary),
+                                        );
+                                    });
+                                },
+                            );
                         });
+
+                        let restore = egui::Rect::from_center_size(
+                            egui::Pos2::new(rect.right() - COMPACT_BUTTON / 2.0, rect.center().y),
+                            egui::vec2(COMPACT_BUTTON, COMPACT_BUTTON),
+                        );
+                        leave = ui
+                            .put(
+                                restore,
+                                egui::Button::image(
+                                    crate::icons::Icon::Restore.image(self.palette.text, 14.0),
+                                )
+                                .fill(self.palette.surface)
+                                .corner_radius(COMPACT_BUTTON / 2.0),
+                            )
+                            .on_hover_text(t("Back to the full window (Esc)"))
+                            .clicked();
                     });
-                });
                 if toggle {
                     self.toggle_transcribing();
                 }
