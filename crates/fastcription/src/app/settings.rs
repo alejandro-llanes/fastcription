@@ -133,8 +133,8 @@ impl Default for State {
 /// therefore what those buttons need, not what the bars need; the ceiling
 /// leaves the captions 74 of the strip's 170 points, which is two lines at
 /// the default transcript size.
-pub const COMPACT_VISUALIZER_DEFAULT: f32 = 44.0;
-pub const COMPACT_VISUALIZER_RANGE: std::ops::RangeInclusive<f32> = 32.0..=72.0;
+pub const COMPACT_VISUALIZER_DEFAULT: f32 = 52.0;
+pub const COMPACT_VISUALIZER_RANGE: std::ops::RangeInclusive<f32> = 46.0..=72.0;
 
 /// The compact visualiser's height, clamped to what the strip can give it.
 ///
@@ -783,7 +783,12 @@ fn theme_picker(ui: &mut Ui, id_salt: &str, choice: &mut ThemeChoice, named: &[S
         .selected_text(choice.label())
         .width(220.0)
         .show_ui(ui, |ui| {
-            for fixed in [ThemeChoice::System, ThemeChoice::Dark, ThemeChoice::Light] {
+            for fixed in [
+                ThemeChoice::Neon,
+                ThemeChoice::System,
+                ThemeChoice::Dark,
+                ThemeChoice::Light,
+            ] {
                 let label = fixed.label();
                 ui.selectable_value(choice, fixed, label);
             }
@@ -888,8 +893,11 @@ mod tests {
             clamp_visualizer_height(f32::INFINITY),
             COMPACT_VISUALIZER_DEFAULT
         );
-        // A sensible value is left exactly alone.
-        assert_eq!(clamp_visualizer_height(40.0), 40.0);
+        // A sensible value is left exactly alone. Taken from inside the
+        // range rather than written as a literal, so the test does not break
+        // every time the range moves.
+        let inside = (low + high) / 2.0;
+        assert_eq!(clamp_visualizer_height(inside), inside);
         assert_eq!(
             clamp_visualizer_height(COMPACT_VISUALIZER_DEFAULT),
             COMPACT_VISUALIZER_DEFAULT
@@ -910,12 +918,12 @@ mod tests {
         assert_eq!(State::default().compact_theme, None);
     }
 
-    /// Defaults have to keep the app behaving as it did for someone who never
-    /// opens this pane: following the desktop, and showing the visualiser.
+    /// The app opens in its own look, with the visualiser on. Following the
+    /// desktop is one pick away for anyone who would rather it blended in.
     #[test]
-    fn the_new_appearance_defaults_change_nothing_for_an_existing_user() {
+    fn the_appearance_defaults_are_the_designed_look() {
         let state = State::default();
-        assert_eq!(state.theme, ThemeChoice::System);
+        assert_eq!(state.theme, ThemeChoice::Neon);
         assert!(state.visualizer.visible());
         assert!(state.visualizer_in_main);
     }

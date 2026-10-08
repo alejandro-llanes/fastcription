@@ -166,15 +166,18 @@ capture is restarted.
 
 ### The top bar
 
-Left to right: a **state light** — a coloured dot and one word, `REC`,
-`PAUSED`, `FINISHING` or `IDLE`, the dot haloed while recording — then the
-**source picker** and its refresh button, then **Start**, **Pause** and
-**Stop**, then the **Mic** toggle. On the right, **Live / Settings** as one
-switch, and the button that enters compact mode.
+Left to right: the **wordmark**, then a **state light** — a coloured dot and
+one word, `REC`, `PAUSED`, `FINISHING` or `IDLE`, the dot haloed while
+recording — then the **source picker** and its refresh button, then the big
+round **record button** and a small **Stop** beside it, then the **Mic**
+toggle. On the right, **Live / Settings** as one switch, and the button that
+enters compact mode.
 
-Start is the only filled button, and only while pressing it would do
-something: a lit control that refuses is worse than a dim one that explains
-itself when you hover. Mic lights up the same way when the second track is on.
+The record button is one control that starts, pauses and resumes, like a
+player's: the icon says which it will do next, and it is lit whenever
+pressing it would do something. It is the largest thing on the bar on
+purpose — it is the control the hand goes to without looking. Mic lights up
+the same way when the second track is on.
 
 **Start** (`Ctrl+R`) begins a new conversation. It is refused, with a notice,
 if there is no source selected ("Choose an audio source first."), no voxtype,
@@ -343,12 +346,12 @@ italics. Before anything has been said it reads "Waiting for speech…".
 Along the foot of the strip, the spectrum runs the full width and the
 controls sit over it:
 
-- **The record button**, in the centre. One button that starts, pauses and
-  resumes: press it to stop transcribing, press it again to carry on. It is
-  filled with the accent colour while recording, so the strip also says
-  *whether* anything is being transcribed. It pauses rather than stops,
-  because a toggle has to be reversible — pressing it twice leaves one
-  conversation with a gap in it, not two conversations. `Ctrl+.` still stops.
+- **The record button**, big and in the centre. One button that starts,
+  pauses and resumes: press it to stop transcribing, press it again to carry
+  on. The icon says which; it pauses rather than stops, because a toggle has
+  to be reversible — pressing it twice leaves one conversation with a gap in
+  it, not two conversations.
+- **Stop**, small, just to its left.
 - **The clock**, `HH:MM:SS` of recording time, on the left.
 - **Restore**, on the right.
 

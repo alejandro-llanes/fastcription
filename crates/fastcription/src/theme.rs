@@ -71,6 +71,40 @@ impl Palette {
         }
     }
 
+    /// The app's own look: near-black ground, electric cyan accent.
+    ///
+    /// The two bases above are deliberately quiet, which is right for a
+    /// palette that has to sit beside every other window on a desktop and
+    /// wrong for the one this app was asked to be. The references were an
+    /// audio plugin and a music player — black grounds, one saturated hue that
+    /// reads as light, and a spectrum that owns the bottom of the window. This
+    /// is that, and it is the default; following the desktop is still a
+    /// choice away.
+    ///
+    /// Every colour that carries words still clears its contrast floor against
+    /// the panel, and the test below holds it there like the other two.
+    pub fn neon() -> Self {
+        Self {
+            dark: true,
+            window: Color32::from_rgb(0x08, 0x0a, 0x10),
+            panel: Color32::from_rgb(0x0e, 0x11, 0x19),
+            surface: Color32::from_rgb(0x14, 0x18, 0x23),
+            surface_hover: Color32::from_rgb(0x1b, 0x21, 0x2f),
+            surface_active: Color32::from_rgb(0x23, 0x2a, 0x3b),
+            outline: Color32::from_rgb(0x22, 0x29, 0x3a),
+            text: Color32::from_rgb(0xee, 0xf3, 0xff),
+            secondary: Color32::from_rgb(0xa6, 0xb2, 0xcc),
+            dim: Color32::from_rgb(0x62, 0x6d, 0x88),
+            accent: Color32::from_rgb(0x3c, 0xe2, 0xff),
+            accent_hover: Color32::from_rgb(0x84, 0xef, 0xff),
+            on_accent: Color32::from_rgb(0x04, 0x10, 0x18),
+            danger: Color32::from_rgb(0xff, 0x5e, 0x7e),
+            warning: Color32::from_rgb(0xff, 0xca, 0x5a),
+            overlay: Color32::from_black_alpha(210),
+            shadow: Color32::from_black_alpha(170),
+        }
+    }
+
     fn light_default() -> Self {
         Self {
             dark: false,
@@ -190,18 +224,19 @@ impl Palette {
 
 /// Where the palette comes from.
 ///
-/// The app follows Omarchy by default and that is still the right default — it
-/// is why `fastframe-theme` was chosen (ARCHITECTURE.md). But following the
-/// desktop is not always what someone wants from *this* app: compact mode sits
-/// on top of a video call for an hour, and a desktop theme that is pleasant to
-/// work in can be the wrong thing to read captions off. So the default
-/// follows, and the setting is there for when it should not.
+/// The default is the app's own [`Palette::neon`]: the look it was designed
+/// to have, which a desktop theme chosen for a terminal rarely resembles.
+/// Following the desktop is the next option and the reason `fastframe-theme`
+/// was chosen (ARCHITECTURE.md) — it keeps the app in step with Omarchy for
+/// anyone who would rather it blended in.
 #[derive(Clone, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ThemeChoice {
-    /// Whatever the desktop is wearing, changing with it.
+    /// The app's own look, [`Palette::neon`]. The default.
     #[default]
+    Neon,
+    /// Whatever the desktop is wearing, changing with it.
     System,
-    /// The app's own palettes, ignoring the desktop.
+    /// Quieter palettes, ignoring the desktop.
     Dark,
     Light,
     /// A palette file in the themes directory, by file name.
@@ -215,6 +250,7 @@ impl ThemeChoice {
     /// file's own name.
     pub fn label(&self) -> String {
         match self {
+            Self::Neon => "Neon".to_owned(),
             Self::System => "Follow the desktop".to_owned(),
             Self::Dark => "Dark".to_owned(),
             Self::Light => "Light".to_owned(),
@@ -402,9 +438,13 @@ mod tests {
     /// against `panel` alone, since a colour that passes on one and fails on
     /// the other fails where it is read.
     #[test]
-    fn every_colour_that_carries_words_is_readable_on_both_bases() {
-        for base in [Base::Dark, Base::Light] {
-            let palette: Palette = ThemePalette::base(base);
+    fn every_colour_that_carries_words_is_readable_on_every_palette() {
+        let palettes: [(&str, Palette); 3] = [
+            ("Dark", ThemePalette::base(Base::Dark)),
+            ("Light", ThemePalette::base(Base::Light)),
+            ("Neon", Palette::neon()),
+        ];
+        for (base, palette) in palettes {
             for (name, behind) in [("panel", palette.panel), ("window", palette.window)] {
                 let check = |what: &str, color: Color32, floor: f32| {
                     let ratio = contrast_ratio(color, behind);
@@ -487,6 +527,7 @@ mod tests {
     #[test]
     fn a_theme_choice_survives_being_saved_and_read_back() {
         for choice in [
+            ThemeChoice::Neon,
             ThemeChoice::System,
             ThemeChoice::Dark,
             ThemeChoice::Light,
@@ -498,7 +539,7 @@ mod tests {
             assert!(!back.label().is_empty());
         }
         assert_eq!(ThemeChoice::Named("Nord.json".to_owned()).label(), "Nord");
-        assert_eq!(ThemeChoice::default(), ThemeChoice::System);
+        assert_eq!(ThemeChoice::default(), ThemeChoice::Neon);
     }
 
     /// A theme from the desktop is not held to anything, so the repair has to

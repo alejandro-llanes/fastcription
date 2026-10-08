@@ -38,10 +38,11 @@ const STATUS_BAR_HEIGHT: f32 = 52.0;
 /// How far the spectrum reaches above that bar.
 ///
 /// The bar is translucent and the spectrum is drawn behind it, so the loud
-/// bands break out of the top rather than being clipped flat by it. This is
-/// the only piece of the window that is purely for the look of the thing, and
-/// it is 22 points.
-const STATUS_SPECTRUM_RISE: f32 = 22.0;
+/// bands break out of the top rather than being clipped flat by it. The first
+/// version gave this 22 points, which let the loudest band poke a few points
+/// over the edge and no more; the reference it was drawn from has the bars
+/// standing well clear of the bar, and that takes room.
+const STATUS_SPECTRUM_RISE: f32 = 64.0;
 
 /// How opaque the footer is over the spectrum behind it.
 ///
@@ -52,7 +53,7 @@ const STATUS_SPECTRUM_RISE: f32 = 22.0;
 /// opaque to keep them readable, which is the same as not drawing a spectrum
 /// at all. The scrim's remaining job is to stop the bands being so loud
 /// behind the plates that the bar stops reading as a bar.
-const SCRIM: f32 = 0.55;
+const SCRIM: f32 = 0.45;
 
 /// The fallback level meter's size, for when the spectrum is turned off.
 const STATUS_VISUALIZER_WIDTH: f32 = 140.0;
@@ -63,6 +64,9 @@ const STATUS_VISUALIZER_HEIGHT: f32 = 16.0;
 /// `COMPACT_VISUALIZER_RANGE`'s floor is set from this: the row is as tall as
 /// the spectrum, and the buttons sit in the middle of it.
 const COMPACT_BUTTON: f32 = 26.0;
+
+/// The compact strip's centre button, the one the hand goes to.
+const COMPACT_BIG_BUTTON: f32 = 38.0;
 
 const COMBO_WIDTH: f32 = 230.0;
 /// How many characters of a source name the picker shows. Chosen to sit inside
@@ -372,7 +376,7 @@ impl App {
         self.title_shown = COMPACT_TITLE.to_owned();
     }
 
-    /// Start, pause or resume, as one button.
+    /// Start, pause or resume, as one big button in the middle of the strip.
     ///
     /// Compact mode is a strip on top of a call, and reaching the transport
     /// meant restoring the whole window, pressing a button and shrinking
@@ -387,30 +391,24 @@ impl App {
     fn compact_toggle_button(&mut self, ui: &mut egui::Ui, at: egui::Rect) -> bool {
         use crate::icons::Icon;
 
-        let (icon, hover, active) = match self.state {
-            SessionState::Recording => (Icon::Pause, t("Pause transcribing (Ctrl+Space)"), true),
-            SessionState::Paused => (Icon::Play, t("Carry on transcribing (Ctrl+Space)"), false),
-            SessionState::Finishing => (Icon::Pause, t("Finishing the last of the audio"), false),
-            SessionState::Idle => (Icon::Play, t("Start transcribing (Ctrl+R)"), false),
+        let (icon, hover) = match self.state {
+            SessionState::Recording => (Icon::Pause, t("Pause transcribing (Ctrl+Space)")),
+            SessionState::Paused => (Icon::Play, t("Carry on transcribing (Ctrl+Space)")),
+            SessionState::Finishing => (Icon::Pause, t("Finishing the last of the audio")),
+            SessionState::Idle => (Icon::Play, t("Start transcribing (Ctrl+R)")),
         };
-        // Filled while recording, so the one control in the strip also says
-        // whether anything is being transcribed — the question someone glances
-        // at the caption bar to answer.
-        let (fill, tint) = if active {
-            (self.palette.accent, self.palette.on_accent)
-        } else {
-            (self.palette.surface, self.palette.text)
-        };
+        // Lit whenever pressing it would do something, the same rule as the
+        // main bar's; the icon is what says whether anything is being
+        // transcribed, and the state light in the full window says it too.
         let enabled = self.state != SessionState::Finishing && !self.library_read_only;
-        let button = egui::Button::image(icon.image(tint, 14.0))
-            .fill(fill)
-            .corner_radius(COMPACT_BUTTON / 2.0);
+        let active = enabled;
+        let palette = self.palette.clone();
         let response = ui
             .scope_builder(egui::UiBuilder::new().max_rect(at), |ui| {
                 if !enabled {
                     ui.disable();
                 }
-                ui.put(at, button)
+                crate::ui::big_button_at(ui, &palette, icon, active, at)
             })
             .inner;
         if self.library_read_only {
@@ -518,15 +516,46 @@ impl App {
 
                         let middle = egui::Rect::from_center_size(
                             rect.center(),
-                            egui::vec2(COMPACT_BUTTON, COMPACT_BUTTON),
+                            egui::vec2(COMPACT_BIG_BUTTON, COMPACT_BIG_BUTTON),
                         );
                         toggle = self.compact_toggle_button(ui, middle);
+
+                        // Stop, small, to the left of the toggle: the one
+                        // transport action the toggle cannot be, and until
+                        // now reachable from compact mode only by shortcut.
+                        let stoppable =
+                            matches!(self.state, SessionState::Recording | SessionState::Paused);
+                        let stop_rect = egui::Rect::from_center_size(
+                            egui::Pos2::new(
+                                middle.left() - 10.0 - COMPACT_BUTTON / 2.0,
+                                rect.center().y,
+                            ),
+                            egui::vec2(COMPACT_BUTTON, COMPACT_BUTTON),
+                        );
+                        let stop = ui
+                            .scope_builder(egui::UiBuilder::new().max_rect(stop_rect), |ui| {
+                                if !stoppable {
+                                    ui.disable();
+                                }
+                                ui.put(
+                                    stop_rect,
+                                    egui::Button::image(
+                                        crate::icons::Icon::Stop.image(self.palette.text, 14.0),
+                                    )
+                                    .fill(self.palette.surface)
+                                    .corner_radius(COMPACT_BUTTON / 2.0),
+                                )
+                            })
+                            .inner;
+                        if stop.on_hover_text(t("Stop (Ctrl+.)")).clicked() {
+                            self.stop();
+                        }
 
                         // Left of the clock and right of Restore, the row is
                         // nothing but spectrum, which is the point.
                         let clock = egui::Rect::from_min_max(
                             egui::Pos2::new(rect.left(), rect.top()),
-                            egui::Pos2::new(middle.left() - 8.0, rect.bottom()),
+                            egui::Pos2::new(middle.left() - 20.0 - COMPACT_BUTTON, rect.bottom()),
                         );
                         ui.scope_builder(egui::UiBuilder::new().max_rect(clock), |ui| {
                             ui.with_layout(
@@ -649,8 +678,11 @@ impl App {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
 
-            // What the session is doing, first and in colour, because it is
-            // the one thing on this bar that changes by itself.
+            ui::wordmark(ui, &palette);
+            ui.add_space(10.0);
+
+            // What the session is doing, in colour, because it is the one
+            // thing on this bar that changes by itself.
             let (state, colour) = match self.state {
                 SessionState::Recording => (t("REC"), palette.accent),
                 SessionState::Paused => (t("PAUSED"), palette.warning),
@@ -710,63 +742,36 @@ impl App {
     /// across the narrowest window the app allows.
     fn transport(&mut self, ui: &mut egui::Ui) {
         use crate::icons::Icon;
-        use crate::ui::{self, Tone};
+        use crate::ui;
 
         let palette = self.palette.clone();
-        let can_start = matches!(self.state, SessionState::Idle | SessionState::Paused)
-            && !self.library_read_only;
-        let start_label = if self.state == SessionState::Paused {
-            t("Resume")
-        } else {
-            t("Start")
+        // One big button that starts, pauses and resumes, like a player's: the
+        // icon says which it will do, and it is lit whenever pressing it would
+        // do something. The first version made it Start alone, which left the
+        // largest control on the bar sitting there disabled for the whole of
+        // every recording — exactly when the hand goes looking for it.
+        let (icon, hover) = match self.state {
+            SessionState::Recording => (Icon::Pause, t("Pause (Ctrl+Space)")),
+            SessionState::Paused => (Icon::Play, t("Resume (Ctrl+R)")),
+            SessionState::Finishing => (Icon::Pause, t("Finishing the last of the audio")),
+            SessionState::Idle => (Icon::Play, t("Start (Ctrl+R)")),
         };
-        // Primary only when pressing it would do something: a lit button that
-        // refuses is worse than a dim one that explains itself on hover.
-        let tone = if can_start {
-            Tone::Primary
-        } else {
-            Tone::Normal
-        };
-        let tint = if can_start {
-            palette.on_accent
-        } else {
-            palette.text
-        };
-        let start = ui
+        let enabled = self.state != SessionState::Finishing && !self.library_read_only;
+        let toggle = ui
             .scope(|ui| {
-                if !can_start {
+                if !enabled {
                     ui.disable();
                 }
-                ui::pill(
-                    ui,
-                    &palette,
-                    tone,
-                    Some(Icon::Play.image(tint, 14.0)),
-                    start_label,
-                )
+                ui::big_button(ui, &palette, icon, enabled, ui::BIG_BUTTON)
             })
             .inner;
         if self.library_read_only {
-            start.on_disabled_hover_text(crate::env::read_only_library(&self.library_path));
-        } else if start.on_hover_text(t("Ctrl+R")).clicked() {
-            self.start_or_resume();
+            toggle.on_disabled_hover_text(crate::env::read_only_library(&self.library_path));
+        } else if toggle.on_hover_text(hover).clicked() {
+            self.toggle_transcribing();
         }
 
-        let recording = self.state == SessionState::Recording;
         let stoppable = matches!(self.state, SessionState::Recording | SessionState::Paused);
-        if ui
-            .scope(|ui| {
-                if !recording {
-                    ui.disable();
-                }
-                ui::icon_button(ui, &palette, Icon::Pause, false)
-            })
-            .inner
-            .on_hover_text(t("Pause (Ctrl+Space)"))
-            .clicked()
-        {
-            self.pause();
-        }
         if ui
             .scope(|ui| {
                 if !stoppable {
@@ -1104,6 +1109,7 @@ impl App {
                 .map(|theme| theme.palette.clone())
         };
         match &self.wanted_theme() {
+            ThemeChoice::Neon => Some(crate::theme::Palette::neon()),
             ThemeChoice::System => desktop(),
             ThemeChoice::Dark => Some(crate::theme::Palette::base(Base::Dark)),
             ThemeChoice::Light => Some(crate::theme::Palette::base(Base::Light)),
@@ -1304,7 +1310,7 @@ fn dot(color: egui::Color32, lit: bool) -> impl egui::Widget {
         if ui.is_rect_visible(rect) {
             let painter = ui.painter();
             if lit {
-                for (grow, alpha) in [(4.0_f32, 0.12_f32), (2.0, 0.22)] {
+                for (grow, alpha) in [(10.0_f32, 0.10_f32), (6.0, 0.18), (3.0, 0.32)] {
                     painter.circle_filled(
                         rect.center(),
                         rect.width() / 2.0 + grow,

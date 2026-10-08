@@ -95,9 +95,13 @@ const BAR_PITCH: f32 = 12.0;
 /// is where more bars stop being distinguishable and start being a fill.
 const BAR_COUNT: std::ops::RangeInclusive<usize> = 8..=160;
 
-/// Below this width a bar is too thin for a halo to read as anything but a
-/// smudge, so it is not drawn.
-const GLOW_MIN_BAR: f32 = 6.0;
+/// How much of a bar's height is its bright cap.
+///
+/// A bar that is one flat colour top to bottom is a histogram. One with a
+/// brighter cap reads as a column of light, which is what the reference
+/// designs draw and what makes the spectrum look like it is emitting rather
+/// than merely coloured.
+const CAP: f32 = 0.22;
 
 /// Columns per band when a style draws a continuous shape rather than bars.
 ///
@@ -109,10 +113,11 @@ const SUBDIVISIONS: usize = 4;
 /// How far around the colour wheel the top of the spectrum sits from the
 /// bottom.
 ///
-/// Enough that low and high read as different colours, not so much that the
-/// result stops looking like the theme's accent. The reference designs run
-/// magenta to cyan, which is about this far apart.
-const HUE_SPREAD: f32 = 80.0;
+/// The reference designs run cyan to magenta, which is a third of the wheel.
+/// From the default palette's cyan that lands the top of the spectrum on
+/// magenta exactly; from any other accent it still gives the two ends a
+/// different colour each.
+const HUE_SPREAD: f32 = 120.0;
 
 /// Which shape the spectrum is drawn as.
 ///
@@ -359,7 +364,6 @@ impl Visualizer {
         // a solid block at the widths this is drawn at; wider and there is
         // more gap than bar.
         let bar = (slot * 0.75).max(1.0);
-        let glow = bar >= GLOW_MIN_BAR;
         for column in 0..columns {
             let t = column as f32 / (columns - 1).max(1) as f32;
             let value = self.sample(t);
@@ -386,17 +390,30 @@ impl Visualizer {
             // and comes out a capsule, so a silent strip reads as a dotted
             // line rather than as a row of bars at rest.
             let radius = (bar * 0.3).min(extent * 0.4);
-            if glow {
-                // egui has no blur, and a larger translucent rounded rectangle
-                // behind the solid one is what a blur looks like from a
-                // distance.
-                painter.rect_filled(
-                    bar_rect.expand(bar * 0.35),
-                    radius + bar * 0.1,
-                    tint.gamma_multiply(0.12 * value.max(0.1)),
-                );
-            }
+            // The glow, always, and sized to the bar's height rather than its
+            // width so a thin loud bar still spills light. egui has no blur;
+            // two translucent copies behind the solid one are what a blur
+            // looks like from a distance.
+            let spill = (extent * 0.18).clamp(2.0, 10.0);
+            painter.rect_filled(
+                bar_rect.expand2(Vec2::new(spill, spill * 0.6)),
+                radius + spill,
+                tint.gamma_multiply(0.10 * value.max(0.15)),
+            );
+            painter.rect_filled(
+                bar_rect.expand2(Vec2::new(spill * 0.5, spill * 0.3)),
+                radius + spill * 0.5,
+                tint.gamma_multiply(0.18 * value.max(0.15)),
+            );
             painter.rect_filled(bar_rect, radius, tint);
+            // The bright cap, on bars tall enough to have one.
+            if extent > 6.0 && !mirrored {
+                let cap = Rect::from_min_max(
+                    bar_rect.min,
+                    Pos2::new(bar_rect.right(), bar_rect.top() + extent * CAP),
+                );
+                painter.rect_filled(cap, radius, tint.lerp_to_gamma(Color32::WHITE, 0.45));
+            }
         }
     }
 

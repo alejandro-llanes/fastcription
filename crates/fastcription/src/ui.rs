@@ -47,8 +47,22 @@ pub const CONTROL_HEIGHT: f32 = 30.0;
 /// Point size of the small upper-case labels.
 pub const LABEL_PT: f32 = 10.0;
 
-/// How much of the accent's brightness a halo keeps, outermost first.
-const HALO: [(f32, f32); 2] = [(6.0, 0.10), (3.0, 0.18)];
+/// How far a halo reaches and how much of the accent's brightness each layer
+/// keeps, outermost first.
+///
+/// The first version was two layers reaching six points at a tenth of the
+/// colour, which is a halo only in the sense that the code had one: at arm's
+/// length it read as a slightly soft edge. Light has to spill. Three layers,
+/// the outermost reaching fourteen points, is where a control starts to look
+/// lit rather than coloured.
+const HALO: [(f32, f32); 3] = [(14.0, 0.09), (8.0, 0.16), (4.0, 0.26)];
+
+/// The one big round button a bar is allowed.
+///
+/// A music player's play button is the largest thing in its bar by a wide
+/// margin, and that is not decoration: it is the control the hand goes to
+/// without looking. Start is that control here.
+pub const BIG_BUTTON: f32 = 44.0;
 
 /// A quiet upper-case label, for naming a group of controls or a readout.
 ///
@@ -337,6 +351,112 @@ pub fn plate<R>(ui: &mut Ui, palette: &Palette, body: impl FnOnce(&mut Ui) -> R)
         .inner
 }
 
+/// A large round button with a glow: the one primary action on a bar.
+///
+/// `lit` fills it with the accent and gives it the full halo; otherwise it is
+/// a raised disc, still the biggest thing in the row, so the hand still finds
+/// it. Disabled is the caller's business — wrap it in a scope and `disable`.
+pub fn big_button(
+    ui: &mut Ui,
+    palette: &Palette,
+    icon: crate::icons::Icon,
+    lit: bool,
+    size: f32,
+) -> Response {
+    let (fill, tint) = if lit {
+        (palette.accent, palette.on_accent)
+    } else {
+        (palette.surface_active, palette.text)
+    };
+    let slot = reserve_halo(ui);
+    let response = ui.add(
+        egui::Button::image(icon.image(tint, size * 0.42))
+            .fill(fill)
+            .stroke(Stroke::new(
+                1.0,
+                if lit {
+                    palette.accent_hover
+                } else {
+                    palette.outline
+                },
+            ))
+            .corner_radius((size / 2.0) as u8)
+            .min_size(Vec2::splat(size)),
+    );
+    if lit {
+        paint_halo(ui, slot, response.rect, palette.accent, (size / 2.0) as u8);
+    }
+    response
+}
+
+/// [`big_button`], placed in an exact rect rather than in the flow.
+///
+/// Compact mode lays its controls out by hand over the spectrum, so it needs
+/// to say where the button goes.
+pub fn big_button_at(
+    ui: &mut Ui,
+    palette: &Palette,
+    icon: crate::icons::Icon,
+    lit: bool,
+    at: Rect,
+) -> Response {
+    let size = at.height();
+    let (fill, tint) = if lit {
+        (palette.accent, palette.on_accent)
+    } else {
+        (palette.surface_active, palette.text)
+    };
+    let slot = reserve_halo(ui);
+    let response = ui.put(
+        at,
+        egui::Button::image(icon.image(tint, size * 0.42))
+            .fill(fill)
+            .stroke(Stroke::new(
+                1.0,
+                if lit {
+                    palette.accent_hover
+                } else {
+                    palette.outline
+                },
+            ))
+            .corner_radius((size / 2.0) as u8),
+    );
+    if lit {
+        paint_halo(ui, slot, response.rect, palette.accent, (size / 2.0) as u8);
+    }
+    response
+}
+
+/// The app's mark: three bars of the accent, a spectrum the size of a word.
+///
+/// Drawn rather than loaded, because the bundled icon set has no waveform and
+/// a mark that is literally the app's own visualiser needs no explaining.
+pub fn wordmark(ui: &mut Ui, palette: &Palette) {
+    let heights = [0.45_f32, 1.0, 0.65];
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(18.0, 16.0), egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let slot = rect.width() / heights.len() as f32;
+        for (i, h) in heights.iter().enumerate() {
+            let x = rect.left() + slot * i as f32 + slot * 0.2;
+            let extent = rect.height() * h;
+            let bar = Rect::from_min_max(
+                egui::Pos2::new(x, rect.bottom() - extent),
+                egui::Pos2::new(x + slot * 0.6, rect.bottom()),
+            );
+            painter.rect_filled(bar.expand(3.0), 4, palette.accent.gamma_multiply(0.18));
+            painter.rect_filled(bar, 2, palette.accent);
+        }
+    }
+    ui.add_space(2.0);
+    ui.label(
+        RichText::new("fastcription")
+            .size(14.0)
+            .strong()
+            .color(palette.text),
+    );
+}
+
 /// A small capsule carrying one word of state, in colour.
 ///
 /// The fill is the window colour, not a tint of `color`. Tinting the
@@ -388,8 +508,12 @@ mod tests {
         use crate::theme::{contrast_ratio, Palette, DECORATION_CONTRAST, WORDS_CONTRAST};
         use fastframe_theme::{Base, Palette as _};
 
-        for base in [Base::Dark, Base::Light] {
-            let palette: Palette = Palette::base(base);
+        let palettes: [(&str, Palette); 3] = [
+            ("Dark", Palette::base(Base::Dark)),
+            ("Light", Palette::base(Base::Light)),
+            ("Neon", Palette::neon()),
+        ];
+        for (base, palette) in palettes {
             assert_eq!(palette.window.a(), 255, "{base:?}: a chip must be opaque");
             for (what, color, floor) in [
                 ("accent", palette.accent, WORDS_CONTRAST),

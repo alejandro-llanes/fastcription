@@ -197,17 +197,18 @@ back to 22 rather than reaching the font stack.
 
 | | |
 | --- | --- |
-| **Theme** | Where the palette comes from: **Follow the desktop**, **Dark**, **Light**, or any palette file in `~/.config/fastcription/themes/` by name. |
-| Default | Follow the desktop |
+| **Theme** | Where the palette comes from: **Neon** (the app's own look), **Follow the desktop**, **Dark**, **Light**, or any palette file in `~/.config/fastcription/themes/` by name. |
+| Default | Neon |
 | Persists | Yes |
 | Takes effect | Immediately |
 
-The full window and compact mode share one theme, because they are one window.
-Following the desktop is the default and the reason `fastframe-theme` was
-chosen: fastcription changes with Omarchy as you switch themes, with nothing to
-keep in sync. The fixed choices are for when that is not what you want from
-*this* app — compact mode sits over a video call for an hour, and a theme that
-is pleasant to work in is not always the right thing to read captions off.
+**Neon** is the look the app was designed to have — near-black ground, an
+electric cyan accent, and a spectrum that runs cyan to magenta. It is the
+default because a desktop theme chosen for a terminal rarely resembles it.
+**Follow the desktop** is the reason `fastframe-theme` was chosen: fastcription
+then changes with Omarchy as you switch themes, with nothing to keep in sync,
+for anyone who would rather it blended in. The quieter fixed choices are for
+when neither is right.
 
 Whatever the source, any colour that carries words is lifted until it is
 readable against the panel behind it (WCAG AA, AAA for the transcript itself).
@@ -231,8 +232,8 @@ darker palette can be much easier to read off.
 
 | | |
 | --- | --- |
-| **visualiser height** | How tall the spectrum is drawn in the caption strip, 32–72 points. |
-| Default | 44 |
+| **visualiser height** | How tall the spectrum is drawn in the caption strip, 46–72 points. |
+| Default | 52 |
 | Persists | Yes |
 | Takes effect | Immediately |
 
