@@ -127,6 +127,7 @@ impl App {
         }
         self.update_search(&ctx);
         self.poll_theme(&ctx);
+        self.poll_log_level();
         self.drain_tray(&ctx, false);
         // A second launch asked for this window rather than starting another
         // copy of the app.
@@ -1083,6 +1084,18 @@ impl App {
             self.palette = palette;
             self.palette.apply(ctx);
         }
+    }
+
+    /// Hands the subscriber the log level from Settings whenever it changes,
+    /// and once at startup for the persisted one — the subscriber is built
+    /// before the settings file is read, so it starts at the default.
+    fn poll_log_level(&mut self) {
+        let wanted = self.settings.log_level;
+        if self.log_applied == Some(wanted) {
+            return;
+        }
+        crate::logging::apply(wanted);
+        self.log_applied = Some(wanted);
     }
 
     /// Which theme should be in force right now.

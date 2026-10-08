@@ -15,7 +15,7 @@ grouped by *when* a setting is touched rather than by what it configures:
 | **Transcription** | The engine, model and language; speed; responsiveness |
 | **Server** | Running the model on another computer |
 | **Appearance** | Theme, audio visualiser, transcript size |
-| **System** | The voxtype service, importing, where the library is |
+| **System** | The voxtype service, importing, logging, where the library is |
 
 Settings are listed below by tab. "Persists" means the value is written to
 `app.ron` (section 2) and restored at the next launch.
@@ -311,6 +311,26 @@ Not a setting either: **Import past voxtype meetings**, with a spinner and an
 `N imported so far` count while it runs. See
 [USER_GUIDE.md](USER_GUIDE.md) section 12.
 
+### Logging
+
+| | |
+| --- | --- |
+| **Log level** | How much the app prints to the terminal it was started from: **Errors only**, **Warnings**, **Information**, **Debug** or **Trace (everything)**. |
+| Default | Warnings |
+| Persists | Yes |
+| Takes effect | Immediately |
+
+The default used to be Information, which printed thirty lines of
+font-fallback bookkeeping on every launch before anything had happened. At
+Errors, Warnings and Information, the libraries that narrate at that level —
+font enumeration, GPU adapter selection, window-system plumbing — are held to
+warnings; Debug and Trace include every library the app uses, because at that
+point you asked for everything.
+
+`RUST_LOG` overrides this setting for the run it is set in, and the pane says
+so and greys the control out. It is the developer's override; a setting that
+silently beat it would be the harder thing to debug.
+
 ### Settings that are not in the pane
 
 Some state persists without having a control of its own:
@@ -511,7 +531,7 @@ engine and model dropdowns into text fields.
 
 | Variable | What fastcription does with it |
 | --- | --- |
-| `RUST_LOG` | Sets the log filter, in `tracing` syntax, e.g. `RUST_LOG=debug` or `RUST_LOG=fc_asr=debug,info`. Defaults to `info`. Logs go to the terminal. |
+| `RUST_LOG` | Sets the log filter, in `tracing` syntax, e.g. `RUST_LOG=debug` or `RUST_LOG=fc_asr=debug,info`. When set it replaces the **Log level** setting for that run, and the Settings pane says so. Unset, the setting applies (default: warnings). Logs go to the terminal. |
 | `PATH` | Searched for `voxtype`; `pactl` and `parec` are run by name. |
 | `XDG_RUNTIME_DIR` | Where voxtype's daemon state files are watched, under `$XDG_RUNTIME_DIR/voxtype/`. Without it, the service pill falls back to `systemctl` alone. |
 | `XDG_DATA_HOME` | Where `library.db`, `app.ron` and `panic.log` go, under `fastcription/`. Defaults to `~/.local/share`. |

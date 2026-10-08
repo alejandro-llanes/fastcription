@@ -81,6 +81,9 @@ pub struct State {
     /// caption strip sits over somebody else's video call for an hour, where a
     /// darker or plainer palette can be much easier to read off.
     pub compact_theme: Option<ThemeChoice>,
+    /// How much the app prints to its standard error. `RUST_LOG` overrides
+    /// it for a run; see `logging.rs`.
+    pub log_level: crate::logging::LogLevel,
     /// Whether the full window shows the visualiser as well as compact mode.
     ///
     /// Separate from the style because the two places are used differently:
@@ -120,6 +123,7 @@ impl Default for State {
             compact_visualizer_height: COMPACT_VISUALIZER_DEFAULT,
             compact_theme: None,
             visualizer_in_main: true,
+            log_level: crate::logging::LogLevel::default(),
             remote_probe: None,
             remote_probe_rx: None,
         }
@@ -759,6 +763,39 @@ fn system(app: &mut App, ui: &mut Ui) {
                 );
             }
         });
+    });
+
+    card(ui, &palette, t("Logging"), |ui| {
+        let overridden = crate::logging::env_override();
+        ui.add_enabled_ui(overridden.is_none(), |ui| {
+            egui::ComboBox::from_id_salt("settings-log-level")
+                .selected_text(app.settings.log_level.label())
+                .width(200.0)
+                .show_ui(ui, |ui| {
+                    for level in crate::logging::LogLevel::ALL {
+                        ui.selectable_value(&mut app.settings.log_level, level, level.label());
+                    }
+                });
+        });
+        match overridden {
+            Some(spec) => hint(
+                ui,
+                &palette,
+                &format!(
+                    "{} RUST_LOG={spec}",
+                    t("Set by the environment for this run, which overrides the setting:")
+                ),
+            ),
+            None => hint(
+                ui,
+                &palette,
+                t(
+                    "What is printed to the terminal the app was started from. Takes \
+                   effect immediately. Warnings is enough unless you are chasing \
+                   something; Debug and Trace include every library the app uses.",
+                ),
+            ),
+        }
     });
 
     card(ui, &palette, t("Library"), |ui| {

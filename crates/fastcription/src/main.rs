@@ -7,6 +7,7 @@ mod compositor;
 mod env;
 mod i18n;
 mod icons;
+mod logging;
 mod session;
 mod theme;
 mod ui;
@@ -115,7 +116,16 @@ fn init_logging() {
         env!("CARGO_PKG_VERSION"),
     );
 
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // Behind a reload handle, so the level in Settings takes effect at once.
+    // See `logging.rs` for why the default is `warn` and why `RUST_LOG` wins.
+    {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::util::SubscriberInitExt as _;
+        let (filter, handle) = tracing_subscriber::reload::Layer::new(logging::initial_filter());
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+        logging::install(handle);
+    }
 }

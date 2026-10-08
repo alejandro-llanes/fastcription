@@ -345,6 +345,8 @@ pub struct App {
     /// The theme choice the current palette was resolved from, so a change to
     /// the setting is noticed without re-resolving it every frame.
     theme_applied: Option<crate::theme::ThemeChoice>,
+    /// The log level last handed to the subscriber, for the same reason.
+    log_applied: Option<crate::logging::LogLevel>,
     /// Set while a deletion is awaiting confirmation.
     pending_delete: Option<PendingDelete>,
     /// A conversation and the offset to scroll to, set by clicking a search
@@ -498,6 +500,7 @@ impl App {
             main_view: MainView::Live,
             settings_tab: settings::Tab::default(),
             theme_applied: None,
+            log_applied: None,
             pending_delete: None,
             pending_scroll: None,
             sidebar: sidebar::State::default(),
