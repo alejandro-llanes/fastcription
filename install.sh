@@ -123,7 +123,8 @@ fi
 
 # ------------------------------------------------------------- what is left
 
-installed_version=$("$BIN_DIR/fastcription" --version 2>/dev/null || echo "")
+# `--version` prints "fastcription 0.1.0"; the line below supplies the name.
+installed_version=$("$BIN_DIR/fastcription" --version 2>/dev/null | awk '{print $NF}' || echo "")
 say ""
 printf '%s%sfastcription %s installed.%s\n' "$GREEN" "$B" "${installed_version:-$plain}" "$R"
 say ""
