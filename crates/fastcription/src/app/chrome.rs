@@ -260,12 +260,16 @@ impl App {
         if shortcut(Modifiers::CTRL, Key::D) {
             self.look_up_current_selection();
         }
-        // A pasted list, from the Words view.
+        // A pasted list, from the Words view. A toggle, so the key that
+        // opened the box also puts it away.
         if shortcut(Modifiers::CTRL, Key::I) {
             self.main_view = MainView::Words;
-            if self.words.import.is_none() {
-                self.words.import = Some(String::new());
-                self.words.import_fresh = true;
+            match self.words.import {
+                Some(_) => self.words.import = None,
+                None => {
+                    self.words.import = Some(String::new());
+                    self.words.import_fresh = true;
+                }
             }
         }
         // Ctrl+C with a selection copies it. egui turns the keys into a Copy

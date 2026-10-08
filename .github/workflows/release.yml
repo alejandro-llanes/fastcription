@@ -1,0 +1,114 @@
+# Builds the release artifact and publishes it, on a version tag.
+#
+#   git tag -a v0.1.0 -m 'fastcription 0.1.0' && git push origin v0.1.0
+#
+# Ubuntu 22.04 rather than the newest runner on purpose: the binary links
+# glibc dynamically, and a binary built against a newer glibc will not start on
+# an older distribution. 22.04 ships glibc 2.35, which is old enough to cover
+# every currently supported release and new enough to build this.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and publish (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev libxcursor-dev libxi-dev libxrandr-dev \
+            libgl1-mesa-dev libegl1-mesa-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Work out the version
+        id: version
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      # The tag and Cargo.toml must agree, or the tarball is named one thing
+      # and reports itself as another.
+      - name: Check the tag matches Cargo.toml
+        run: |
+          manifest=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          tagged="${{ steps.version.outputs.version }}"
+          if [ "$manifest" != "$tagged" ]; then
+            echo "::error::tag is v$tagged but Cargo.toml says $manifest"
+            exit 1
+          fi
+
+      - name: Build
+        run: cargo build --release --locked -p fastcription
+
+      - name: Package
+        id: package
+        run: |
+          name="fastcription-${{ steps.version.outputs.version }}-${TARGET}"
+          mkdir -p "dist/$name"
+          cp target/release/fastcription "dist/$name/"
+          strip "dist/$name/fastcription"
+          cp packaging/fastcription.desktop "dist/$name/"
+          cp packaging/fastcription.svg "dist/$name/"
+          cp LICENSE README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          ( cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256" )
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          ls -la dist
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.version.outputs.tag }}"
+          notes=$(mktemp)
+          {
+            echo "## Install"
+            echo
+            echo '```sh'
+            echo "curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/master/install.sh | sh"
+            echo '```'
+            echo
+            echo "Or download the tarball below, check it against its \`.sha256\`, and put"
+            echo "\`fastcription\` somewhere on your \`PATH\`."
+            echo
+            echo "fastcription needs PipeWire or PulseAudio and [voxtype](https://github.com/peteonrails/voxtype)"
+            echo "with a model installed. See the [installation guide](https://github.com/${{ github.repository }}/blob/master/docs/INSTALL.md)."
+            echo
+            echo "---"
+            echo
+            echo "Built on Ubuntu 22.04 (glibc 2.35), \`x86_64-unknown-linux-gnu\`."
+          } > "$notes"
+          gh release create "$tag" \
+            --title "fastcription ${{ steps.version.outputs.version }}" \
+            --notes-file "$notes" \
+            --verify-tag \
+            "dist/${{ steps.package.outputs.name }}.tar.gz" \
+            "dist/${{ steps.package.outputs.name }}.tar.gz.sha256"

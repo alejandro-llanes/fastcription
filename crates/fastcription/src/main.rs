@@ -20,6 +20,15 @@ use std::sync::Arc;
 use app::App;
 
 fn main() -> anyhow::Result<()> {
+    // Answered before anything else is set up. A GUI binary that has just been
+    // put on someone's PATH by a shell script is going to be asked what it is
+    // from a terminal, and opening a window — or failing to, on a machine with
+    // no display — is the wrong answer to `--version`.
+    if let Some(reply) = cli_reply(std::env::args().skip(1)) {
+        println!("{reply}");
+        return Ok(());
+    }
+
     init_logging();
 
     // Built before the claim, because the claim's handler needs it: a second
@@ -97,6 +106,43 @@ impl eframe::App for Window {
     }
 }
 
+/// What to print and exit for, if anything.
+///
+/// Deliberately tiny: fastcription is configured in its own window, not on a
+/// command line, so there are no options to parse — only the two questions a
+/// terminal asks of any binary. An unrecognised argument is reported rather
+/// than ignored, because silently opening the window is how a typo in a
+/// desktop entry goes unnoticed.
+fn cli_reply(args: impl Iterator<Item = String>) -> Option<String> {
+    const USAGE: &str = concat!(
+        "fastcription ",
+        env!("CARGO_PKG_VERSION"),
+        "\n\n\
+         Realtime conversation transcription for the Linux desktop.\n\n\
+         Usage: fastcription [--version] [--help]\n\n\
+         Everything else is configured in the window, under Settings.\n\
+         Set RUST_LOG to override the log level for one run.\n\n\
+         Documentation: https://github.com/alejandro-llanes/fastcription"
+    );
+    let mut unknown = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "-V" | "--version" => {
+                return Some(format!("fastcription {}", env!("CARGO_PKG_VERSION")))
+            }
+            "-h" | "--help" => return Some(USAGE.to_owned()),
+            other => unknown.push(other.to_owned()),
+        }
+    }
+    if unknown.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "fastcription takes no arguments; got {}.\n\n{USAGE}",
+        unknown.join(" ")
+    ))
+}
+
 fn native_options() -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -128,5 +174,42 @@ fn init_logging() {
             .with(tracing_subscriber::fmt::layer())
             .init();
         logging::install(handle);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cli_reply;
+
+    fn reply(args: &[&str]) -> Option<String> {
+        cli_reply(args.iter().map(|a| (*a).to_owned()))
+    }
+
+    /// No arguments means open the window, which is the whole point of the
+    /// program; anything printed instead would be a window that never opened.
+    #[test]
+    fn no_arguments_opens_the_window() {
+        assert_eq!(reply(&[]), None);
+    }
+
+    #[test]
+    fn version_and_help_are_answered_in_both_spellings() {
+        let version = format!("fastcription {}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(reply(&["--version"]).as_deref(), Some(version.as_str()));
+        assert_eq!(reply(&["-V"]).as_deref(), Some(version.as_str()));
+        for help in [reply(&["--help"]), reply(&["-h"])] {
+            let help = help.expect("help is answered");
+            assert!(help.contains("Usage: fastcription"), "{help}");
+            assert!(help.contains(env!("CARGO_PKG_VERSION")), "{help}");
+        }
+    }
+
+    /// A typo in a desktop entry or a shell alias should say so rather than
+    /// open a window as though nothing had been asked.
+    #[test]
+    fn an_unknown_argument_is_reported_with_the_usage() {
+        let reply = reply(&["--transcribe-everything"]).expect("reported");
+        assert!(reply.contains("--transcribe-everything"), "{reply}");
+        assert!(reply.contains("Usage: fastcription"), "{reply}");
     }
 }

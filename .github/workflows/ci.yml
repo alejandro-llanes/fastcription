@@ -1,0 +1,53 @@
+# Formatting, lints and the test suite, on every push and pull request.
+#
+# The build needs X11, Wayland and GL headers even though nothing here opens a
+# window: eframe is compiled with both windowing backends and the `glow`
+# renderer, and their -sys crates look for the headers at build time.
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A backtrace costs nothing until something panics, and a CI panic with no
+  # backtrace is a second run to get one.
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: fmt, clippy, tests
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev libxcursor-dev libxi-dev libxrandr-dev \
+            libgl1-mesa-dev libegl1-mesa-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The suite skips what it cannot have on a runner: the tests that need a
+      # sound server, voxtype with a model, or a meaning server are `#[ignore]`
+      # and say so in their reason.
+      - name: Tests
+        run: cargo test --workspace
