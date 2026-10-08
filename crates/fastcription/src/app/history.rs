@@ -122,6 +122,9 @@ fn inner(app: &mut App, ui: &mut egui::Ui, id: ConversationId) {
         // Scoped so this borrow of the transcript cache ends before the scroll
         // request is cleared below. Not cloned: a three-hour meeting is
         // thousands of segments and this runs every frame.
+        // Taken out before `segments_for` borrows the app, put back after.
+        let mut selection = app.selection.take();
+        let mut action: Option<transcript::LineAction> = None;
         let segments = app.segments_for(id);
         // The segment the search excerpt came from: the first one that has not
         // finished by then, so an offset that lands in a gap between two
@@ -131,24 +134,28 @@ fn inner(app: &mut App, ui: &mut egui::Ui, id: ConversationId) {
                 .iter()
                 .position(|segment| segment.end_ms >= start_ms)
         });
-        let mut add_word: Option<fc_core::Segment> = None;
         egui::ScrollArea::vertical()
             .id_salt("history-segments")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for (row, segment) in segments.iter().enumerate() {
-                    let response = transcript::row(ui, &app.palette, segment, pt);
+                    let response =
+                        transcript::row(ui, &app.palette, segment, pt, Some(id), &mut selection);
                     if Some(row) == target_row {
                         response.scroll_to_me(Some(egui::Align::Center));
                     }
-                    if transcript::line_menu(&response, segment).is_some() {
-                        add_word = Some(segment.clone());
+                    if let Some(asked) = transcript::line_menu(&response, segment, &selection) {
+                        action = Some(asked);
                     }
                 }
                 if segments.is_empty() {
                     ui.weak(t("This conversation has no transcript."));
                 }
             });
+        app.selection = selection;
+        if let Some(action) = action {
+            app.apply_line_action(action);
+        }
     }
     // Dropped whether or not a row matched, so an offset that names nothing in
     // this transcript does not leave the view scrolling for ever.

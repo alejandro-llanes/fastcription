@@ -1,13 +1,14 @@
 //! The word registry: expressions the reader did not know, what they mean,
 //! and where they were said.
 //!
-//! Three pieces. The **editor** is the small window that opens from a
-//! transcript line's right-click menu (or `Ctrl+D` for the newest line): the
-//! line's words as chips to click, so the expression is picked rather than
-//! typed, because during a meeting nobody has a hand free to type. The
-//! **pane** is the registry itself, newest first, each entry with its English
-//! meaning beside its translation and a way back to the line it came from.
-//! And the **lookups**, which run on threads against the meaning server and
+//! Three pieces. The **selection** is made in the transcript itself
+//! (`select.rs`): drag across the words, or double-click one, then `Ctrl+D`
+//! or the right-click menu — because during a meeting nobody has a hand free
+//! to type, and a form was the wrong shape for the moment. A lookup asks the
+//! vocabulary first and the meaning server only for something new, and shows
+//! the answer on a **card** beside the transcript. The **pane** is the
+//! registry itself, newest first, with a paste-a-list import for the words
+//! that arrive some other way. And the **lookups**, which run on threads and
 //! land in the store when they answer — like the transcription itself, the
 //! window never waits on the network.
 
@@ -16,7 +17,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use egui::{RichText, Ui};
-use fc_core::{ConversationId, Segment, Word, WordId};
+use fc_core::{ConversationId, Word, WordId};
 
 use crate::app::{App, NoticeKind, PendingDelete};
 use crate::i18n::{t, tf};
@@ -36,8 +37,13 @@ pub struct State {
     pub loaded: bool,
     /// Lookups in flight, by the entry they are for.
     pub in_flight: HashMap<WordId, Receiver<Result<Answer, String>>>,
-    /// The add-a-word window, while it is open.
-    pub editor: Option<Editor>,
+    /// The entry the meaning card is showing, while it is open.
+    pub card: Option<WordId>,
+    /// The paste-a-list import panel's text, while it is open.
+    pub import: Option<String>,
+    /// True for the frame after the panel opens, so the box takes focus once
+    /// and then leaves the reader alone.
+    pub import_fresh: bool,
     /// The entry whose fields are being edited inline, with the draft.
     pub editing: Option<Word>,
     pub search: String,
@@ -45,90 +51,7 @@ pub struct State {
     pub warmed: Option<Instant>,
 }
 
-/// The add-a-word window: a transcript line broken into chips, and the
-/// expression they add up to.
-pub struct Editor {
-    /// The line, as said.
-    pub context: String,
-    /// Its words, in order, for the chips.
-    pub words: Vec<String>,
-    /// Which chips are lit.
-    pub chosen: Vec<bool>,
-    /// The expression, which the chips write and the reader may still edit.
-    pub expression: String,
-    pub conversation: Option<ConversationId>,
-    pub start_ms: Option<u64>,
-    /// Whether the expression field has been given focus yet.
-    pub focused: bool,
-}
-
-impl Editor {
-    pub fn for_line(
-        text: &str,
-        conversation: Option<ConversationId>,
-        start_ms: Option<u64>,
-    ) -> Self {
-        let words: Vec<String> = text.split_whitespace().map(str::to_owned).collect();
-        let chosen = vec![false; words.len()];
-        Self {
-            context: fc_core::single_line(text),
-            words,
-            chosen,
-            expression: String::new(),
-            conversation,
-            start_ms,
-            focused: false,
-        }
-    }
-
-    /// The lit chips, in line order, with the punctuation that clings to a
-    /// word's ends dropped: "ocean," is the word "ocean".
-    pub fn expression_from_chips(&self) -> String {
-        self.words
-            .iter()
-            .zip(&self.chosen)
-            .filter(|(_, &on)| on)
-            .map(|(w, _)| trim_punctuation(w))
-            .filter(|w| !w.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-}
-
-/// Strips the punctuation that clings to a spoken word in a transcript:
-/// commas, full stops, quotes, brackets. Apostrophes inside a word stay —
-/// "don't" is one word.
-pub fn trim_punctuation(word: &str) -> &str {
-    word.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'' && c != '-')
-}
-
 impl App {
-    /// Opens the editor for a transcript line.
-    pub(super) fn open_word_editor(
-        &mut self,
-        segment: &Segment,
-        conversation: Option<ConversationId>,
-    ) {
-        self.words.editor = Some(Editor::for_line(
-            &segment.text,
-            conversation,
-            Some(segment.start_ms),
-        ));
-    }
-
-    /// `Ctrl+D`: the newest settled line, which is the one just heard.
-    pub(super) fn open_word_editor_for_latest(&mut self) {
-        let Some(segment) = self.segments.last().cloned() else {
-            self.notify(
-                NoticeKind::Info,
-                t("Nothing has been transcribed yet to add a word from."),
-            );
-            return;
-        };
-        let conversation = self.live_conversation;
-        self.open_word_editor(&segment, conversation);
-    }
-
     /// Adds an expression to the registry, and looks it up if asked.
     pub(super) fn add_word(
         &mut self,
@@ -137,14 +60,12 @@ impl App {
         conversation: Option<ConversationId>,
         start_ms: Option<u64>,
         look_up: bool,
-    ) {
+    ) -> Option<WordId> {
         let expression = expression.trim();
         if expression.is_empty() {
-            return;
+            return None;
         }
-        let Some(store) = self.store.clone() else {
-            return;
-        };
+        let store = self.store.clone()?;
         let new = fc_store::NewWord {
             expression: expression.to_owned(),
             context: context.to_owned(),
@@ -159,12 +80,106 @@ impl App {
                 if look_up {
                     self.look_up_word(id);
                 }
+                Some(id)
+            }
+            Err(err) => {
+                self.notify(
+                    NoticeKind::Error,
+                    tf("Could not add the word: {}", &[&err.to_string()]),
+                );
+                None
+            }
+        }
+    }
+
+    /// What the row menu and `Ctrl+D` do with a selection.
+    pub(super) fn apply_line_action(&mut self, action: super::transcript::LineAction) {
+        use super::transcript::LineAction;
+        match action {
+            LineAction::LookUp(selection) => self.look_up_selection(&selection),
+            LineAction::Add(selection) => {
+                if let Some(id) = self.add_word(
+                    &selection.text,
+                    &selection.context,
+                    selection.conversation,
+                    selection.start_ms,
+                    false,
+                ) {
+                    self.words.card = Some(id);
+                }
+            }
+        }
+    }
+
+    /// `Ctrl+D`: whatever is selected in the transcript.
+    pub(super) fn look_up_current_selection(&mut self) {
+        match self.selection.clone() {
+            Some(selection) => self.look_up_selection(&selection),
+            None => self.notify(
+                NoticeKind::Info,
+                t("Select a word or expression in the transcript first — drag across it, or double-click a word.").to_owned(),
+            ),
+        }
+    }
+
+    /// The vocabulary first; the server only for something new.
+    ///
+    /// A word the reader already looked up is a word they already paid for,
+    /// and the answer they edited is better than a fresh one from the model.
+    /// Either way the card opens on it.
+    pub(super) fn look_up_selection(&mut self, selection: &super::select::Selection) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let found = lock(&store).find_word(&selection.text);
+        match found {
+            Ok(Some(word)) => {
+                self.words.card = Some(word.id);
+                if !word.looked_up() {
+                    self.look_up_word(word.id);
+                }
+            }
+            Ok(None) => {
+                if let Some(id) = self.add_word(
+                    &selection.text,
+                    &selection.context,
+                    selection.conversation,
+                    selection.start_ms,
+                    true,
+                ) {
+                    self.words.card = Some(id);
+                }
             }
             Err(err) => self.notify(
                 NoticeKind::Error,
-                tf("Could not add the word: {}", &[&err.to_string()]),
+                tf("Could not read the word registry: {}", &[&err.to_string()]),
             ),
         }
+    }
+
+    /// A pasted list, one word or expression per line.
+    ///
+    /// Returns how many were new. Lines that were already there land on their
+    /// existing entries and are not counted, which is what the store's
+    /// `add_word` does on its own; here it is only tallied for the notice.
+    pub(super) fn import_words(&mut self, text: &str, look_up: bool) -> usize {
+        let lines = parse_import(text);
+        let before = self.words.list.len();
+        for expression in &lines {
+            self.add_word(expression, "", None, None, false);
+        }
+        let added = self.words.list.len().saturating_sub(before);
+        if look_up {
+            self.look_up_missing_words();
+        }
+        self.notify(
+            NoticeKind::Info,
+            tf(
+                "Added {} new words; {} were already in your vocabulary.",
+                &[&added.to_string(), &(lines.len() - added).to_string()],
+            ),
+        );
+        added
     }
 
     /// Asks the meaning server about one entry, on a thread.
@@ -373,99 +388,134 @@ impl App {
     }
 }
 
-// ----------------------------------------------------------- the editor
+/// The lines of a pasted list: trimmed, blanks dropped, repeats dropped
+/// case-insensitively, order kept.
+pub fn parse_import(text: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    text.lines()
+        .map(|l| {
+            l.trim()
+                .trim_matches(|c: char| c == ',' || c == ';' || c == '\u{2022}' || c == '-')
+                .trim()
+        })
+        .filter(|l| !l.is_empty())
+        .filter(|l| seen.insert(l.to_lowercase()))
+        .map(str::to_owned)
+        .collect()
+}
 
-/// The add-a-word window, if one is open. Called every frame.
-pub fn editor_window(app: &mut App, ctx: &egui::Context) {
-    let Some(mut editor) = app.words.editor.take() else {
+// ------------------------------------------------------------- the card
+
+/// The meaning of what was just looked up, beside the transcript.
+///
+/// A floating card rather than a trip to the Words view: the reader is in a
+/// meeting and the transcript is what they are following. It stays until
+/// closed, Escape, or the next lookup replaces it. In compact mode it is the
+/// same card, small enough for the strip.
+pub fn meaning_card(app: &mut App, ctx: &egui::Context) {
+    let Some(id) = app.words.card else {
+        return;
+    };
+    let Some(word) = app.words.list.iter().find(|w| w.id == id).cloned() else {
+        app.words.card = None;
         return;
     };
     let palette = app.palette.clone();
-    let mut outcome: Option<Outcome> = None;
+    let busy = app.words.in_flight.contains_key(&id);
+    let compact = app.compact;
+    let mut close = false;
+    let mut look_up = false;
 
-    egui::Window::new(t("Add to my words"))
+    egui::Window::new("meaning-card")
+        .title_bar(false)
         .collapsible(false)
         .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .anchor(
+            egui::Align2::RIGHT_TOP,
+            egui::vec2(-16.0, if compact { 8.0 } else { 72.0 }),
+        )
+        .frame(
+            egui::Frame::default()
+                .fill(palette.surface)
+                .stroke(egui::Stroke::new(1.0, palette.accent.gamma_multiply(0.6)))
+                .corner_radius(ui::PANEL_RADIUS)
+                .inner_margin(egui::Margin::same(if compact { 10 } else { 14 }))
+                .shadow(egui::epaint::Shadow {
+                    offset: [0, 4],
+                    blur: 18,
+                    spread: 0,
+                    color: palette.accent.gamma_multiply(0.18),
+                }),
+        )
         .show(ctx, |ui| {
-            ui.set_width(520.0);
-            ui::label(ui, &palette, t("tap the words of the expression"));
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-                let mut changed = false;
-                for (word, on) in editor.words.iter().zip(editor.chosen.iter_mut()) {
-                    let tone = if *on { Tone::Primary } else { Tone::Normal };
-                    if ui::pill(ui, &palette, tone, None, word).clicked() {
-                        *on = !*on;
-                        changed = true;
+            ui.set_max_width(if compact { 400.0 } else { 440.0 });
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(&word.expression)
+                        .size(if compact { 16.0 } else { 20.0 })
+                        .strong()
+                        .color(palette.accent),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("\u{2715}")
+                        .on_hover_text(t("Close (Esc)"))
+                        .clicked()
+                    {
+                        close = true;
+                    }
+                });
+            });
+            if busy {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(14.0));
+                    ui.label(
+                        RichText::new(t("asking the meaning server\u{2026}"))
+                            .color(palette.secondary),
+                    );
+                });
+                return;
+            }
+            match (&word.translation, &word.meaning) {
+                (None, None) => {
+                    ui.label(
+                        RichText::new(t("In your words, not looked up yet."))
+                            .color(palette.secondary),
+                    );
+                    if ui.small_button(t("Look up")).clicked() {
+                        look_up = true;
                     }
                 }
-                if changed {
-                    editor.expression = editor.expression_from_chips();
+                (translation, meaning) => {
+                    if let Some(translation) = translation {
+                        ui.label(
+                            RichText::new(translation)
+                                .size(if compact { 15.0 } else { 18.0 })
+                                .color(palette.text),
+                        );
+                    }
+                    if let Some(meaning) = meaning {
+                        ui.label(RichText::new(meaning).color(palette.secondary));
+                    }
+                    if !compact {
+                        if let Some(example) = &word.example {
+                            ui.add_space(4.0);
+                            ui.label(RichText::new(example).italics().color(palette.secondary));
+                        }
+                    }
                 }
-            });
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label(t("Expression"));
-                let field = ui.add(
-                    egui::TextEdit::singleline(&mut editor.expression)
-                        .desired_width(300.0)
-                        .hint_text(t("or type it")),
-                );
-                // Focused the frame the window opens, so the flow during a
-                // meeting is Ctrl+D, type, Enter — nothing to click.
-                if !editor.focused {
-                    field.request_focus();
-                    editor.focused = true;
-                }
-                if field.lost_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                    && !editor.expression.trim().is_empty()
-                {
-                    outcome = Some(Outcome::Add { look_up: true });
-                }
-            });
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let ready = !editor.expression.trim().is_empty();
-                if ui
-                    .add_enabled(ready, egui::Button::new(t("Add and look up")))
-                    .clicked()
-                {
-                    outcome = Some(Outcome::Add { look_up: true });
-                }
-                if ui.add_enabled(ready, egui::Button::new(t("Add"))).clicked() {
-                    outcome = Some(Outcome::Add { look_up: false });
-                }
-                if ui.button(t("Cancel")).clicked() {
-                    outcome = Some(Outcome::Cancel);
-                }
-            });
+            }
         });
 
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-        outcome = Some(Outcome::Cancel);
+        close = true;
     }
-    match outcome {
-        Some(Outcome::Add { look_up }) => {
-            let expression = editor.expression.clone();
-            app.add_word(
-                &expression,
-                &editor.context,
-                editor.conversation,
-                editor.start_ms,
-                look_up,
-            );
-        }
-        Some(Outcome::Cancel) => {}
-        None => app.words.editor = Some(editor),
+    if look_up {
+        app.look_up_word(id);
     }
-}
-
-enum Outcome {
-    Add { look_up: bool },
-    Cancel,
+    if close {
+        app.words.card = None;
+    }
 }
 
 // ------------------------------------------------------------- the pane
@@ -488,6 +538,24 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                     .hint_text(t("Search…")),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let importing = app.words.import.is_some();
+                if ui::pill(
+                    ui,
+                    &palette,
+                    if importing {
+                        Tone::Primary
+                    } else {
+                        Tone::Normal
+                    },
+                    None,
+                    t("Import"),
+                )
+                .on_hover_text(t("Paste a list of words or expressions (Ctrl+I)"))
+                .clicked()
+                {
+                    app.words.import = if importing { None } else { Some(String::new()) };
+                    app.words.import_fresh = !importing;
+                }
                 let missing = app.words.list.iter().filter(|w| !w.looked_up()).count();
                 if missing > 0
                     && ui::pill(
@@ -505,11 +573,14 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         });
         ui.add_space(10.0);
 
+        import_panel(app, ui, &palette);
+
         if app.words.list.is_empty() {
             ui.label(
                 RichText::new(t(
-                    "Nothing yet. Right-click a line of the transcript and choose \
-                     \u{201c}Add to my words\u{201d}, or press Ctrl+D for the newest line.",
+                    "Nothing yet. Select a word or expression in the transcript \u{2014} drag \
+                     across it, or double-click a word \u{2014} then press Ctrl+D or \
+                     right-click it. Or paste a list with Import.",
                 ))
                 .color(palette.secondary),
             );
@@ -557,6 +628,76 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             }
         }
     });
+}
+
+/// The paste-a-list panel, while it is open.
+///
+/// One word or expression per line. `Ctrl+Enter` adds and looks them all up,
+/// so a list pasted from somewhere else is a keyboard away from meanings.
+fn import_panel(app: &mut App, ui: &mut Ui, palette: &crate::theme::Palette) {
+    let Some(mut draft) = app.words.import.take() else {
+        return;
+    };
+    let mut outcome: Option<bool> = None;
+    let mut cancel = false;
+    egui::Frame::default()
+        .fill(palette.window)
+        .stroke(egui::Stroke::new(1.0, palette.accent.gamma_multiply(0.5)))
+        .corner_radius(ui::PANEL_RADIUS)
+        .inner_margin(egui::Margin::same(12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui::label(ui, palette, t("import a list"));
+            ui.add_space(4.0);
+            let field = ui.add(
+                egui::TextEdit::multiline(&mut draft)
+                    .desired_rows(5)
+                    .desired_width(f32::INFINITY)
+                    .hint_text(t("One word or expression per line\u{2026}")),
+            );
+            if app.words.import_fresh {
+                field.request_focus();
+                app.words.import_fresh = false;
+            }
+            let count = parse_import(&draft).len();
+            if field.has_focus()
+                && ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter))
+                && count > 0
+            {
+                outcome = Some(true);
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let n = count.to_string();
+                if ui
+                    .add_enabled(
+                        count > 0,
+                        egui::Button::new(tf("Add and look up {}", &[&n])),
+                    )
+                    .on_hover_text(t("Ctrl+Enter"))
+                    .clicked()
+                {
+                    outcome = Some(true);
+                }
+                if ui
+                    .add_enabled(count > 0, egui::Button::new(tf("Add {}", &[&n])))
+                    .clicked()
+                {
+                    outcome = Some(false);
+                }
+                if ui.button(t("Cancel")).clicked() {
+                    cancel = true;
+                }
+            });
+        });
+    ui.add_space(10.0);
+    match outcome {
+        Some(look_up) => {
+            app.import_words(&draft, look_up);
+        }
+        None if cancel => {}
+        None => app.words.import = Some(draft),
+    }
 }
 
 enum Action {
@@ -684,11 +825,13 @@ fn entry(
             }
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new(format!("\u{201c}{}\u{201d}", word.context))
-                        .small()
-                        .color(palette.dim),
-                );
+                if !word.context.is_empty() {
+                    ui.label(
+                        RichText::new(format!("\u{201c}{}\u{201d}", word.context))
+                            .small()
+                            .color(palette.dim),
+                    );
+                }
                 if let Some(conversation) = word.conversation {
                     let title = app
                         .conversations
@@ -711,30 +854,20 @@ fn entry(
 mod tests {
     use super::*;
 
+    /// A list pasted from anywhere: bullets, trailing commas, blank lines,
+    /// the same thing twice with different capitals.
     #[test]
-    fn chips_add_up_to_the_expression_in_line_order_without_clinging_punctuation() {
-        let mut editor = Editor::for_line("I don't want to boil the ocean, honestly.", None, None);
-        assert_eq!(editor.words.len(), 8);
-        // Lit out of order on purpose: the expression follows the line.
-        editor.chosen[6] = true; // ocean,
-        editor.chosen[4] = true; // boil
-        editor.chosen[5] = true; // the
-        assert_eq!(editor.expression_from_chips(), "boil the ocean");
+    fn a_pasted_list_is_cleaned_and_deduplicated_in_order() {
+        let text = "boil the ocean,\n\n- table this\n\u{2022} Ballpark figure\nBOIL THE OCEAN\n   \nask not;";
+        assert_eq!(
+            parse_import(text),
+            ["boil the ocean", "table this", "Ballpark figure", "ask not"]
+        );
     }
 
     #[test]
-    fn punctuation_is_trimmed_but_apostrophes_and_hyphens_inside_a_word_stay() {
-        assert_eq!(trim_punctuation("ocean,"), "ocean");
-        assert_eq!(trim_punctuation("\u{201c}table\u{201d}"), "table");
-        assert_eq!(trim_punctuation("don't"), "don't");
-        assert_eq!(trim_punctuation("ballpark-ish."), "ballpark-ish");
-        assert_eq!(trim_punctuation("..."), "");
-    }
-
-    #[test]
-    fn the_context_is_kept_on_one_line() {
-        let editor = Editor::for_line("first\nsecond  third", None, Some(5));
-        assert_eq!(editor.context, "first second third");
-        assert_eq!(editor.start_ms, Some(5));
+    fn an_empty_paste_is_an_empty_list() {
+        assert!(parse_import("").is_empty());
+        assert!(parse_import("\n  \n,\n").is_empty());
     }
 }

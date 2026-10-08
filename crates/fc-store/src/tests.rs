@@ -1003,6 +1003,15 @@ mod words {
     }
 
     #[test]
+    fn an_expression_is_found_under_any_capitalisation_or_not_at_all() {
+        let (_dir, store) = open_temp();
+        let id = store.add_word(&new_word("Ballpark Figure")).unwrap();
+        let found = store.find_word("  ballpark figure ").unwrap().unwrap();
+        assert_eq!(found.id, id);
+        assert!(store.find_word("circle back").unwrap().is_none());
+    }
+
+    #[test]
     fn newest_first() {
         let (_dir, store) = open_temp();
         let mut older = new_word("older");

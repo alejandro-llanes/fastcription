@@ -12,6 +12,7 @@ mod history;
 mod library;
 mod live;
 mod readiness;
+mod select;
 mod session_control;
 mod settings;
 mod sidebar;
@@ -353,6 +354,8 @@ pub struct App {
     log_applied: Option<crate::logging::LogLevel>,
     /// The word registry, as loaded from the store; see `words.rs`.
     words: words::State,
+    /// The words selected in a transcript line, if any; see `select.rs`.
+    selection: Option<select::Selection>,
     /// Set while a deletion is awaiting confirmation.
     pending_delete: Option<PendingDelete>,
     /// A conversation and the offset to scroll to, set by clicking a search
@@ -508,6 +511,7 @@ impl App {
             theme_applied: None,
             log_applied: None,
             words: words::State::default(),
+            selection: None,
             pending_delete: None,
             pending_scroll: None,
             sidebar: sidebar::State::default(),

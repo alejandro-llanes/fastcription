@@ -74,9 +74,11 @@ fn body(app: &mut App, ui: &mut egui::Ui) {
     }
 
     let pt = app.settings.transcript_pt;
-    // Collected inside the loop, applied after it: the loop borrows the
-    // segments, and opening the editor needs the app.
-    let mut add_word: Option<Segment> = None;
+    // The selection is taken out while the rows borrow the app's segments
+    // and put back after, which keeps the borrow checker out of the loop.
+    let mut selection = app.selection.take();
+    let conversation = app.live_conversation;
+    let mut action: Option<transcript::LineAction> = None;
     egui::ScrollArea::vertical()
         .id_salt("live-transcript-scroll")
         .auto_shrink([false, false])
@@ -102,23 +104,25 @@ fn body(app: &mut App, ui: &mut egui::Ui) {
                 ui.add_space(4.0);
             }
             for segment in app.segments.iter().skip(hidden) {
-                let response = transcript::row(ui, &app.palette, segment, pt);
-                if transcript::line_menu(&response, segment).is_some() {
-                    add_word = Some(segment.clone());
+                let response =
+                    transcript::row(ui, &app.palette, segment, pt, conversation, &mut selection);
+                if let Some(asked) = transcript::line_menu(&response, segment, &selection) {
+                    action = Some(asked);
                 }
             }
             let mut pending: Vec<&Segment> = app.provisional.values().collect();
             pending.sort_by_key(|segment| segment.seq);
             for segment in pending {
-                let response = transcript::row(ui, &app.palette, segment, pt);
-                if transcript::line_menu(&response, segment).is_some() {
-                    add_word = Some(segment.clone());
+                let response =
+                    transcript::row(ui, &app.palette, segment, pt, conversation, &mut selection);
+                if let Some(asked) = transcript::line_menu(&response, segment, &selection) {
+                    action = Some(asked);
                 }
             }
         });
-    if let Some(segment) = add_word {
-        let conversation = app.live_conversation;
-        app.open_word_editor(&segment, conversation);
+    app.selection = selection;
+    if let Some(action) = action {
+        app.apply_line_action(action);
     }
 }
 

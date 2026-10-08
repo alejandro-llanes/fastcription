@@ -145,13 +145,14 @@ impl App {
         self.handle_shortcuts(&ctx);
         self.sync_title(&ctx);
 
+        super::words::meaning_card(self, &ctx);
+
         if self.compact {
             self.compact_frame(ui);
             return;
         }
 
         self.delete_confirmation(&ctx);
-        super::words::editor_window(self, &ctx);
 
         egui::Panel::top("top-bar")
             .frame(crate::ui::bar(&self.palette, true))
@@ -246,19 +247,34 @@ impl App {
         // No focus check: Wayland only delivers a key to the focused surface,
         // so a key event already proves focus, and the extra condition only
         // ever lost an Escape.
-        // Not while the add-a-word window is up: that window takes Escape
-        // for itself, and leaving compact mode underneath it would be two
-        // things happening for one key.
-        if self.compact && self.words.editor.is_none() && ctx.input(|i| i.key_pressed(Key::Escape))
-        {
+        // Not while the meaning card is up: the card takes Escape for itself,
+        // and leaving compact mode underneath it would be two things
+        // happening for one key.
+        if self.compact && self.words.card.is_none() && ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.set_compact(ctx, false);
         }
 
-        // The newest line, straight into the registry: during a meeting nobody
-        // has a hand free for a right-click, and the expression that was just
-        // said is the one that was not understood.
+        // Whatever is selected in the transcript, looked up: the vocabulary
+        // first, the meaning server for anything new. During a meeting nobody
+        // has a hand free for a menu.
         if shortcut(Modifiers::CTRL, Key::D) {
-            self.open_word_editor_for_latest();
+            self.look_up_current_selection();
+        }
+        // A pasted list, from the Words view.
+        if shortcut(Modifiers::CTRL, Key::I) {
+            self.main_view = MainView::Words;
+            if self.words.import.is_none() {
+                self.words.import = Some(String::new());
+                self.words.import_fresh = true;
+            }
+        }
+        // Ctrl+C with a selection copies it. egui turns the keys into a Copy
+        // event before anything here sees them, and since the transcript owns
+        // its selection now, nothing else would answer.
+        if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy))) {
+            if let Some(selection) = &self.selection {
+                ctx.copy_text(selection.text.clone());
+            }
         }
 
         // Settings was reachable only by its button in the top bar, which is
@@ -498,6 +514,10 @@ impl App {
     fn compact_frame(&mut self, ui: &mut egui::Ui) {
         let size = transcript::clamp_pt(self.settings.transcript_pt);
         let mut leave = false;
+        // Taken out while the closure below borrows `self`, put back after.
+        let mut selection = self.selection.take();
+        let mut action: Option<super::transcript::LineAction> = None;
+        let conversation = self.live_conversation;
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
@@ -625,15 +645,15 @@ impl App {
                 let painter = ui.painter_at(area);
                 let spacing = ui.spacing().item_spacing.y;
 
-                let mut lines: Vec<(&str, bool)> = Vec::new();
+                let mut lines: Vec<(&fc_core::Segment, bool)> = Vec::new();
                 let mut pending: Vec<&fc_core::Segment> = self.provisional.values().collect();
                 pending.sort_by_key(|segment| segment.seq);
                 // Newest first: this paints upward from the bottom edge.
                 for segment in pending.iter().rev() {
-                    lines.push((segment.text.as_str(), true));
+                    lines.push((segment, true));
                 }
                 for segment in self.segments.iter().rev() {
-                    lines.push((segment.text.as_str(), false));
+                    lines.push((segment, false));
                 }
 
                 if lines.is_empty() {
@@ -642,8 +662,9 @@ impl App {
                     painter.galley(area.left_top(), galley, self.palette.secondary);
                 } else {
                     let mut baseline = area.bottom();
-                    for (index, (text, unsettled)) in lines.iter().enumerate() {
-                        let galley = self.caption_galley(ui, text, *unsettled, size, area.width());
+                    for (index, (segment, unsettled)) in lines.iter().enumerate() {
+                        let galley =
+                            self.caption_galley(ui, &segment.text, *unsettled, size, area.width());
                         let top = baseline - galley.size().y;
                         // A line cut horizontally through its glyphs reads as
                         // broken rather than as scrolled, so a line that does
@@ -664,11 +685,43 @@ impl App {
                         } else {
                             top
                         };
-                        painter.galley(
+                        // Selectable, like the full window's rows: the strip is
+                        // where the reader is during the meeting, and the
+                        // meeting is where the jargon is.
+                        let rect = egui::Rect::from_min_size(
                             egui::Pos2::new(area.left(), top),
-                            galley,
-                            self.palette.text,
+                            galley.size(),
                         );
+                        let owner = super::transcript::row_id(segment);
+                        let source = super::select::Source {
+                            text: &segment.text,
+                            text_start: 0,
+                            conversation,
+                            start_ms: Some(segment.start_ms),
+                        };
+                        let response = super::select::interact(
+                            ui,
+                            owner,
+                            rect,
+                            &galley,
+                            &mut selection,
+                            &source,
+                        );
+                        if let Some(current) = selection.as_ref().filter(|s| s.owner == owner) {
+                            super::select::paint_highlight(
+                                ui,
+                                rect,
+                                &galley,
+                                current.range,
+                                self.palette.accent.gamma_multiply(0.35),
+                            );
+                        }
+                        painter.galley(rect.min, galley, self.palette.text);
+                        if let Some(asked) =
+                            super::transcript::line_menu(&response, segment, &selection)
+                        {
+                            action = Some(asked);
+                        }
                         baseline = top - spacing;
                         if baseline <= area.top() {
                             break;
@@ -676,6 +729,10 @@ impl App {
                     }
                 }
             });
+        self.selection = selection;
+        if let Some(action) = action {
+            self.apply_line_action(action);
+        }
         if leave {
             let ctx = ui.ctx().clone();
             self.set_compact(&ctx, false);

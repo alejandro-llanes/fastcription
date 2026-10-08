@@ -123,3 +123,19 @@ fn row_to_word(row: &rusqlite::Row) -> rusqlite::Result<Word> {
         created_at: row.get(8)?,
     })
 }
+
+impl Store {
+    /// The entry for an expression, under any capitalisation, if there is one.
+    ///
+    /// What a lookup asks before it asks the server: a word already in the
+    /// vocabulary is a word already paid for, and the answer the reader may
+    /// have corrected is better than a fresh one.
+    pub fn find_word(&self, expression: &str) -> Result<Option<Word>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, expression, context, conversation_id, start_ms, meaning, translation, \
+             example, created_at FROM words WHERE expression = ?1 COLLATE NOCASE",
+        )?;
+        let mut rows = stmt.query_map(params![expression.trim()], row_to_word)?;
+        Ok(rows.next().transpose()?)
+    }
+}

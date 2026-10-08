@@ -11,10 +11,10 @@
 use std::ops::RangeInclusive;
 
 use egui::text::{LayoutJob, TextFormat};
-use egui::{Label, Response, Sense, Stroke};
+use egui::{Response, Sense, Stroke};
 use fc_core::{Conversation, Segment, Track};
 
-use crate::i18n::t;
+use crate::i18n::{t, tf};
 use crate::theme::Palette;
 
 /// How large the transcript may be drawn, in points.
@@ -56,17 +56,44 @@ const PULSE_SECS: f32 = 0.8;
 
 /// Draws one segment and returns the label's response, so the caller can hang
 /// a context menu or a `scroll_to_me` off it.
-pub fn row(ui: &mut egui::Ui, palette: &Palette, segment: &Segment, pt: f32) -> Response {
+pub fn row(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    segment: &Segment,
+    pt: f32,
+    conversation: Option<fc_core::ConversationId>,
+    selection: &mut Option<super::select::Selection>,
+) -> Response {
     let pt = clamp_pt(pt);
     let (gutter, label) = ui
         .horizontal(|ui| {
             let (gutter, _) = ui.allocate_exact_size(egui::vec2(GUTTER, pt), Sense::hover());
-            let label = ui.add(
-                Label::new(job(palette, segment, pt))
-                    .selectable(true)
-                    .wrap(),
-            );
-            (gutter, label)
+            // Laid out and painted by hand rather than through `Label`, so the
+            // words can be selected and the selection read back — see
+            // `select.rs` for why egui's own cannot be.
+            let mut job = job(palette, segment, pt);
+            job.wrap.max_width = ui.available_width();
+            let galley = ui.painter().layout_job(job);
+            let (rect, _) = ui.allocate_exact_size(galley.size(), Sense::hover());
+            let owner = row_id(segment);
+            let source = super::select::Source {
+                text: &segment.text,
+                text_start: prefix_chars(segment),
+                conversation,
+                start_ms: Some(segment.start_ms),
+            };
+            let response = super::select::interact(ui, owner, rect, &galley, selection, &source);
+            if let Some(current) = selection.as_ref().filter(|s| s.owner == owner) {
+                super::select::paint_highlight(
+                    ui,
+                    rect,
+                    &galley,
+                    current.range,
+                    palette.accent.gamma_multiply(0.35),
+                );
+            }
+            ui.painter().galley(rect.min, galley, palette.text);
+            (gutter, response)
         })
         .inner;
 
@@ -216,12 +243,44 @@ const COPY_OPTIONS: fc_export::ExportOptions = fc_export::ExportOptions {
 ///
 /// Hung off the row's own response, which is why [`row`] returns it: a reader
 /// following a meeting wants the sentence they just read, not the transcript.
-pub fn line_menu(response: &Response, segment: &Segment) -> Option<LineAction> {
+pub fn line_menu(
+    response: &Response,
+    segment: &Segment,
+    selection: &Option<super::select::Selection>,
+) -> Option<LineAction> {
     let mut action = None;
+    let selected = selection
+        .as_ref()
+        .filter(|s| s.owner == row_id(segment))
+        .cloned();
     response.context_menu(|ui| {
-        if ui.button(t("Add to my words\u{2026}")).clicked() {
-            action = Some(LineAction::AddWord);
-            ui.close();
+        match &selected {
+            Some(sel) => {
+                let shown = elide_words(&sel.text, 40);
+                if ui
+                    .button(tf("Look up \u{201c}{}\u{201d}", &[&shown]))
+                    .clicked()
+                {
+                    action = Some(LineAction::LookUp(sel.clone()));
+                    ui.close();
+                }
+                if ui
+                    .button(tf("Add \u{201c}{}\u{201d} to my words", &[&shown]))
+                    .clicked()
+                {
+                    action = Some(LineAction::Add(sel.clone()));
+                    ui.close();
+                }
+                ui.separator();
+            }
+            None => {
+                ui.label(
+                    egui::RichText::new(t("Select words to look them up"))
+                        .small()
+                        .weak(),
+                );
+                ui.separator();
+            }
         }
         if ui.button(t("Copy line")).clicked() {
             ui.ctx().copy_text(line_text(segment));
@@ -234,9 +293,38 @@ pub fn line_menu(response: &Response, segment: &Segment) -> Option<LineAction> {
 /// What a line's menu asked for. Returned rather than done, because the
 /// menu is drawn inside a loop that borrows the app's segments and the
 /// registry needs the app mutably.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum LineAction {
-    AddWord,
+    /// Look the selection up: the vocabulary first, then the server.
+    LookUp(super::select::Selection),
+    /// Add it without asking anything.
+    Add(super::select::Selection),
+}
+
+/// A stable identity for a row across frames, so a selection made in it
+/// survives a repaint. A segment is unique by track and sequence number.
+pub fn row_id(segment: &Segment) -> egui::Id {
+    egui::Id::new((
+        "transcript-row",
+        matches!(segment.track, Track::Microphone),
+        segment.seq,
+    ))
+}
+
+/// How many characters of a row's galley come before the segment's own text:
+/// the speaker label and the timestamp, which `job` puts in front of it.
+pub fn prefix_chars(segment: &Segment) -> usize {
+    segment.speaker_label().chars().count()
+        + format!("  {}  ", stamp(segment.start_ms)).chars().count()
+}
+
+/// A selection shortened for a menu item, which has to stay one line.
+fn elide_words(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().take(max - 1).collect();
+    format!("{}\u{2026}", kept.trim_end())
 }
 
 /// The Copy and Copy as Markdown buttons a pane header carries.
@@ -475,11 +563,18 @@ mod tests {
         let mut output = ctx.run_ui(Default::default(), |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
                 for pt in [*PT_RANGE.start(), DEFAULT_PT, *PT_RANGE.end(), f32::NAN] {
-                    let settled = row(ui, &palette, &segment(0, "Hello.", Track::Selected), pt);
+                    let settled = row(
+                        ui,
+                        &palette,
+                        &segment(0, "Hello.", Track::Selected),
+                        pt,
+                        None,
+                        &mut None,
+                    );
                     assert!(settled.rect.height() > 0.0, "nothing laid out at {pt}");
                     // The provisional row paints a pulse and the microphone row
                     // a bar, both off the label's own rect.
-                    let live = row(ui, &palette, &pending, pt);
+                    let live = row(ui, &palette, &pending, pt, None, &mut None);
                     assert!(live.rect.height() > 0.0);
                 }
             });

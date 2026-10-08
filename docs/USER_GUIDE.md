@@ -620,21 +620,32 @@ is where they go — with the line they were said in, so the meaning can be
 looked up *in context*. "Table this" means nothing until you know it was said
 about a decision.
 
-**Adding one.** Right-click any line of a transcript, live or in the library,
-and choose **Add to my words…**; or press `Ctrl+D` for the newest settled
-line, which during a meeting is the one you just did not understand. A small
-window shows the line as word chips: tap the words of the expression, in any
-order, and they are joined in the order they were said with the clinging
-punctuation dropped ("ocean," is the word "ocean"). Or type it. The expression
-field has focus when the window opens, so the whole thing is `Ctrl+D`, type,
-`Enter` — nothing to click, and you are back to reading.
+**Selecting the words.** Straight from the transcript — live, in the library,
+or in the caption strip of compact mode. Drag across an expression, or
+double-click a single word; the speaker and the timestamp in front of a line
+are not selectable, only the words. Punctuation that clings to a spoken word
+is left out ("ocean," selects "ocean"). Nothing to type: someone says a piece
+of jargon, you select it, and you are done.
 
-**Add and look up** sends the expression and its line to the meaning server
-and fills in three things when it answers, usually in under half a second: a
-short **English meaning as used in that line**, the expression in **your
-language**, and one **example sentence**. **Add** stores it without asking;
-the registry shows "Not looked up yet" and a **Look up** button, and a **Look
-up N missing** button at the top catches up on all of them after a meeting.
+**Looking it up.** `Ctrl+D`, or right-click the selection and choose **Look
+up “…”**. The lookup checks your vocabulary first; a word already there is
+shown at once, with the meaning you may have corrected. Anything new goes to
+the meaning server with the line it was said in, is added to your words, and
+comes back — usually in under half a second — as three things: a short
+**English meaning as used in that line**, the expression in **your
+language**, and one **example sentence**. The answer appears on a card beside
+the transcript (small enough for the strip in compact mode) and stays until
+you close it, press `Esc`, or look something else up.
+
+**Add “…” to my words**, in the same menu, stores the selection without
+asking the server; the registry shows "Not looked up yet" and a **Look up**
+button, and **Look up N missing** at the top catches up on all of them after
+a meeting. `Ctrl+C` copies a selection.
+
+**Importing a list.** **Import** in the Words view, or `Ctrl+I` from anywhere,
+opens a box to paste into: one word or expression per line; bullets, trailing
+commas and blank lines are ignored, and repeats are folded. **Add and look up
+N** (or `Ctrl+Enter`) adds them all and asks the server about each.
 
 **The registry** is the **Words** view in the top bar. Newest first; each
 entry shows the expression and its translation on one line, the English
@@ -801,7 +812,9 @@ your captions.
 | `Ctrl+.` | Stop |
 | `Ctrl+M` | Enter or leave compact mode |
 | `Ctrl+,` | Open Settings, or go back to the transcript |
-| `Ctrl+D` | Add a word or expression from the newest transcript line |
+| `Ctrl+D` | Look up the words selected in the transcript |
+| `Ctrl+I` | Open the Words view with the import box |
+| `Ctrl+C` | Copy the words selected in the transcript |
 | `Esc` | Leave compact mode |
 | `Ctrl+=` or `Ctrl++` | Transcript text two points larger |
 | `Ctrl+-` | Transcript text two points smaller |

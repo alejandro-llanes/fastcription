@@ -69,9 +69,9 @@ fn url(endpoint: &str, path: &str) -> String {
 /// that. It is also the thing they are trying to learn.
 pub fn system_prompt(language: &str) -> String {
     format!(
-        "You help a {language} speaker understand spoken English. Given a transcript line \
-         and an expression selected from it, reply with a JSON object with exactly these \
-         keys: \"meaning\" (a short English meaning of the expression as used in this \
+        "You help a {language} speaker understand spoken English. Given an expression, \
+         and usually the transcript line it was said in, reply with a JSON object with \
+         exactly these keys: \"meaning\" (a short English meaning of the expression as used in this \
          line), \"translation\" (a natural {language} translation of the expression, not \
          word by word), \"example\" (one short English example sentence using it). \
          Be concise. Output JSON only."
@@ -79,7 +79,13 @@ pub fn system_prompt(language: &str) -> String {
 }
 
 pub fn user_prompt(expression: &str, context: &str) -> String {
-    format!("Line: \"{context}\"\nExpression: \"{expression}\"")
+    // An imported word has no line. Sending an empty one would invite the
+    // model to explain the word in the light of nothing in particular.
+    if context.trim().is_empty() {
+        format!("Expression: \"{expression}\"")
+    } else {
+        format!("Line: \"{context}\"\nExpression: \"{expression}\"")
+    }
 }
 
 /// The request body for one lookup.
@@ -284,6 +290,12 @@ mod tests {
         assert!(text.contains("spanish"));
         assert!(text.contains("table this"));
         assert!(text.contains("let's table this for now."));
+    }
+
+    #[test]
+    fn an_imported_word_is_asked_about_without_a_line() {
+        assert!(!user_prompt("sandbag", "").contains("Line:"));
+        assert!(user_prompt("sandbag", "Let's not sandbag the estimate.").contains("Line:"));
     }
 
     #[test]
