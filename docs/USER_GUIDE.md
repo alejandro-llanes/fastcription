@@ -285,8 +285,8 @@ Compact mode shrinks the window to a caption strip 760 × 170 points, drops its
 decorations and asks the compositor to keep it on top, so it can sit over a
 fullscreened meeting window.
 
-**To enter it:** the **Compact** button in the top bar, or `Ctrl+Shift+C`.
-**To leave it:** the strip's own **Restore** button, `Esc`, or `Ctrl+Shift+C`
+**To enter it:** the **Compact** button in the top bar, or `Ctrl+M`.
+**To leave it:** the strip's own **Restore** button, `Esc`, or `Ctrl+M`
 again. The window goes back to the size it had.
 
 The strip shows the last four settled lines, then the line being spoken in
@@ -673,7 +673,7 @@ your captions.
 | `Ctrl+R` | Start a conversation, or resume a paused one |
 | `Ctrl+Space` | Pause while recording, resume while paused |
 | `Ctrl+.` | Stop |
-| `Ctrl+Shift+C` | Enter or leave compact mode |
+| `Ctrl+M` | Enter or leave compact mode |
 | `Esc` | Leave compact mode |
 | `Ctrl+=` or `Ctrl++` | Transcript text two points larger |
 | `Ctrl+-` | Transcript text two points smaller |

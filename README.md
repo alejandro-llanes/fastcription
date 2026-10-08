@@ -61,7 +61,7 @@ winit cannot ask the compositor to keep a window above others.
 | `Ctrl+R` | Start, or resume a paused conversation |
 | `Ctrl+Space` | Pause / resume |
 | `Ctrl+.` | Stop |
-| `Ctrl+Shift+C` | Compact mode on or off (`Esc` comes back) |
+| `Ctrl+M` | Compact mode on or off (`Esc` comes back) |
 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | Transcript text larger, smaller, back to 22 pt |
 
 None of them fire while a text field has the keyboard.

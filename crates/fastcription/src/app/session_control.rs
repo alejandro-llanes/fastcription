@@ -381,7 +381,8 @@ impl App {
             // must not be refused on a machine with exactly one source. The
             // default is the choice a meeting needs, not the first thing the
             // sound server happened to list.
-            self.selected_source = super::chrome::default_selection(&self.sources);
+            self.selected_source =
+                super::chrome::default_selection(&self.sources, startup.default_monitor.as_deref());
         }
     }
 

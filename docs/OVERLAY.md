@@ -3,7 +3,7 @@
 ARCHITECTURE.md decision D3 asks for captions that stay visible over a
 fullscreened meeting window. fastcription provides them as **compact mode**: the
 main window shrinks to a caption strip, drops its decorations, asks to be
-always on top, and renames itself to `fastcription — captions`. `Ctrl+Shift+C`
+always on top, and renames itself to `fastcription — captions`. `Ctrl+M`
 toggles it, the top bar has a **Compact** button, and `Esc` or the strip's own
 **Restore** button bring the full window back.
 

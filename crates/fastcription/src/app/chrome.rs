@@ -139,6 +139,24 @@ impl App {
     /// also keeps focus in the call, and then nothing here sees the key at all
     /// — hence the restore button compact mode draws for itself.
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // Trace-level only: what a key press looked like by the time it reached
+        // egui is the one thing a shortcut that "does nothing" needs recorded,
+        // and it is far too chatty for any other level.
+        if tracing::enabled!(tracing::Level::TRACE) {
+            ctx.input(|i| {
+                for event in &i.events {
+                    if let egui::Event::Key {
+                        key,
+                        pressed,
+                        modifiers,
+                        ..
+                    } = event
+                    {
+                        tracing::trace!(?key, pressed, ?modifiers, "key event");
+                    }
+                }
+            });
+        }
         if ctx.text_edit_focused() {
             return;
         }
@@ -146,12 +164,18 @@ impl App {
         let shortcut = |modifiers: Modifiers, key: Key| {
             ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(modifiers, key)))
         };
-        let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
 
-        if shortcut(ctrl_shift, Key::C) {
+        // Not Ctrl+M: on Linux egui's winit layer turns the press of
+        // any Ctrl+C combination into a Copy event and delivers only the
+        // release as a key, so that shortcut could never match. Verified by
+        // tracing the events the window received.
+        if shortcut(Modifiers::CTRL, Key::M) {
             self.set_compact(ctx, !self.compact);
         }
-        if self.compact && ctx.input(|i| i.focused) && ctx.input(|i| i.key_pressed(Key::Escape)) {
+        // No focus check: Wayland only delivers a key to the focused surface,
+        // so a key event already proves focus, and the extra condition only
+        // ever lost an Escape.
+        if self.compact && ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.set_compact(ctx, false);
         }
 
@@ -373,9 +397,7 @@ impl App {
                 }
                 if ui
                     .selectable_label(self.compact, t("Compact"))
-                    .on_hover_text(t(
-                        "Captions only, always on top (Ctrl+Shift+C). Esc comes back.",
-                    ))
+                    .on_hover_text(t("Captions only, always on top (Ctrl+M). Esc comes back."))
                     .clicked()
                 {
                     let ctx = ui.ctx().clone();
@@ -882,14 +904,22 @@ pub(super) fn transport_for(key: TransportKey, state: SessionState) -> Option<Tr
 
 /// What to select when nothing was remembered.
 ///
-/// A sink monitor — what the system is playing — is the source a meeting
-/// needs; a capture device would transcribe the user's own room. Falls back
-/// to the first entry so a machine with a single source of any kind is ready
-/// to start, and to nothing at all when there is nothing to record.
-pub(super) fn default_selection(sources: &[AudioSource]) -> Option<usize> {
-    sources
-        .iter()
-        .position(|source| source.kind == fc_core::SourceKind::SinkMonitor)
+/// The monitor of the default sink is what the user is actually hearing, so it
+/// is the source a meeting needs; any sink monitor is the next best, and a
+/// capture device would transcribe the user's own room. Falls back to the
+/// first entry so a machine with a single source of any kind is ready to
+/// start, and to nothing at all when there is nothing to record.
+pub(super) fn default_selection(
+    sources: &[AudioSource],
+    default_monitor: Option<&str>,
+) -> Option<usize> {
+    default_monitor
+        .and_then(|name| sources.iter().position(|source| source.name == name))
+        .or_else(|| {
+            sources
+                .iter()
+                .position(|source| source.kind == fc_core::SourceKind::SinkMonitor)
+        })
         .or_else(|| (!sources.is_empty()).then_some(0))
 }
 
@@ -982,9 +1012,23 @@ mod tests {
     fn a_fresh_start_prefers_a_monitor_then_anything_then_nothing() {
         let mic = AudioSource::named(SourceKind::Device, "mic", "USB Microphone");
         let mon = monitor("speakers.monitor");
-        assert_eq!(default_selection(&[mic.clone(), mon.clone()]), Some(1));
-        assert_eq!(default_selection(std::slice::from_ref(&mic)), Some(0));
-        assert_eq!(default_selection(&[]), None);
+        assert_eq!(
+            default_selection(&[mic.clone(), mon.clone()], None),
+            Some(1)
+        );
+        assert_eq!(default_selection(std::slice::from_ref(&mic), None), Some(0));
+        assert_eq!(default_selection(&[], None), None);
+        // The default sink's monitor wins over an earlier monitor in the list.
+        let hdmi = monitor("hdmi.monitor");
+        assert_eq!(
+            default_selection(&[hdmi, mon.clone()], Some("speakers.monitor")),
+            Some(1)
+        );
+        // A default that is not in the list falls back to the first monitor.
+        assert_eq!(
+            default_selection(&[mic, mon], Some("ghost.monitor")),
+            Some(1)
+        );
     }
 
     #[test]

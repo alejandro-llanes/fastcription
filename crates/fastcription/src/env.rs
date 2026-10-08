@@ -430,6 +430,10 @@ pub struct Startup {
     pub sources: Probe<Vec<AudioSource>>,
     pub engine: EngineInfo,
     pub catalog: Catalog,
+    /// Name of the default sink's monitor, so the first selection is what the
+    /// system is actually playing. `None` when the sound server has no default
+    /// sink or no monitor for it.
+    pub default_monitor: Option<String>,
 }
 
 /// Runs the startup probes on a thread and wakes the window when they land.
@@ -443,6 +447,7 @@ pub fn probe_startup(
         .name("fc-startup-probe".into())
         .spawn(move || {
             let startup = Startup {
+                default_monitor: fc_audio::default_source().ok().flatten().map(|s| s.name),
                 sources: list_sources(),
                 engine: probe_engine(voxtype.as_ref()),
                 catalog: probe_catalog(),
