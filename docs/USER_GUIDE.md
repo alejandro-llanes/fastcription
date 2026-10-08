@@ -591,8 +591,10 @@ the model on this machine. The usual reason is hardware: a desktop with a GPU
 can serve a laptop that has none, and because the model stays resident there,
 no pass pays to load it. Set it up under **Settings → Transcription server**.
 
-[SERVER.md](SERVER.md) has the protocol, two server options, which model to
-pick, and what it costs in bandwidth and privacy.
+[SERVER.md](SERVER.md) walks the whole setup: installing CUDA, building
+whisper.cpp for your card, which model to download and from where, running the
+server, reaching it over Tailscale or through the firewall, every field in this
+pane, and what to look at when something is wrong.
 
 Two things to know here:
 
