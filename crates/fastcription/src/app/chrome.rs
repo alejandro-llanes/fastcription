@@ -880,6 +880,19 @@ pub(super) fn transport_for(key: TransportKey, state: SessionState) -> Option<Tr
     }
 }
 
+/// What to select when nothing was remembered.
+///
+/// A sink monitor — what the system is playing — is the source a meeting
+/// needs; a capture device would transcribe the user's own room. Falls back
+/// to the first entry so a machine with a single source of any kind is ready
+/// to start, and to nothing at all when there is nothing to record.
+pub(super) fn default_selection(sources: &[AudioSource]) -> Option<usize> {
+    sources
+        .iter()
+        .position(|source| source.kind == fc_core::SourceKind::SinkMonitor)
+        .or_else(|| (!sources.is_empty()).then_some(0))
+}
+
 /// Finds the user's previously chosen source in a freshly enumerated list.
 ///
 /// Matched on identity rather than position: a source that disappears shifts
@@ -898,7 +911,7 @@ pub(super) fn reselect(previous: Option<&AudioSource>, sources: &[AudioSource]) 
 
 #[cfg(test)]
 mod tests {
-    use super::{reselect, transport_for, Transport, TransportKey};
+    use super::{default_selection, reselect, transport_for, Transport, TransportKey};
     use fc_core::{AudioSource, SessionState, SourceKind};
 
     /// One key starts and resumes, because a reader who paused to answer the
@@ -963,6 +976,15 @@ mod tests {
 
     fn monitor(name: &str) -> AudioSource {
         AudioSource::named(SourceKind::SinkMonitor, name, name)
+    }
+
+    #[test]
+    fn a_fresh_start_prefers_a_monitor_then_anything_then_nothing() {
+        let mic = AudioSource::named(SourceKind::Device, "mic", "USB Microphone");
+        let mon = monitor("speakers.monitor");
+        assert_eq!(default_selection(&[mic.clone(), mon.clone()]), Some(1));
+        assert_eq!(default_selection(std::slice::from_ref(&mic)), Some(0));
+        assert_eq!(default_selection(&[]), None);
     }
 
     #[test]
