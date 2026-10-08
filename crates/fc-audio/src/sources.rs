@@ -317,6 +317,10 @@ mod tests {
     #[test]
     fn real_machine_sink_input_from_paplay() {
         // Captured while `paplay` was actively streaming into `auto_null`.
+        // The capturing machine's user name, host name and machine id were
+        // replaced with placeholders: a systemd machine id is a stable
+        // per-installation identifier and does not belong in a public
+        // repository. Nothing asserted here reads them.
         let inputs = parse_sink_inputs(fixture("sink_inputs_real_paplay.json"));
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].kind, SourceKind::SinkInput);
