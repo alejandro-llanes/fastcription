@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use fc_core::{Conversation, ConversationId, TagId};
 use fc_store::StoreError;
 
-use crate::app::{App, LabelEdit, MainView, NoticeKind, SEARCH_LIMIT};
-use crate::i18n::t;
+use crate::app::{App, LabelEdit, MainView, NoticeKind, PendingDelete, SEARCH_LIMIT};
+use crate::i18n::{t, tf};
 use crate::session::lock;
 
 /// How long the search box waits after the last keystroke.
@@ -54,7 +54,7 @@ impl App {
             drop(guard);
             self.notify(
                 NoticeKind::Error,
-                format!("Could not rename the conversation: {err}"),
+                tf("Could not rename the conversation: {}", &[&err.to_string()]),
             );
             return;
         }
@@ -62,7 +62,7 @@ impl App {
             drop(guard);
             self.notify(
                 NoticeKind::Error,
-                format!("Could not change the group: {err}"),
+                tf("Could not change the group: {}", &[&err.to_string()]),
             );
         }
     }
@@ -89,7 +89,7 @@ impl App {
         if let Some(message) = failure {
             self.notify(
                 NoticeKind::Error,
-                format!("Could not update tags: {message}"),
+                tf("Could not update tags: {}", &[&message]),
             );
         }
     }
@@ -105,7 +105,7 @@ impl App {
             Ok(_) => self.reload_library(),
             Err(err) => self.notify(
                 NoticeKind::Error,
-                format!("Could not create the group: {err}"),
+                tf("Could not create the group: {}", &[&err.to_string()]),
             ),
         }
     }
@@ -121,7 +121,7 @@ impl App {
             Ok(_) => self.reload_library(),
             Err(err) => self.notify(
                 NoticeKind::Error,
-                format!("Could not create the tag: {err}"),
+                tf("Could not create the tag: {}", &[&err.to_string()]),
             ),
         }
     }
@@ -168,7 +168,7 @@ impl App {
             }
             Err(err) => self.notify(
                 NoticeKind::Error,
-                format!("Could not apply that change: {err}"),
+                tf("Could not apply that change: {}", &[&err.to_string()]),
             ),
         }
     }
@@ -197,13 +197,19 @@ impl App {
             ),
             Err(err) => self.notify(
                 NoticeKind::Error,
-                format!("Could not delete the conversation: {err}"),
+                tf("Could not delete the conversation: {}", &[&err.to_string()]),
             ),
         }
     }
 
-    pub(super) fn ask_to_delete(&mut self, id: ConversationId) {
-        self.pending_delete = Some(id);
+    /// Routes every destructive action through the same confirmation.
+    ///
+    /// Groups and tags used to be deleted the instant the context-menu entry
+    /// was clicked, which meant the two actions sitting one pixel below
+    /// "Rename" were the two that could not be taken back — a deleted tag is
+    /// gone from every conversation it was on.
+    pub(super) fn ask_to_delete(&mut self, what: PendingDelete) {
+        self.pending_delete = Some(what);
     }
 
     /// True while this conversation is the one being recorded, which is the
@@ -212,32 +218,24 @@ impl App {
         self.recording == Some(id)
     }
 
-    /// The confirmation for the one irreversible action in the app. Shown as a
-    /// modal window rather than an inline button so a mis-click on a list that
-    /// has just reordered cannot destroy a transcript.
+    /// The confirmation every irreversible action goes through. A modal window
+    /// rather than an inline button, so a mis-click on a list that has just
+    /// reordered cannot destroy a transcript.
     pub(super) fn delete_confirmation(&mut self, ctx: &egui::Context) {
-        let Some(id) = self.pending_delete else {
+        let Some(what) = self.pending_delete else {
             return;
         };
-        let title = self
-            .conversations
-            .iter()
-            .find(|c| c.id == id)
-            .map(|c| c.title.clone())
-            .unwrap_or_else(|| id.to_string());
+        let (window, question, consequence) = self.delete_wording(what);
 
         let mut decision = None;
-        egui::Window::new(t("Delete conversation"))
+        egui::Window::new(window)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label(format!(
-                    "{} \u{201c}{title}\u{201d}?",
-                    t("Permanently delete")
-                ));
+                ui.label(question);
                 ui.label(
-                    egui::RichText::new(t("The transcript cannot be recovered."))
+                    egui::RichText::new(consequence)
                         .small()
                         .color(self.palette.secondary),
                 );
@@ -255,10 +253,64 @@ impl App {
         match decision {
             Some(true) => {
                 self.pending_delete = None;
-                self.delete_conversation(id);
+                match what {
+                    PendingDelete::Conversation(id) => self.delete_conversation(id),
+                    PendingDelete::Group(id) => self.edit_label(LabelEdit::DeleteGroup(id)),
+                    PendingDelete::Tag(id) => self.edit_label(LabelEdit::DeleteTag(id)),
+                }
             }
             Some(false) => self.pending_delete = None,
             None => {}
+        }
+    }
+
+    /// The window title, the question and what the answer costs.
+    ///
+    /// Each one names the thing by the name the user gave it, and says what
+    /// survives: deleting a group keeps its conversations (the column is
+    /// `ON DELETE SET NULL`), and deleting a conversation does not.
+    fn delete_wording(&self, what: PendingDelete) -> (&'static str, String, &'static str) {
+        let quoted = |name: String| format!("\u{201c}{name}\u{201d}");
+        match what {
+            PendingDelete::Conversation(id) => {
+                let name = self
+                    .conversations
+                    .iter()
+                    .find(|c| c.id == id)
+                    .map(|c| c.title.clone())
+                    .unwrap_or_else(|| id.to_string());
+                (
+                    t("Delete conversation"),
+                    format!("{} {}?", t("Permanently delete"), quoted(name)),
+                    t("The transcript cannot be recovered."),
+                )
+            }
+            PendingDelete::Group(id) => {
+                let name = self
+                    .groups
+                    .iter()
+                    .find(|g| g.id == id)
+                    .map(|g| g.name.clone())
+                    .unwrap_or_else(|| id.to_string());
+                (
+                    t("Delete group"),
+                    format!("{} {}?", t("Delete the group"), quoted(name)),
+                    t("Its conversations are kept, and become ungrouped."),
+                )
+            }
+            PendingDelete::Tag(id) => {
+                let name = self
+                    .tags
+                    .iter()
+                    .find(|tag| tag.id == id)
+                    .map(|tag| tag.name.clone())
+                    .unwrap_or_else(|| id.to_string());
+                (
+                    t("Delete tag"),
+                    format!("{} {}?", t("Delete the tag"), quoted(name)),
+                    t("Its conversations are kept, and lose the tag."),
+                )
+            }
         }
     }
 
@@ -305,7 +357,7 @@ impl App {
             Ok(_) => self.import = Some(Running { result, added }),
             Err(err) => self.notify(
                 NoticeKind::Error,
-                format!("Could not start the import: {err}"),
+                tf("Could not start the import: {}", &[&err.to_string()]),
             ),
         }
     }
@@ -323,17 +375,19 @@ impl App {
             Ok(Ok(outcome)) => {
                 self.import = None;
                 self.reload_library();
-                let mut message = format!(
+                let mut message = tf(
                     "Imported {} meeting(s), skipped {}.",
-                    outcome.added, outcome.skipped
+                    &[&outcome.added.to_string(), &outcome.skipped.to_string()],
                 );
                 let kind = if outcome.failed.is_empty() {
                     NoticeKind::Info
                 } else {
-                    message.push_str(&format!(
+                    message.push_str(&tf(
                         " {} could not be imported: {}",
-                        outcome.failed.len(),
-                        outcome.failed.join("; ")
+                        &[
+                            &outcome.failed.len().to_string(),
+                            &outcome.failed.join("; "),
+                        ],
                     ));
                     NoticeKind::Warning
                 };
@@ -371,6 +425,16 @@ impl App {
         if let Some(id) = self.recording {
             self.history_segments.remove(&id);
         }
+    }
+
+    /// Opens a conversation and asks the history view to scroll to the segment
+    /// a search excerpt came from.
+    ///
+    /// Scrolling happens in the view, which is the only place that knows where
+    /// each row ended up; this leaves the request behind for it to pick up.
+    pub(super) fn open_history_at(&mut self, id: ConversationId, start_ms: u64) {
+        self.open_history(id);
+        self.pending_scroll = Some((id, start_ms));
     }
 
     pub(super) fn open_history(&mut self, id: ConversationId) {
@@ -437,10 +501,16 @@ impl App {
                 let mut by_conversation = HashMap::new();
                 for hit in hits {
                     // The first hit in rank order is the best excerpt for that
-                    // conversation, so later ones do not overwrite it.
+                    // conversation, so later ones do not overwrite it. Its
+                    // offset is kept with it: an excerpt the user can click is
+                    // only useful if it can open the transcript where the words
+                    // actually are.
                     by_conversation
                         .entry(hit.conversation_id)
-                        .or_insert(hit.snippet);
+                        .or_insert(super::sidebar::Hit {
+                            snippet: hit.snippet,
+                            start_ms: hit.start_ms,
+                        });
                 }
                 // A hit can be in any conversation, but the sidebar only holds
                 // the most recent page: without this, searching a long-lived
@@ -456,7 +526,10 @@ impl App {
             Err(err) => {
                 self.sidebar.matches = Some(HashMap::new());
                 self.search_extra.clear();
-                self.notify(NoticeKind::Error, format!("Search failed: {err}"));
+                self.notify(
+                    NoticeKind::Error,
+                    tf("Search failed: {}", &[&err.to_string()]),
+                );
             }
         }
     }
@@ -524,7 +597,10 @@ impl App {
                 if let Err(err) = std::fs::create_dir_all(parent) {
                     self.notify(
                         NoticeKind::Error,
-                        format!("Could not create {}: {err}", parent.display()),
+                        tf(
+                            "Could not create {}: {}",
+                            &[&parent.display().to_string(), &err.to_string()],
+                        ),
                     );
                     return true;
                 }
@@ -542,11 +618,14 @@ impl App {
         match written {
             Ok(()) => self.notify(
                 NoticeKind::Info,
-                format!("Exported to {}", destination.display()),
+                tf("Exported to {}", &[&destination.display().to_string()]),
             ),
             Err(err) => self.notify(
                 NoticeKind::Error,
-                format!("Could not write {}: {err}", destination.display()),
+                tf(
+                    "Could not write {}: {}",
+                    &[&destination.display().to_string(), &err.to_string()],
+                ),
             ),
         };
         self.export.confirming = None;

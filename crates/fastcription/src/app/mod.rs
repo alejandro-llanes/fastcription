@@ -11,9 +11,11 @@ mod export_ui;
 mod history;
 mod library;
 mod live;
+mod readiness;
 mod session_control;
 mod settings;
 mod sidebar;
+mod transcript;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -60,6 +62,19 @@ pub enum ServiceStatus {
     Unknown,
     Running,
     Stopped,
+}
+
+/// What a confirmed deletion will delete.
+///
+/// One enum rather than three flags because all three go through the same
+/// modal: a group and a tag used to be deleted straight from a context menu
+/// while a conversation asked first, so the two destructive actions that are
+/// easiest to hit by accident were the two that did not confirm.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PendingDelete {
+    Conversation(ConversationId),
+    Group(GroupId),
+    Tag(TagId),
 }
 
 /// A rename or deletion of a group or a tag, applied by `App::edit_label`.
@@ -257,6 +272,11 @@ pub struct App {
     /// `stop_async` so the sidebar can mark it and the cached transcript can
     /// be invalidated when it closes.
     recording: Option<ConversationId>,
+    /// Which conversation the live view's segments belong to. Unlike
+    /// `recording` it survives the stop, because the transcript stays on screen
+    /// after a session ends and exporting or copying it needs the record it was
+    /// written to.
+    live_conversation: Option<ConversationId>,
     /// This session's voxtype config, removed when the session ends.
     session_config: Option<PathBuf>,
     /// The startup probes, still running on their own thread.
@@ -294,6 +314,10 @@ pub struct App {
     /// Captions only, on an always-on-top window: the mode for watching a
     /// meeting with the transcript over it.
     compact: bool,
+    /// The window title as the compositor currently has it, so the title is
+    /// only sent when it actually changes — `ViewportCommand::Title` every
+    /// frame is a Wayland round trip sixty times a second.
+    title_shown: String,
     /// The window size to go back to when compact mode is left.
     restore_size: Option<egui::Vec2>,
 
@@ -310,7 +334,10 @@ pub struct App {
     // Navigation and per-pane transient state
     main_view: MainView,
     /// Set while a deletion is awaiting confirmation.
-    pending_delete: Option<ConversationId>,
+    pending_delete: Option<PendingDelete>,
+    /// A conversation and the offset to scroll to, set by clicking a search
+    /// excerpt and consumed by the history view on the next frame it draws.
+    pending_scroll: Option<(ConversationId, u64)>,
     sidebar: sidebar::State,
     settings: settings::State,
     export: export_ui::State,
@@ -365,14 +392,7 @@ impl App {
             notices.push(NoticeKind::Error, problem);
         }
         if voxtype.is_none() {
-            notices.push(
-                NoticeKind::Error,
-                t(
-                    "voxtype was not found on PATH, so nothing can be transcribed. \
-                   Install it and run `voxtype setup --download` to fetch a model.",
-                )
-                .to_owned(),
-            );
+            notices.push(NoticeKind::Error, t(readiness::NO_VOXTYPE).to_owned());
         }
 
         let themes_dir = dirs::config_dir()
@@ -433,6 +453,7 @@ impl App {
             session: None,
             events: None,
             recording: None,
+            live_conversation: None,
             session_config: None,
             state: SessionState::Idle,
             session_start: None,
@@ -453,6 +474,7 @@ impl App {
             segments: Vec::new(),
             provisional: HashMap::new(),
             compact: false,
+            title_shown: String::new(),
             restore_size: None,
             conversations: library.value.conversations,
             search_extra: Vec::new(),
@@ -462,6 +484,7 @@ impl App {
             history_segments: HashMap::new(),
             main_view: MainView::Live,
             pending_delete: None,
+            pending_scroll: None,
             sidebar: sidebar::State::default(),
             settings,
             export: export_ui::State::default(),

@@ -6,7 +6,7 @@
 //! discovered when the first chunk fails, which during a meeting is the worst
 //! possible moment to find out.
 
-use crate::app::{App, ServiceStatus};
+use crate::app::{transcript, App, ServiceStatus};
 use crate::i18n::t;
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -39,9 +39,12 @@ pub struct State {
     #[serde(skip)]
     pub remote_api_key: String,
     pub remote_timeout_secs: u32,
-    /// How large the transcript is drawn in compact mode. Someone who reads a
-    /// language better than they hear it is reading this across a room from a
-    /// laptop, so it is a setting rather than a constant.
+    /// How large the transcript is drawn, in the live view, the history view
+    /// and compact mode alike. Someone who reads a language better than they
+    /// hear it is reading this across a room from a laptop, so it is a setting
+    /// rather than a constant — and one with a slider in the Live pane and
+    /// `Ctrl+=`/`Ctrl+-`/`Ctrl+0` on it, because the right size depends on
+    /// where the laptop is sitting right now.
     pub transcript_pt: f32,
     /// The result of the last connection test, shown next to the button.
     ///
@@ -69,7 +72,7 @@ impl Default for State {
             remote_model: "whisper-1".to_owned(),
             remote_api_key: String::new(),
             remote_timeout_secs: 30,
-            transcript_pt: 22.0,
+            transcript_pt: transcript::DEFAULT_PT,
             remote_probe: None,
             remote_probe_rx: None,
         }
@@ -250,13 +253,16 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     );
 
     ui.add_space(8.0);
-    ui.label(t("Captions"));
+    ui.label(t("Transcript"));
     ui.add(
-        egui::Slider::new(&mut app.settings.transcript_pt, 14.0..=48.0)
-            .text(t("caption text size")),
+        egui::Slider::new(&mut app.settings.transcript_pt, transcript::PT_RANGE)
+            .step_by(1.0)
+            .text(t("text size")),
     )
     .on_hover_text(t(
-        "How large compact mode draws the transcript. Ctrl+Shift+C switches to it.",
+        "How large the words are drawn in the live view, in a conversation's \
+         history and in compact mode. The Live pane has the same slider, and \
+         Ctrl+= / Ctrl+- / Ctrl+0 reach it from anywhere.",
     ));
 
     ui.add_space(8.0);

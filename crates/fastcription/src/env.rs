@@ -18,6 +18,7 @@ use fc_core::{
 use fc_store::{ConversationFilter, Store};
 use std::collections::{HashMap, HashSet};
 
+use crate::i18n::tf;
 use crate::session::SharedStore;
 
 /// How many conversations the sidebar loads at once. The list is a navigation
@@ -70,6 +71,19 @@ pub struct StoreProbe {
     pub problem: Option<String>,
 }
 
+/// Said wherever a read-only library has to be explained, which is four
+/// places: the startup notice, the disabled Start button's tooltip, the
+/// refusal when Start is pressed anyway, and the first-run checklist. One
+/// wording, because a user who reads two different sentences about the same
+/// file concludes there are two problems.
+pub fn read_only_library(path: &Path) -> String {
+    tf(
+        "The conversation library at {} will not accept writes, so nothing can be \
+         recorded. Past transcripts are still readable and exportable.",
+        &[&path.display().to_string()],
+    )
+}
+
 /// Opens the library. A failure here disables recording but leaves the app
 /// usable, so it returns `None` rather than aborting startup.
 pub fn open_store() -> StoreProbe {
@@ -91,21 +105,16 @@ pub fn open_store() -> StoreProbe {
             }
             StoreProbe {
                 store: Some(Arc::new(Mutex::new(store))),
-                problem: read_only.then(|| {
-                    format!(
-                        "The conversation library at {} will not accept writes, so recording \
-                         is disabled. Past transcripts are still readable and exportable.",
-                        path.display()
-                    )
-                }),
+                problem: read_only.then(|| read_only_library(&path)),
                 path,
                 read_only,
             }
         }
         Err(err) => StoreProbe {
             store: None,
-            problem: Some(format!(
-                "The conversation library could not be opened, so recording is disabled: {err}"
+            problem: Some(tf(
+                "The conversation library could not be opened, so recording is disabled: {}",
+                &[&err.to_string()],
             )),
             path,
             read_only: false,
@@ -120,7 +129,10 @@ pub fn list_sources() -> Probe<Vec<AudioSource>> {
         Ok(sources) => Probe::ok(sources),
         Err(err) => Probe {
             value: Vec::new(),
-            problem: Some(format!("No audio sources could be listed: {err}")),
+            problem: Some(tf(
+                "No audio sources could be listed: {}",
+                &[&err.to_string()],
+            )),
         },
     }
 }
@@ -270,7 +282,10 @@ pub fn load_library(store: &SharedStore, recording: Option<ConversationId>) -> P
         Err(err) => {
             return Probe {
                 value: Library::default(),
-                problem: Some(format!("The conversation list could not be read: {err}")),
+                problem: Some(tf(
+                    "The conversation list could not be read: {}",
+                    &[&err.to_string()],
+                )),
             }
         }
     };

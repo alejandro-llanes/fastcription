@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use fc_core::{EngineInfo, SessionEvent, SessionState};
 
 use crate::app::{App, NoticeKind};
-use crate::i18n::t;
+use crate::i18n::{t, tf};
 use crate::session::{self, Session, SessionConfig};
 
 impl App {
@@ -81,11 +81,7 @@ impl App {
         if self.library_read_only {
             self.notify(
                 NoticeKind::Error,
-                format!(
-                    "The conversation library at {} will not accept writes, so there is \
-                     nowhere to record to.",
-                    self.library_path.display()
-                ),
+                crate::env::read_only_library(&self.library_path),
             );
             return;
         }
@@ -101,18 +97,11 @@ impl App {
         // would record happily and fail every transcription, which looks like
         // the app is working when nothing is being understood.
         if self.voxtype.is_none() {
-            self.notify(
-                NoticeKind::Error,
-                "voxtype was not found on PATH. Install it and run \
-                 `voxtype setup --download` to fetch a model.",
-            );
+            self.notify(NoticeKind::Error, t(super::readiness::NO_VOXTYPE));
             return;
         }
         if self.settings.model.trim().is_empty() && self.models.is_empty() {
-            self.notify(
-                NoticeKind::Error,
-                "No transcription model is installed. Run `voxtype setup model` to download one.",
-            );
+            self.notify(NoticeKind::Error, t(super::readiness::NO_MODEL));
             return;
         }
 
@@ -124,7 +113,10 @@ impl App {
             Err(err) => {
                 self.notify(
                     NoticeKind::Error,
-                    format!("{} is not available: {err}", chosen.label()),
+                    tf(
+                        "{} is not available: {}",
+                        &[&chosen.label(), &err.to_string()],
+                    ),
                 );
                 return;
             }
@@ -140,9 +132,10 @@ impl App {
                 Err(err) => {
                     self.notify(
                         NoticeKind::Error,
-                        format!(
+                        tf(
                             "Could not write fastcription's voxtype settings, so transcription \
-                             would be too slow to follow live: {err}"
+                             would be too slow to follow live: {}",
+                            &[&err],
                         ),
                     );
                     return;
@@ -170,6 +163,7 @@ impl App {
                 self.provisional.clear();
                 self.events = Some(session.events.clone());
                 self.recording = Some(session.conversation);
+                self.live_conversation = Some(session.conversation);
                 self.session_config = Some(voxtype_config);
                 self.session = Some(session);
                 self.set_state(SessionState::Recording);
@@ -180,7 +174,7 @@ impl App {
                 crate::env::remove_session_config(&voxtype_config);
                 self.notify(
                     NoticeKind::Error,
-                    format!("Could not start recording: {err}"),
+                    tf("Could not start recording: {}", &[&err.to_string()]),
                 );
             }
         }
@@ -353,9 +347,9 @@ impl App {
             if self.selected_source.is_none() {
                 self.notify(
                     NoticeKind::Warning,
-                    format!(
+                    tf(
                         "{} is not available any more, so nothing is selected to record.",
-                        previous.label()
+                        &[&previous.label()],
                     ),
                 );
             }
@@ -398,10 +392,8 @@ impl App {
                 SessionEvent::StateChanged(state) => self.set_state(state),
                 SessionEvent::PressureChanged(pressure) => self.pressure = pressure,
                 SessionEvent::SourceLost { reason } => {
-                    let id = self.notify_id(
-                        NoticeKind::Warning,
-                        format!("{} {reason}", t("Audio source lost:")),
-                    );
+                    let id = self
+                        .notify_id(NoticeKind::Warning, tf("Audio source lost: {}", &[&reason]));
                     self.capture_notice = Some(id);
                 }
                 // Only the notice it pairs with: clearing the list would also
@@ -414,7 +406,7 @@ impl App {
                     self.notify(NoticeKind::Info, t("The audio source is back."));
                 }
                 SessionEvent::Failed { stage, message } => {
-                    self.notify(NoticeKind::Error, format!("{stage}: {message}"));
+                    self.notify(NoticeKind::Error, tf("{}: {}", &[stage, &message]));
                 }
             }
         }

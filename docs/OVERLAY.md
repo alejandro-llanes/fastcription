@@ -20,6 +20,38 @@ toggles it, the top bar has a **Compact** button, and `Esc` or the strip's own
 > is how you put it away. Stop compact mode before hiding, or leave the window
 > up.
 
+## What the strip shows
+
+The last four committed lines, then the line being spoken. The line being
+spoken is drawn in italics, in the palette's `secondary`, because its tail is
+replaced on every transcription pass and the reader has to be able to tell
+settled words from unsettled ones. It used to be drawn in `dim`, which on a
+light palette measured 3:1 against the panel — below WCAG AA for text, for the
+one audience this application has.
+
+The size is the **transcript text size** setting, shared with the main
+window's live transcript rather than being compact mode's own. It ranges from
+14 to 40 points, defaults to 22, is persisted, and has three ways to change it:
+the slider in the Live pane header, the slider in Settings, and `Ctrl+=` /
+`Ctrl+-` / `Ctrl+0` (back to 22).
+
+Compact mode answers every shortcut the full window does — the size keys above,
+`Ctrl+R` / `Ctrl+Space` / `Ctrl+.` for start, pause and stop, and `Esc` to come
+back. All of them need keyboard focus, which the recommended Hyprland rule
+below deliberately withholds so the meeting keeps it; set the size before
+entering compact mode, or use the **Restore** button and the full window's
+controls. Nothing else in the strip is a control.
+
+## The title is compact mode's, while it is on
+
+The main window retitles itself as the session changes state: `● REC 12:34 —
+fastcription` while recording, `⏸ Paused — fastcription` when paused, plain
+`fastcription` when idle. **None of that happens while compact mode is on.** The
+title is the compositor rule's only handle on this window, and a title that
+gained a `REC` prefix would float the captions for exactly as long as it took
+the clock to tick over. Leaving compact mode restores whichever state title is
+current.
+
 winit has no layer-shell backend: on Wayland, "always on top" is an
 `xdg_toplevel` hint the compositor is free to ignore, not a protocol guarantee
 the way `zwlr_layer_shell_v1` would be. On this machine (Hyprland/Omarchy) that

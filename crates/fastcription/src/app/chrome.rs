@@ -8,11 +8,13 @@
 
 use std::time::Instant;
 
-use egui::{RichText, ViewportCommand, WindowLevel};
-use fc_core::{AudioSource, SessionState};
+use egui::{Key, KeyboardShortcut, Modifiers, RichText, ViewportCommand, WindowLevel};
+use fc_core::{AudioSource, Pressure, SessionState};
 
-use crate::app::{session_control::format_elapsed, App, MainView, NoticeKind, ServiceStatus};
-use crate::i18n::t;
+use crate::app::{
+    session_control::format_elapsed, transcript, App, MainView, NoticeKind, ServiceStatus,
+};
+use crate::i18n::{t, tf};
 
 /// The window's ordinary title, and the one it takes in compact mode.
 ///
@@ -27,6 +29,11 @@ const COMPACT_SIZE: [f32; 2] = [760.0, 170.0];
 
 /// How many committed lines compact mode shows above the live one.
 const COMPACT_LINES: usize = 4;
+
+/// The source picker's width. Wide enough for a sink input's application name
+/// and most device descriptions, narrow enough that the transport still fits
+/// beside it at the window's 760 pt minimum.
+const COMBO_WIDTH: f32 = 230.0;
 
 impl App {
     /// Re-applies everything tied to an `egui::Context`: fonts, text
@@ -49,6 +56,11 @@ impl App {
             .start(self.themes_dir.clone(), None, &self.theme_waker);
 
         self.palette.apply(ctx);
+
+        // A fresh viewport is titled from `native_options`, whatever the last
+        // one was told, so what we believe the compositor knows is wrong until
+        // `sync_title` has spoken to this one.
+        self.title_shown.clear();
 
         // A window reopened from the tray while compact was on comes back
         // decorated and ordinary-sized, because the commands that made it
@@ -85,6 +97,7 @@ impl App {
             ctx.request_repaint_after(due);
         }
         self.handle_shortcuts(&ctx);
+        self.sync_title(&ctx);
 
         if self.compact {
             self.compact_frame(ui);
@@ -95,6 +108,9 @@ impl App {
 
         egui::Panel::top("top-bar").show(ui, |ui| self.top_bar(ui));
         self.notice_panel(ui);
+        // Below the notices and above the sidebar, so it spans the window:
+        // what it carries is about the session, not about either pane.
+        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
 
         egui::Panel::left("sidebar")
             .resizable(true)
@@ -109,25 +125,102 @@ impl App {
         });
     }
 
-    /// `Ctrl+Shift+C` toggles compact mode, `Esc` leaves it.
+    /// Every key the window answers to.
     ///
-    /// `Esc` only works while the window has focus, which is the point: a
-    /// compositor rule that keeps the captions above a call usually also keeps
-    /// focus in the call, and then nothing here sees the key at all — hence
-    /// the restore button compact mode draws for itself.
+    /// Nothing fires while a text field has the keyboard: the app is full of
+    /// them — a conversation title, a server address, a new tag — and `Ctrl+R`
+    /// stopping being "select the word" and starting a recording mid-sentence
+    /// is the kind of surprise that costs a meeting. `text_edit_focused` rather
+    /// than `egui_wants_keyboard_input`, which is true of any focused widget
+    /// and would silence the transport for as long as a button held focus.
+    ///
+    /// `Esc` only leaves compact mode while the window has focus, which is the
+    /// point: a compositor rule that keeps the captions above a call usually
+    /// also keeps focus in the call, and then nothing here sees the key at all
+    /// — hence the restore button compact mode draws for itself.
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let toggle = egui::KeyboardShortcut::new(
-            egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
-            egui::Key::C,
-        );
-        if ctx.input_mut(|i| i.consume_shortcut(&toggle)) {
+        if ctx.text_edit_focused() {
+            return;
+        }
+
+        let shortcut = |modifiers: Modifiers, key: Key| {
+            ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(modifiers, key)))
+        };
+        let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
+
+        if shortcut(ctrl_shift, Key::C) {
             self.set_compact(ctx, !self.compact);
         }
-        if self.compact {
-            let focused = ctx.input(|i| i.focused);
-            if focused && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                self.set_compact(ctx, false);
+        if self.compact && ctx.input(|i| i.focused) && ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.set_compact(ctx, false);
+        }
+
+        for (modifiers, key, request) in [
+            (Modifiers::CTRL, Key::R, TransportKey::StartOrResume),
+            (Modifiers::CTRL, Key::Space, TransportKey::PauseOrResume),
+            (Modifiers::CTRL, Key::Period, TransportKey::Stop),
+        ] {
+            if shortcut(modifiers, key) {
+                self.apply_transport(transport_for(request, self.state));
             }
+        }
+
+        // `Plus` as well as `Equals`, because the key is shifted on most
+        // layouts and winit reports what the shift produced.
+        let pt = self.settings.transcript_pt;
+        if shortcut(Modifiers::CTRL, Key::Equals) || shortcut(Modifiers::CTRL, Key::Plus) {
+            self.set_transcript_pt(pt + transcript::PT_STEP);
+        }
+        if shortcut(Modifiers::CTRL, Key::Minus) {
+            self.set_transcript_pt(pt - transcript::PT_STEP);
+        }
+        if shortcut(Modifiers::CTRL, Key::Num0) {
+            self.set_transcript_pt(transcript::DEFAULT_PT);
+        }
+    }
+
+    /// Clamps the transcript size to the one range the sliders and the
+    /// shortcuts share, so a size reached by keyboard is a size a slider can
+    /// show.
+    pub(super) fn set_transcript_pt(&mut self, pt: f32) {
+        self.settings.transcript_pt = transcript::clamp_pt(pt);
+    }
+
+    fn apply_transport(&mut self, action: Option<Transport>) {
+        match action {
+            Some(Transport::Start) | Some(Transport::Resume) => self.start_or_resume(),
+            Some(Transport::Pause) => self.pause(),
+            Some(Transport::Stop) => self.stop(),
+            None => {}
+        }
+    }
+
+    /// Keeps the window title saying what the session is doing, which on a
+    /// tiled desktop is the only part of fastcription visible while the user is
+    /// looking at the call.
+    ///
+    /// Compact mode owns the title: [`COMPACT_TITLE`] is what the compositor
+    /// rule in `docs/OVERLAY.md` matches on, so a `REC` prefix there would
+    /// float the captions for exactly as long as it took the clock to tick.
+    fn sync_title(&mut self, ctx: &egui::Context) {
+        if self.compact {
+            return;
+        }
+        let wanted = match self.state {
+            // Truncated to the second by `duration_hms`, so this string — and
+            // therefore the command below — changes once a second, not once
+            // per frame.
+            SessionState::Recording => format!(
+                "\u{25cf} REC {} \u{2014} {TITLE}",
+                fc_core::time::duration_hms(self.elapsed().as_millis() as u64)
+            ),
+            SessionState::Paused => format!("\u{23f8} Paused \u{2014} {TITLE}"),
+            SessionState::Finishing => format!("Finishing \u{2014} {TITLE}"),
+            SessionState::Idle => TITLE.to_owned(),
+        };
+        if wanted != self.title_shown {
+            ctx.send_viewport_cmd(ViewportCommand::Title(wanted.clone()));
+            self.title_shown = wanted;
         }
     }
 
@@ -159,21 +252,25 @@ impl App {
             ctx.send_viewport_cmd(ViewportCommand::Decorations(true));
             ctx.send_viewport_cmd(ViewportCommand::WindowLevel(WindowLevel::Normal));
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
-            ctx.send_viewport_cmd(ViewportCommand::Title(TITLE.to_owned()));
+            // Not sent here: `sync_title` owns the ordinary title and knows
+            // whether the session is recording, which this does not. Clearing
+            // what the compositor was last told is what makes it send one.
+            self.title_shown.clear();
         }
     }
 
-    fn apply_compact(&self, ctx: &egui::Context) {
+    fn apply_compact(&mut self, ctx: &egui::Context) {
         ctx.send_viewport_cmd(ViewportCommand::InnerSize(COMPACT_SIZE.into()));
         ctx.send_viewport_cmd(ViewportCommand::Decorations(false));
         ctx.send_viewport_cmd(ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop));
         ctx.send_viewport_cmd(ViewportCommand::Title(COMPACT_TITLE.to_owned()));
+        self.title_shown = COMPACT_TITLE.to_owned();
     }
 
     /// Captions and nothing else: the last few committed lines, then the one
-    /// being spoken, dimmed because its tail is still being revised.
+    /// being spoken, in italics because its tail is still being revised.
     fn compact_frame(&mut self, ui: &mut egui::Ui) {
-        let size = self.settings.transcript_pt.clamp(14.0, 48.0);
+        let size = transcript::clamp_pt(self.settings.transcript_pt);
         let mut leave = false;
         egui::CentralPanel::default()
             .frame(
@@ -187,7 +284,7 @@ impl App {
                         ui.label(
                             RichText::new(format_elapsed(self.elapsed()))
                                 .small()
-                                .color(self.palette.dim),
+                                .color(self.palette.secondary),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             leave = ui
@@ -216,19 +313,22 @@ impl App {
                         pending.sort_by_key(|segment| segment.seq);
                         for segment in pending {
                             // The in-flight tail is replaced on every pass, so
-                            // it is shown as provisional rather than as text
-                            // the user can rely on having been said.
+                            // it is marked as not yet settled — in italics, at
+                            // a colour that still clears AA. It used to be
+                            // drawn in `dim`, which made the newest words on
+                            // screen the hardest ones to read.
                             ui.label(
                                 RichText::new(&segment.text)
                                     .size(size)
-                                    .color(self.palette.dim),
+                                    .italics()
+                                    .color(self.palette.secondary),
                             );
                         }
                         if self.segments.is_empty() && self.provisional.is_empty() {
                             ui.label(
                                 RichText::new(t("Waiting for speech…"))
                                     .size(size)
-                                    .color(self.palette.dim),
+                                    .color(self.palette.secondary),
                             );
                         }
                     });
@@ -239,6 +339,11 @@ impl App {
         }
     }
 
+    /// Everything that chooses or starts a conversation. Status moved out of
+    /// here into [`App::status_bar`]: the bar was one non-wrapping `horizontal`
+    /// carrying a level meter, a clock, a pressure warning and a service pill
+    /// as well, and below about a thousand points — the window's minimum is
+    /// 760 — the right-hand controls were simply off the edge.
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if ui
@@ -252,58 +357,12 @@ impl App {
             source_combo(self, ui, "top-bar-source");
 
             ui.separator();
-            ui.add(crate::icons::Icon::Mic.image(self.palette.secondary, 14.0));
-            ui.add(
-                egui::ProgressBar::new(self.level_peak.clamp(0.0, 1.0))
-                    .desired_width(90.0)
-                    .show_percentage(),
-            );
-
-            ui.separator();
-            let can_start = matches!(self.state, SessionState::Idle | SessionState::Paused)
-                && !self.library_read_only;
-            let start_label = if self.state == SessionState::Paused {
-                t("Resume")
-            } else {
-                t("Start")
-            };
-            let start = ui.add_enabled(can_start, egui::Button::new(start_label));
-            if self.library_read_only {
-                start.on_disabled_hover_text(format!(
-                    "{} {}",
-                    t("The conversation library is read-only, so nothing can be recorded:"),
-                    self.library_path.display()
-                ));
-            } else if start.clicked() {
-                self.start_or_resume();
-            }
-            if ui
-                .add_enabled(
-                    self.state == SessionState::Recording,
-                    egui::Button::new(t("Pause")),
-                )
-                .clicked()
-            {
-                self.pause();
-            }
-            if ui
-                .add_enabled(
-                    matches!(self.state, SessionState::Recording | SessionState::Paused),
-                    egui::Button::new(t("Stop")),
-                )
-                .clicked()
-            {
-                self.stop();
-            }
-
-            ui.separator();
-            ui.label(format_elapsed(self.elapsed()));
-
-            ui.separator();
+            ui.add(crate::icons::Icon::Mic.image(self.palette.secondary, 14.0))
+                .on_hover_text(t("Also transcribe your own microphone, as a second track"));
             mic_checkbox(self, ui, t("Mic"));
 
             ui.separator();
-            service_pill(ui, &self.palette, self.voxtype_service);
+            self.transport(ui);
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
@@ -322,6 +381,101 @@ impl App {
                     let ctx = ui.ctx().clone();
                     self.set_compact(&ctx, true);
                 }
+            });
+        });
+    }
+
+    /// Start, Pause and Stop, with the icons and the shortcuts they answer to.
+    ///
+    /// The shortcut is in every tooltip rather than in the label: the labels
+    /// have to stay short enough that three of them plus a source picker fit
+    /// across the narrowest window the app allows.
+    fn transport(&mut self, ui: &mut egui::Ui) {
+        use crate::icons::Icon;
+        let tint = self.palette.text;
+
+        let can_start = matches!(self.state, SessionState::Idle | SessionState::Paused)
+            && !self.library_read_only;
+        let start_label = if self.state == SessionState::Paused {
+            t("Resume")
+        } else {
+            t("Start")
+        };
+        let start = ui.add_enabled(
+            can_start,
+            egui::Button::image_and_text(Icon::Play.image(tint, 14.0), start_label),
+        );
+        if self.library_read_only {
+            start.on_disabled_hover_text(crate::env::read_only_library(&self.library_path));
+        } else if start.on_hover_text(t("Ctrl+R")).clicked() {
+            self.start_or_resume();
+        }
+
+        if ui
+            .add_enabled(
+                self.state == SessionState::Recording,
+                egui::Button::image_and_text(Icon::Pause.image(tint, 14.0), t("Pause")),
+            )
+            .on_hover_text(t("Ctrl+Space"))
+            .clicked()
+        {
+            self.pause();
+        }
+        if ui
+            .add_enabled(
+                matches!(self.state, SessionState::Recording | SessionState::Paused),
+                egui::Button::image_and_text(Icon::Stop.image(tint, 14.0), t("Stop")),
+            )
+            .on_hover_text(t("Ctrl+."))
+            .clicked()
+        {
+            self.stop();
+        }
+    }
+
+    /// What the session is doing, on a line of its own at the foot of the
+    /// window: the input level, how long it has been running, whether
+    /// transcription is keeping up, and whether voxtype's daemon is there.
+    ///
+    /// None of it is a control, which is why it is down here and not next to
+    /// the buttons.
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            // The meter reads the *selected* source, which is usually the other
+            // end of a call. A microphone icon here said the opposite, and a
+            // user watching a flat meter while the remote side talked had every
+            // reason to think they had picked the wrong thing.
+            let hover = match self
+                .selected_source
+                .and_then(|index| self.sources.get(index))
+            {
+                Some(source) => tf("Input level from {}", &[&source.label()]),
+                None => t("No audio source is selected").to_owned(),
+            };
+            ui.add(crate::icons::Icon::Monitor.image(self.palette.secondary, 14.0))
+                .on_hover_text(hover.clone());
+            ui.add(
+                egui::ProgressBar::new(self.level_peak.clamp(0.0, 1.0))
+                    .desired_width(90.0)
+                    .show_percentage(),
+            )
+            .on_hover_text(hover);
+
+            ui.separator();
+            ui.label(format_elapsed(self.elapsed()))
+                .on_hover_text(t("How long this conversation has been recording"));
+
+            if self.pressure == Pressure::Lagging {
+                ui.separator();
+                ui.add(crate::icons::Icon::StatusWarn.image(self.palette.warning, 14.0));
+                ui.colored_label(
+                    self.palette.warning,
+                    t("transcription behind \u{2014} words arrive late"),
+                );
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                service_pill(ui, &self.palette, self.voxtype_service);
             });
         });
     }
@@ -428,9 +582,9 @@ impl App {
         if let (Some(previous), None) = (&chosen, self.selected_source) {
             self.notify(
                 NoticeKind::Warning,
-                format!(
+                tf(
                     "{} is not available any more, so nothing is selected to record.",
-                    previous.label()
+                    &[&previous.label()],
                 ),
             );
         }
@@ -456,11 +610,15 @@ impl App {
             fc_voxtype::service::stop()
         };
         if let Err(err) = outcome {
-            let verb = if running { "start" } else { "stop" };
-            self.notify(
-                NoticeKind::Error,
-                format!("Could not {verb} voxtype.service: {err}"),
-            );
+            // Two whole sentences rather than a verb substituted into one:
+            // "could not {start} the service" is not a sentence a translator
+            // can work with, because the verb inflects with what follows it.
+            let message = if running {
+                tf("Could not start voxtype.service: {}", &[&err.to_string()])
+            } else {
+                tf("Could not stop voxtype.service: {}", &[&err.to_string()])
+            };
+            self.notify(NoticeKind::Error, message);
         }
         self.voxtype_service = crate::env::service_status();
     }
@@ -476,7 +634,9 @@ impl App {
                 .system_theme()
                 .or_else(|| self.theme_catalog.themes().first())
                 .map(|theme| theme.palette.clone());
-            if let Some(palette) = next {
+            if let Some(mut palette) = next {
+                // A theme from the desktop has not been held to anything.
+                palette.enforce_contrast();
                 self.palette = palette;
                 self.palette.apply(ctx);
             }
@@ -571,7 +731,14 @@ pub(super) fn source_combo(app: &mut App, ui: &mut egui::Ui, id_salt: &str) {
     };
     ui.add_enabled_ui(!locked, |ui| {
         let combo = egui::ComboBox::from_id_salt(id_salt)
-            .selected_text(current)
+            .selected_text(current.clone())
+            // Bounded and elided, because the label is the sound server's and
+            // can be sixty characters of "Monitor of Built-in Audio Analogue
+            // Stereo": an unbounded picker pushed the transport buttons off the
+            // right edge of the window, which is the bug the status bar below
+            // was split out to fix.
+            .width(COMBO_WIDTH)
+            .truncate()
             .show_ui(ui, |ui| {
                 if app.sources.is_empty() {
                     ui.label(t("Nothing to record"));
@@ -585,10 +752,16 @@ pub(super) fn source_combo(app: &mut App, ui: &mut egui::Ui, id_salt: &str) {
             combo
                 .response
                 .on_disabled_hover_text(t("Stop the recording to change the source"));
+        } else {
+            // The full name, for the half of them the picker cannot show.
+            combo.response.on_hover_text(current);
         }
     });
     if ui
-        .small_button(t("↻"))
+        .add(
+            egui::Button::image(crate::icons::Icon::Reconnect.image(app.palette.secondary, 13.0))
+                .small(),
+        )
         .on_hover_text(t("Look for audio sources again"))
         .clicked()
     {
@@ -629,8 +802,11 @@ fn service_pill(ui: &mut egui::Ui, palette: &crate::theme::Palette, status: Serv
             palette.dim,
         ),
     };
-    ui.add(icon.image(color, 14.0));
+    // Added label first: the status bar aligns this to the right, where the
+    // first widget placed is the rightmost one, so this is what puts the icon
+    // on the left of the words.
     ui.colored_label(color, text);
+    ui.add(icon.image(color, 14.0));
 }
 
 fn notice_icon(kind: NoticeKind) -> crate::icons::Icon {
@@ -661,6 +837,49 @@ pub(super) fn tray_icon_rgba(size: usize) -> Vec<u8> {
     pixels
 }
 
+/// Which key was pressed, as the transport understands it. Three keys, because
+/// one of them has to mean two things: the key that starts a recording is the
+/// key that resumes a paused one, since from the reader's side those are the
+/// same request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TransportKey {
+    /// `Ctrl+R`.
+    StartOrResume,
+    /// `Ctrl+Space`.
+    PauseOrResume,
+    /// `Ctrl+.`
+    Stop,
+}
+
+/// What the session should be asked to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Transport {
+    Start,
+    Pause,
+    Resume,
+    Stop,
+}
+
+/// Maps a key onto an action, or onto nothing.
+///
+/// Pure, so the thing that is easy to get wrong — which key does what in which
+/// state, and above all that nothing fires while a session is `Finishing` — is
+/// tested instead of being spread across the branches of a frame. Starting a
+/// second session while the first is still transcribing its backlog would take
+/// the store's conversation row out from under it.
+pub(super) fn transport_for(key: TransportKey, state: SessionState) -> Option<Transport> {
+    match (key, state) {
+        (TransportKey::StartOrResume, SessionState::Idle) => Some(Transport::Start),
+        (TransportKey::StartOrResume, SessionState::Paused)
+        | (TransportKey::PauseOrResume, SessionState::Paused) => Some(Transport::Resume),
+        (TransportKey::PauseOrResume, SessionState::Recording) => Some(Transport::Pause),
+        (TransportKey::Stop, SessionState::Recording | SessionState::Paused) => {
+            Some(Transport::Stop)
+        }
+        _ => None,
+    }
+}
+
 /// Finds the user's previously chosen source in a freshly enumerated list.
 ///
 /// Matched on identity rather than position: a source that disappears shifts
@@ -679,8 +898,68 @@ pub(super) fn reselect(previous: Option<&AudioSource>, sources: &[AudioSource]) 
 
 #[cfg(test)]
 mod tests {
-    use super::reselect;
-    use fc_core::{AudioSource, SourceKind};
+    use super::{reselect, transport_for, Transport, TransportKey};
+    use fc_core::{AudioSource, SessionState, SourceKind};
+
+    /// One key starts and resumes, because a reader who paused to answer the
+    /// door presses the same thing to carry on.
+    #[test]
+    fn the_start_key_resumes_a_paused_session() {
+        let key = TransportKey::StartOrResume;
+        assert_eq!(
+            transport_for(key, SessionState::Idle),
+            Some(Transport::Start)
+        );
+        assert_eq!(
+            transport_for(key, SessionState::Paused),
+            Some(Transport::Resume)
+        );
+        // Already recording: pressing it again must not start a second session.
+        assert_eq!(transport_for(key, SessionState::Recording), None);
+    }
+
+    #[test]
+    fn the_pause_key_toggles() {
+        let key = TransportKey::PauseOrResume;
+        assert_eq!(
+            transport_for(key, SessionState::Recording),
+            Some(Transport::Pause)
+        );
+        assert_eq!(
+            transport_for(key, SessionState::Paused),
+            Some(Transport::Resume)
+        );
+        assert_eq!(transport_for(key, SessionState::Idle), None);
+    }
+
+    #[test]
+    fn stopping_needs_something_to_stop() {
+        let key = TransportKey::Stop;
+        assert_eq!(
+            transport_for(key, SessionState::Recording),
+            Some(Transport::Stop)
+        );
+        assert_eq!(
+            transport_for(key, SessionState::Paused),
+            Some(Transport::Stop)
+        );
+        assert_eq!(transport_for(key, SessionState::Idle), None);
+    }
+
+    /// `Finishing` is capture stopped with a backlog still being transcribed.
+    /// Every key has to be inert there: starting would steal the conversation
+    /// row the session is still appending to, and stopping twice would hand the
+    /// same session off to finish on two threads.
+    #[test]
+    fn nothing_fires_while_a_session_is_finishing() {
+        for key in [
+            TransportKey::StartOrResume,
+            TransportKey::PauseOrResume,
+            TransportKey::Stop,
+        ] {
+            assert_eq!(transport_for(key, SessionState::Finishing), None, "{key:?}");
+        }
+    }
 
     fn monitor(name: &str) -> AudioSource {
         AudioSource::named(SourceKind::SinkMonitor, name, name)

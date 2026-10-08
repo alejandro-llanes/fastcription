@@ -3,7 +3,7 @@
 use egui::RichText;
 use fc_core::{ConversationId, ConversationStatus};
 
-use crate::app::App;
+use crate::app::{transcript, App, PendingDelete};
 use crate::i18n::t;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui, id: ConversationId) {
@@ -38,11 +38,20 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: ConversationId) {
                     .on_hover_text(t("Deletes this conversation and its transcript."))
                     .clicked()
             {
-                app.ask_to_delete(conversation.id);
+                app.ask_to_delete(PendingDelete::Conversation(conversation.id));
             }
             crate::app::export_ui::button(app, ui, &conversation);
+            transcript::copy_buttons(ui, Some(&conversation), app.segments_for(id));
         });
     });
+    // When it happened and how long it ran, which is what an export header
+    // carries and what the window showed nowhere: a conversation page used to
+    // name its source and its engine and never its date.
+    ui.label(
+        RichText::new(header_line(&conversation))
+            .small()
+            .color(app.palette.secondary),
+    );
     ui.separator();
 
     ui.horizontal(|ui| {
@@ -95,35 +104,74 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: ConversationId) {
         }
     });
 
-    ui.add_space(8.0);
-    ui.label(format!(
-        "{} · {} ({}) · {}",
-        conversation.source.label(),
-        conversation.engine.engine,
-        conversation.engine.model,
-        status_label(conversation.status),
-    ));
     if conversation.mic_track {
-        ui.label(RichText::new(t("Microphone track captured")).color(app.palette.dim));
+        ui.label(
+            RichText::new(t("Microphone track captured"))
+                .small()
+                .color(app.palette.secondary),
+        );
     }
 
     ui.separator();
-    egui::ScrollArea::vertical()
-        .id_salt("history-segments")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            for segment in app.segments_for(id) {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(segment.speaker_label()).strong());
-                    ui.label(&segment.text);
-                });
-            }
+    let pt = app.settings.transcript_pt;
+    let target = app
+        .pending_scroll
+        .and_then(|(pending, start_ms)| (pending == id).then_some(start_ms));
+    {
+        // Scoped so this borrow of the transcript cache ends before the scroll
+        // request is cleared below. Not cloned: a three-hour meeting is
+        // thousands of segments and this runs every frame.
+        let segments = app.segments_for(id);
+        // The segment the search excerpt came from: the first one that has not
+        // finished by then, so an offset that lands in a gap between two
+        // utterances scrolls to the one that follows it.
+        let target_row = target.and_then(|start_ms| {
+            segments
+                .iter()
+                .position(|segment| segment.end_ms >= start_ms)
         });
+        egui::ScrollArea::vertical()
+            .id_salt("history-segments")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (row, segment) in segments.iter().enumerate() {
+                    let response = transcript::row(ui, &app.palette, segment, pt);
+                    if Some(row) == target_row {
+                        response.scroll_to_me(Some(egui::Align::Center));
+                    }
+                    transcript::line_menu(&response, segment);
+                }
+                if segments.is_empty() {
+                    ui.weak(t("This conversation has no transcript."));
+                }
+            });
+    }
+    // Dropped whether or not a row matched, so an offset that names nothing in
+    // this transcript does not leave the view scrolling for ever.
+    if target.is_some() {
+        app.pending_scroll = None;
+    }
 
     if changed {
         app.persist_conversation(&conversation);
         app.conversations[index] = conversation;
     }
+}
+
+/// The one line that says what this conversation is: when, how long, from
+/// where, with what.
+fn header_line(conversation: &fc_core::Conversation) -> String {
+    let mut parts = vec![fc_core::time::local_datetime(conversation.started_at)];
+    if let Some(ms) = conversation.duration_ms() {
+        parts.push(fc_core::time::duration_hms(ms));
+    }
+    parts.push(conversation.source.label());
+    parts.push(format!(
+        "{} ({})",
+        conversation.engine.engine, conversation.engine.model
+    ));
+    parts.push(status_label(conversation.status).to_owned());
+    parts.join(" \u{b7} ")
 }
 
 fn status_label(status: ConversationStatus) -> &'static str {
