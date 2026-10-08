@@ -32,6 +32,21 @@ const MAIN_MIN_SIZE: [f32; 2] = [760.0, 480.0];
 /// The source picker's width. Wide enough for a sink input's application name
 /// and most device descriptions, narrow enough that the transport still fits
 /// beside it at the window's 760 pt minimum.
+/// The visualiser's size in the status bar, where it stands in for the level
+/// meter it replaces and so is about that wide.
+const STATUS_VISUALIZER_WIDTH: f32 = 140.0;
+const STATUS_VISUALIZER_HEIGHT: f32 = 16.0;
+
+/// The visualiser's height in the compact strip.
+///
+/// Small: the captions are what compact mode is for, and every point this
+/// takes is a point of text. Enough to read as a spectrum rather than as a
+/// smudge.
+const COMPACT_VISUALIZER_HEIGHT: f32 = 26.0;
+
+/// The compact strip's one button, square and round-cornered into a circle.
+const COMPACT_BUTTON: f32 = 26.0;
+
 const COMBO_WIDTH: f32 = 230.0;
 /// How many characters of a source name the picker shows. Chosen to sit inside
 /// `COMBO_WIDTH` at the default text size.
@@ -181,6 +196,18 @@ impl App {
             self.set_compact(ctx, false);
         }
 
+        // Settings was reachable only by its button in the top bar, which is
+        // the one pane with no other way in. Ctrl+, is what the rest of the
+        // desktop uses. It toggles, so the same key puts the transcript back
+        // rather than stranding the reader in a settings pane.
+        if shortcut(Modifiers::CTRL, Key::Comma) {
+            self.main_view = if self.main_view == MainView::Settings {
+                MainView::Live
+            } else {
+                MainView::Settings
+            };
+        }
+
         for (modifiers, key, request) in [
             (Modifiers::CTRL, Key::R, TransportKey::StartOrResume),
             (Modifiers::CTRL, Key::Space, TransportKey::PauseOrResume),
@@ -296,6 +323,60 @@ impl App {
         self.title_shown = COMPACT_TITLE.to_owned();
     }
 
+    /// Start, pause or resume, as one button.
+    ///
+    /// Compact mode is a strip on top of a call, and reaching the transport
+    /// meant restoring the whole window, pressing a button and shrinking
+    /// again — three actions and a window resize to stop transcribing a
+    /// coffee break. Returns whether it was pressed rather than acting, so the
+    /// caller can act outside the closure that borrows `self` for drawing.
+    ///
+    /// Pause rather than stop, because this is a toggle and stop is not
+    /// reversible: pressing it twice has to leave one conversation with a gap
+    /// in it, not two conversations. `Ctrl+.` still stops, from here as well
+    /// as from the full window.
+    fn compact_toggle_button(&mut self, ui: &mut egui::Ui) -> bool {
+        use crate::icons::Icon;
+
+        let (icon, hover, active) = match self.state {
+            SessionState::Recording => (Icon::Pause, t("Pause transcribing (Ctrl+Space)"), true),
+            SessionState::Paused => (Icon::Play, t("Carry on transcribing (Ctrl+Space)"), false),
+            SessionState::Finishing => (Icon::Pause, t("Finishing the last of the audio"), false),
+            SessionState::Idle => (Icon::Play, t("Start transcribing (Ctrl+R)"), false),
+        };
+        // Filled while recording, so the one control in the strip also says
+        // whether anything is being transcribed — the question someone glances
+        // at the caption bar to answer.
+        let (fill, tint) = if active {
+            (self.palette.accent, self.palette.on_accent)
+        } else {
+            (self.palette.surface, self.palette.text)
+        };
+        let enabled = self.state != SessionState::Finishing && !self.library_read_only;
+        let button = egui::Button::image(icon.image(tint, 14.0))
+            .fill(fill)
+            .corner_radius(COMPACT_BUTTON / 2.0)
+            .min_size(egui::vec2(COMPACT_BUTTON, COMPACT_BUTTON));
+        let response = ui.add_enabled(enabled, button);
+        if self.library_read_only {
+            response.on_disabled_hover_text(crate::env::read_only_library(&self.library_path));
+            return false;
+        }
+        response.on_hover_text(hover).clicked()
+    }
+
+    /// What the compact button and `Ctrl+Space` both mean: transcribing, or
+    /// not.
+    fn toggle_transcribing(&mut self) {
+        match self.state {
+            SessionState::Idle | SessionState::Paused => self.start_or_resume(),
+            SessionState::Recording => self.pause(),
+            // Already on its way to idle, and starting again here would race
+            // the transcription of the audio still in flight.
+            SessionState::Finishing => {}
+        }
+    }
+
     /// Captions and nothing else: the last few committed lines, then the one
     /// being spoken, in italics because its tail is still being revised.
     fn compact_frame(&mut self, ui: &mut egui::Ui) {
@@ -308,8 +389,10 @@ impl App {
                     .inner_margin(12.0),
             )
             .show(ui, |ui| {
+                let mut toggle = false;
                 egui::Panel::bottom("compact-controls").show(ui, |ui| {
                     ui.horizontal(|ui| {
+                        toggle = self.compact_toggle_button(ui);
                         ui.label(
                             RichText::new(format_elapsed(self.elapsed()))
                                 .small()
@@ -320,9 +403,24 @@ impl App {
                                 .small_button(t("Restore"))
                                 .on_hover_text(t("Back to the full window (Esc)"))
                                 .clicked();
+                            // Between the clock and the Restore button, taking
+                            // whatever is left. Laid out right-to-left, so it
+                            // is added after the button it sits to the left of.
+                            let room = ui.available_width() - 8.0;
+                            if room > 40.0 {
+                                self.visualizer.show(
+                                    ui,
+                                    &self.palette,
+                                    self.settings.visualizer,
+                                    egui::vec2(room, COMPACT_VISUALIZER_HEIGHT),
+                                );
+                            }
                         });
                     });
                 });
+                if toggle {
+                    self.toggle_transcribing();
+                }
 
                 // Whole lines only, newest at the bottom. A scroll area stuck
                 // to the bottom cut the oldest visible line horizontally
@@ -503,12 +601,36 @@ impl App {
             };
             ui.add(crate::icons::Icon::Monitor.image(self.palette.secondary, 14.0))
                 .on_hover_text(hover.clone());
-            ui.add(
-                egui::ProgressBar::new(self.level_peak.clamp(0.0, 1.0))
-                    .desired_width(90.0)
-                    .show_percentage(),
-            )
-            .on_hover_text(hover);
+            // The spectrum in place of the bar, when there is one. It answers
+            // the same question — is anything being heard — and answers it from
+            // further away, which is the distance this app is read from. The
+            // percentage goes with it, so the bar stays available for anyone
+            // who wants the number or does not want the movement.
+            let spectrum = self
+                .settings
+                .visualizer_in_main
+                .then(|| {
+                    self.visualizer.show(
+                        ui,
+                        &self.palette,
+                        self.settings.visualizer,
+                        egui::vec2(STATUS_VISUALIZER_WIDTH, STATUS_VISUALIZER_HEIGHT),
+                    )
+                })
+                .flatten();
+            match spectrum {
+                Some(response) => {
+                    response.on_hover_text(hover);
+                }
+                None => {
+                    ui.add(
+                        egui::ProgressBar::new(self.level_peak.clamp(0.0, 1.0))
+                            .desired_width(90.0)
+                            .show_percentage(),
+                    )
+                    .on_hover_text(hover);
+                }
+            }
 
             ui.separator();
             ui.label(format_elapsed(self.elapsed()))
@@ -672,23 +794,63 @@ impl App {
         self.voxtype_service = crate::env::service_status();
     }
 
+    /// Keeps the palette in step with both the catalog and the user's choice.
+    ///
+    /// Two things can change it: the desktop's theme, which arrives through a
+    /// background rescan, and the Appearance setting, which changes between
+    /// one frame and the next. Watching only the first was enough while
+    /// following the desktop was the only behaviour; now a changed setting has
+    /// to be noticed too, which is what `theme_applied` records. Re-resolving
+    /// unconditionally every frame would work and would also clone a palette
+    /// and rebuild an `egui::Visuals` sixty times a second for nothing.
     fn poll_theme(&mut self, ctx: &egui::Context) {
         if self.theme_catalog.needs_reload() {
             self.theme_catalog
                 .start(self.themes_dir.clone(), None, &self.theme_waker);
         }
-        if self.theme_catalog.poll() {
-            let next = self
-                .theme_catalog
+        let rescanned = self.theme_catalog.poll();
+        let chosen = self.theme_applied.as_ref() != Some(&self.settings.theme);
+        if !rescanned && !chosen {
+            return;
+        }
+        let Some(mut palette) = self.resolve_palette() else {
+            return;
+        };
+        // A theme from the desktop, or from a file, has not been held to
+        // anything.
+        palette.enforce_contrast();
+        self.theme_applied = Some(self.settings.theme.clone());
+        if palette != self.palette {
+            self.palette = palette;
+            self.palette.apply(ctx);
+        }
+    }
+
+    /// The palette the current [`crate::theme::ThemeChoice`] names.
+    ///
+    /// A named theme that is no longer in the directory falls back to the
+    /// desktop's rather than to nothing: the file can be deleted or renamed
+    /// between two launches, and an app that came up with stock egui grey
+    /// because of it would look broken rather than out of date.
+    fn resolve_palette(&self) -> Option<crate::theme::Palette> {
+        use crate::theme::ThemeChoice;
+        use fastframe_theme::{Base, Palette as _};
+
+        let desktop = || {
+            self.theme_catalog
                 .system_theme()
                 .or_else(|| self.theme_catalog.themes().first())
-                .map(|theme| theme.palette.clone());
-            if let Some(mut palette) = next {
-                // A theme from the desktop has not been held to anything.
-                palette.enforce_contrast();
-                self.palette = palette;
-                self.palette.apply(ctx);
-            }
+                .map(|theme| theme.palette.clone())
+        };
+        match &self.settings.theme {
+            ThemeChoice::System => desktop(),
+            ThemeChoice::Dark => Some(crate::theme::Palette::base(Base::Dark)),
+            ThemeChoice::Light => Some(crate::theme::Palette::base(Base::Light)),
+            ThemeChoice::Named(filename) => self
+                .theme_catalog
+                .find(filename)
+                .map(|theme| theme.palette.clone())
+                .or_else(desktop),
         }
     }
 

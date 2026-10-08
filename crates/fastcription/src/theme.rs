@@ -188,6 +188,96 @@ impl Palette {
     }
 }
 
+/// Where the palette comes from.
+///
+/// The app follows Omarchy by default and that is still the right default — it
+/// is why `fastframe-theme` was chosen (ARCHITECTURE.md). But following the
+/// desktop is not always what someone wants from *this* app: compact mode sits
+/// on top of a video call for an hour, and a desktop theme that is pleasant to
+/// work in can be the wrong thing to read captions off. So the default
+/// follows, and the setting is there for when it should not.
+#[derive(Clone, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ThemeChoice {
+    /// Whatever the desktop is wearing, changing with it.
+    #[default]
+    System,
+    /// The app's own palettes, ignoring the desktop.
+    Dark,
+    Light,
+    /// A palette file in the themes directory, by file name.
+    Named(String),
+}
+
+impl ThemeChoice {
+    /// What the picker shows for this choice.
+    ///
+    /// Owned rather than `&'static str` because a named theme's label is the
+    /// file's own name.
+    pub fn label(&self) -> String {
+        match self {
+            Self::System => "Follow the desktop".to_owned(),
+            Self::Dark => "Dark".to_owned(),
+            Self::Light => "Light".to_owned(),
+            Self::Named(filename) => fastframe_theme::display_name(filename).to_owned(),
+        }
+    }
+}
+
+/// `color` with its hue turned `degrees` around the colour wheel, keeping its
+/// saturation and value.
+///
+/// The visualiser uses this to colour the spectrum: the reference designs get
+/// their low-to-high gradient from two chosen neon hues, which this app cannot
+/// do because its palette belongs to whatever Omarchy theme the desktop is
+/// wearing. Rotating the theme's own accent gives the same two-tone effect out
+/// of a colour the user actually picked.
+///
+/// A grey has no hue to turn, and comes back unchanged rather than acquiring
+/// one — a monochrome theme stays monochrome.
+pub fn shift_hue(color: Color32, degrees: f32) -> Color32 {
+    let (r, g, b) = (
+        f32::from(color.r()) / 255.0,
+        f32::from(color.g()) / 255.0,
+        f32::from(color.b()) / 255.0,
+    );
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let chroma = max - min;
+    if chroma <= f32::EPSILON {
+        return color;
+    }
+
+    let mut hue = 60.0
+        * if max == r {
+            ((g - b) / chroma).rem_euclid(6.0)
+        } else if max == g {
+            (b - r) / chroma + 2.0
+        } else {
+            (r - g) / chroma + 4.0
+        };
+    hue = (hue + degrees).rem_euclid(360.0);
+
+    // Back to RGB, reusing the chroma and value we already have.
+    let secondary = chroma * (1.0 - ((hue / 60.0) % 2.0 - 1.0).abs());
+    let (r1, g1, b1) = match (hue / 60.0) as u32 {
+        0 => (chroma, secondary, 0.0),
+        1 => (secondary, chroma, 0.0),
+        2 => (0.0, chroma, secondary),
+        3 => (0.0, secondary, chroma),
+        4 => (secondary, 0.0, chroma),
+        _ => (chroma, 0.0, secondary),
+    };
+    let lift = max - chroma;
+    // `as u8` on a float saturates rather than wrapping, so a rounding error
+    // that pushes a channel a hair over 1.0 lands on 255 rather than on 0.
+    Color32::from_rgba_premultiplied(
+        ((r1 + lift) * 255.0).round() as u8,
+        ((g1 + lift) * 255.0).round() as u8,
+        ((b1 + lift) * 255.0).round() as u8,
+        color.a(),
+    )
+}
+
 /// WCAG 2.1 relative luminance of an opaque sRGB colour.
 ///
 /// Spelled out rather than approximated with a brightness average, because the
@@ -275,8 +365,8 @@ impl ThemePalette for Palette {
 #[cfg(test)]
 mod tests {
     use super::{
-        contrast_ratio, readable, relative_luminance, Palette, DECORATION_CONTRAST, TEXT_CONTRAST,
-        WORDS_CONTRAST,
+        contrast_ratio, readable, relative_luminance, shift_hue, Palette, ThemeChoice,
+        DECORATION_CONTRAST, TEXT_CONTRAST, WORDS_CONTRAST,
     };
     use egui::Color32;
     use fastframe_theme::{Base, Palette as ThemePalette};
@@ -339,6 +429,76 @@ mod tests {
                 "{base:?}: on_accent over accent is {on_accent:.2}:1"
             );
         }
+    }
+
+    /// A full turn of the wheel is the colour it started as. The visualiser
+    /// spreads its gradient over a fraction of a turn, so an error here would
+    /// show as the wrong colours rather than as a crash — which is exactly the
+    /// kind of thing nobody notices for a year.
+    #[test]
+    fn a_full_rotation_is_the_colour_it_started_as() {
+        for color in [
+            Color32::from_rgb(0x9c, 0x8e, 0xee),
+            Color32::from_rgb(0xe0, 0x6c, 0x75),
+            Color32::from_rgb(0x00, 0xff, 0x00),
+        ] {
+            let turned = shift_hue(color, 360.0);
+            for (a, b) in [
+                (turned.r(), color.r()),
+                (turned.g(), color.g()),
+                (turned.b(), color.b()),
+            ] {
+                assert!(a.abs_diff(b) <= 1, "{color:?} became {turned:?}");
+            }
+        }
+    }
+
+    /// Rotating has to change the colour and keep its weight: a gradient whose
+    /// ends differ in brightness rather than in hue reads as a fade, not as
+    /// two colours.
+    #[test]
+    fn rotating_changes_the_hue_and_keeps_the_luminance_in_the_same_range() {
+        let accent = Color32::from_rgb(0x9c, 0x8e, 0xee);
+        let turned = shift_hue(accent, 80.0);
+        assert_ne!(turned, accent);
+        let before = relative_luminance(accent);
+        let after = relative_luminance(turned);
+        assert!(
+            (before - after).abs() < 0.35,
+            "luminance moved from {before:.3} to {after:.3}"
+        );
+    }
+
+    /// A monochrome theme has no hue to turn, and must not acquire one — the
+    /// visualiser would be the single coloured thing in a grey desktop.
+    #[test]
+    fn a_grey_has_no_hue_and_keeps_none() {
+        for grey in [
+            Color32::BLACK,
+            Color32::WHITE,
+            Color32::from_rgb(0x80, 0x80, 0x80),
+        ] {
+            assert_eq!(shift_hue(grey, 120.0), grey);
+        }
+    }
+
+    /// The setting is persisted, so every variant has to survive a round trip
+    /// through the settings file, and a named theme has to keep its name.
+    #[test]
+    fn a_theme_choice_survives_being_saved_and_read_back() {
+        for choice in [
+            ThemeChoice::System,
+            ThemeChoice::Dark,
+            ThemeChoice::Light,
+            ThemeChoice::Named("Nord.json".to_owned()),
+        ] {
+            let json = serde_json::to_string(&choice).expect("serialises");
+            let back: ThemeChoice = serde_json::from_str(&json).expect("deserialises");
+            assert_eq!(choice, back);
+            assert!(!back.label().is_empty());
+        }
+        assert_eq!(ThemeChoice::Named("Nord.json".to_owned()).label(), "Nord");
+        assert_eq!(ThemeChoice::default(), ThemeChoice::System);
     }
 
     /// A theme from the desktop is not held to anything, so the repair has to

@@ -289,6 +289,13 @@ pub struct App {
     pressure: Pressure,
     level_peak: f32,
     level_rms: f32,
+    /// The spectrum display. Fed from `SessionEvent::Level`, drawn by the
+    /// status bar and by compact mode.
+    visualizer: crate::visualizer::Visualizer,
+    /// A second one for the settings preview, which is fed a synthetic
+    /// spectrum. Separate so that previewing a style cannot disturb what the
+    /// real one is showing.
+    preview_visualizer: crate::visualizer::Visualizer,
     mic_track: bool,
     /// The microphone used for the optional second track. Separate from
     /// `sources`/`selected_source`, which is the source being transcribed.
@@ -331,6 +338,13 @@ pub struct App {
 
     // Navigation and per-pane transient state
     main_view: MainView,
+    /// Which group the settings pane is showing. Not persisted: a launch
+    /// should open on the first tab rather than wherever the last session
+    /// happened to leave it.
+    settings_tab: settings::Tab,
+    /// The theme choice the current palette was resolved from, so a change to
+    /// the setting is noticed without re-resolving it every frame.
+    theme_applied: Option<crate::theme::ThemeChoice>,
     /// Set while a deletion is awaiting confirmation.
     pending_delete: Option<PendingDelete>,
     /// A conversation and the offset to scroll to, set by clicking a search
@@ -459,6 +473,8 @@ impl App {
             pressure: Pressure::Keeping,
             level_peak: 0.0,
             level_rms: 0.0,
+            visualizer: crate::visualizer::Visualizer::default(),
+            preview_visualizer: crate::visualizer::Visualizer::default(),
             mic_track: false,
             mic_source: crate::env::default_microphone(),
             sources: Vec::new(),
@@ -480,6 +496,8 @@ impl App {
             conversation_tags: library.value.conversation_tags,
             history_segments: HashMap::new(),
             main_view: MainView::Live,
+            settings_tab: settings::Tab::default(),
+            theme_applied: None,
             pending_delete: None,
             pending_scroll: None,
             sidebar: sidebar::State::default(),

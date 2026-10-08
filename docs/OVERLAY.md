@@ -30,8 +30,23 @@ drawn in `dim`, which on a light palette measured 3:1 against the panel — belo
 WCAG AA for text, for the one audience this application has. Before anything
 has been said the strip reads "Waiting for speech…".
 
-Along the foot: the recording clock on the left, the **Restore** button on the
-right.
+Along the foot: a record button, the recording clock, the audio visualiser,
+and the **Restore** button on the right.
+
+The record button is the one control besides Restore, and it is a toggle —
+start, pause, resume. It pauses rather than stops because a toggle has to be
+reversible: pressing it twice has to leave one conversation with a gap in it,
+not two conversations. `Ctrl+.` still stops. It is filled with the accent
+colour while recording, so the strip answers "is this transcribing?" without
+anyone having to read the clock. It exists because reaching the transport from
+compact mode previously meant restoring the window, pressing a button and
+shrinking again — three actions and a window resize to stop transcribing a
+coffee break.
+
+The visualiser is the spectrum of the selected source, in whichever style is
+set under **Settings → Appearance**; `Off` is one of them. In a strip that is
+otherwise all text it is the quickest answer to "is this thing still hearing
+the call?" when the captions have not moved for twenty seconds.
 
 The size is the **transcript text size** setting, shared with the main
 window's live transcript rather than being compact mode's own. It ranges from

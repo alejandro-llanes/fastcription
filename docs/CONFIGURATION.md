@@ -6,7 +6,18 @@ one costs. For how to use the features these settings belong to, see
 
 ## 1. The Settings pane
 
-Controls in the order they appear. "Persists" means the value is written to
+`Ctrl+,` opens it and puts the transcript back. The pane is in five tabs,
+grouped by *when* a setting is touched rather than by what it configures:
+
+| Tab | What is in it |
+| --- | --- |
+| **Audio** | What to transcribe, and whether to capture your own voice too |
+| **Transcription** | The engine, model and language; speed; responsiveness |
+| **Server** | Running the model on another computer |
+| **Appearance** | Theme, audio visualiser, transcript size |
+| **System** | The voxtype service, importing, where the library is |
+
+Settings are listed below by tab. "Persists" means the value is written to
 `app.ron` (section 2) and restored at the next launch.
 
 ### Audio source
@@ -182,6 +193,64 @@ The Live pane carries the same slider, and `Ctrl+=` / `Ctrl+-` / `Ctrl+0` reach
 it from anywhere. A size restored from disk that is not a finite number falls
 back to 22 rather than reaching the font stack.
 
+### Theme
+
+| | |
+| --- | --- |
+| **Theme** | Where the palette comes from: **Follow the desktop**, **Dark**, **Light**, or any palette file in `~/.config/fastcription/themes/` by name. |
+| Default | Follow the desktop |
+| Persists | Yes |
+| Takes effect | Immediately |
+
+The full window and compact mode share one theme, because they are one window.
+Following the desktop is the default and the reason `fastframe-theme` was
+chosen: fastcription changes with Omarchy as you switch themes, with nothing to
+keep in sync. The fixed choices are for when that is not what you want from
+*this* app — compact mode sits over a video call for an hour, and a theme that
+is pleasant to work in is not always the right thing to read captions off.
+
+Whatever the source, any colour that carries words is lifted until it is
+readable against the panel behind it (WCAG AA, AAA for the transcript itself).
+A theme file named here that has since been deleted falls back to the
+desktop's rather than to nothing.
+
+### Audio visualiser
+
+| | |
+| --- | --- |
+| **Style** | **Bars**, **Mirrored**, **Waveform**, **Ribbons**, **Ring** or **Off**. |
+| Default | Bars |
+| Persists | Yes |
+| Takes effect | Immediately |
+
+| | |
+| --- | --- |
+| **Show it in the full window too** | Whether the status bar shows the visualiser instead of the percentage level meter. Compact mode always shows it. |
+| Default | On |
+| Persists | Yes |
+| Takes effect | Immediately |
+
+This is a real spectrum, not a shape drawn from the volume: the capture thread
+runs a 512-point transform over the newest 32 ms of audio twenty times a
+second and reports 24 log-spaced bands between 60 Hz and 8 kHz. That is why it
+is worth looking at — a voice moves its energy around constantly, so the
+display says *what* is being heard and not merely how loudly.
+
+The colours are the theme's. The two-tone gradient is the palette's own accent
+rotated around the colour wheel, so the visualiser belongs to whatever theme
+is active rather than being the one thing on screen that ignores it; a
+monochrome theme stays monochrome.
+
+The preview in this tab is fed a synthetic spectrum, because with nothing
+being recorded every style would otherwise look identical. It says so
+underneath. It is the only place in the app that draws audio nobody made.
+
+**Cost.** The transform is a few thousand multiplies twenty times a second,
+far less than the `pactl` read that delivered the samples, and the analyser
+allocates nothing per block. Drawing stops entirely once the display has
+decayed to silence, so an idle window is not held at 60 fps for a row of flat
+bars. `Off` skips both.
+
 ### voxtype service
 
 Not a setting: a status word (`not installed`, `running` or `stopped`) and
@@ -205,8 +274,8 @@ Some state persists without having a control of its own:
 - the chosen source, the microphone and the mic-track toggle, listed above
 
 And some state deliberately does not persist: the export format, options and
-destination, the search box, the group and tag filters, and the main pane you
-had open. Each starts fresh — an export destination suggested for one
+destination, the search box, the group and tag filters, the main pane you had
+open, and which Settings tab you were on. Each starts fresh — an export destination suggested for one
 conversation, left set, wrote the next transcript over the first one's file.
 
 ## 2. Files and directories

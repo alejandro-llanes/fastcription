@@ -197,10 +197,12 @@ owns the title while it is on, and none of these appear — see
 
 Along the foot of the window, and none of it is a control:
 
-- **The level meter** — peak level of the *selected* source as a percentage,
-  updated 20 times a second. Hovering says `Input level from <source>`, or
-  "No audio source is selected". It deliberately does not read your
-  microphone: the side you cannot hear is the one you need to see arriving.
+- **The audio visualiser** — the spectrum of the *selected* source, updated
+  20 times a second. Hovering says `Input level from <source>`, or "No audio
+  source is selected". It deliberately does not read your microphone: the side
+  you cannot hear is the one you need to see arriving. Turning the visualiser
+  off, or unticking "Show it in the full window too" under
+  **Settings → Appearance**, puts the old percentage bar back here.
 - **The clock** — `HH:MM:SS` of recording time, which stops while paused.
   Hovering says "How long this conversation has been recording".
 - **"transcription behind — words arrive late"** — appears only while
@@ -310,15 +312,28 @@ fullscreened meeting window.
 **To leave it:** the strip's own **Restore** button, `Esc`, or `Ctrl+M`
 again. The window goes back to the size it had.
 
-The strip shows the last four settled lines, then the line being spoken in
-italics, plus a small clock. Before anything has been said it reads "Waiting
-for speech…". Nothing in it is a control except Restore.
+The strip shows the last settled lines, then the line being spoken in
+italics. Before anything has been said it reads "Waiting for speech…".
+
+Along the foot of the strip:
+
+- **The record button**, on the left. One button that starts, pauses and
+  resumes: press it to stop transcribing, press it again to carry on. It is
+  filled with the accent colour while recording, so the strip also says
+  *whether* anything is being transcribed. It pauses rather than stops,
+  because a toggle has to be reversible — pressing it twice leaves one
+  conversation with a gap in it, not two conversations. `Ctrl+.` still stops.
+- **The clock**, `HH:MM:SS` of recording time.
+- **The audio visualiser**, in whatever style you chose under
+  **Settings → Appearance**. It is the quickest answer to "is this thing still
+  hearing the call?" when the captions have not moved for a while.
+- **Restore**, on the right.
 
 Compact mode answers every shortcut the full window does — the size keys and
 the transport keys — but all of them need keyboard focus, which the
 recommended compositor rule deliberately withholds so your meeting keeps it.
-Set the size before you enter compact mode, or use **Restore** and the full
-window's controls.
+That is why the record button is there: reaching the transport used to mean
+restoring the window, pressing a button and shrinking again.
 
 **Compact mode is the main window.** There is one window; hiding fastcription
 to the tray hides the captions with it. Stop compact mode before hiding, or
@@ -700,6 +715,7 @@ your captions.
 | `Ctrl+Space` | Pause while recording, resume while paused |
 | `Ctrl+.` | Stop |
 | `Ctrl+M` | Enter or leave compact mode |
+| `Ctrl+,` | Open Settings, or go back to the transcript |
 | `Esc` | Leave compact mode |
 | `Ctrl+=` or `Ctrl++` | Transcript text two points larger |
 | `Ctrl+-` | Transcript text two points smaller |

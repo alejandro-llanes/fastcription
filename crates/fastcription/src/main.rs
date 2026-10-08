@@ -9,6 +9,7 @@ mod i18n;
 mod icons;
 mod session;
 mod theme;
+mod visualizer;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

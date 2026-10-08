@@ -74,6 +74,8 @@ impl App {
         self.accumulated = Duration::ZERO;
         self.level_peak = 0.0;
         self.level_rms = 0.0;
+        // Sinks rather than cutting out; see `visualizer::IDLE_TAU`.
+        self.visualizer.idle();
         self.pressure = fc_core::Pressure::Keeping;
         self.provisional.clear();
         // The cached transcript of the conversation that just closed is short
@@ -396,10 +398,11 @@ impl App {
         }
         for event in batch {
             match event {
-                SessionEvent::Level { peak, rms } => {
+                SessionEvent::Level { peak, rms, bands } => {
                     if self.state == SessionState::Recording {
                         self.level_peak = peak;
                         self.level_rms = rms;
+                        self.visualizer.feed(bands);
                     }
                 }
                 SessionEvent::Provisional(segment) => {
