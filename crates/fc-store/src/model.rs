@@ -22,6 +22,17 @@ pub struct NewConversation {
     pub voxtype_meeting_id: Option<String>,
 }
 
+/// A word or expression to add to the registry. The lookup fields do not
+/// exist yet, which is why this is not `Word` minus its id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewWord {
+    pub expression: String,
+    pub context: String,
+    pub conversation: Option<ConversationId>,
+    pub start_ms: Option<u64>,
+    pub created_at: UnixMillis,
+}
+
 /// Criteria for `Store::list_conversations`. `None` on any field means "do not
 /// filter on this".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

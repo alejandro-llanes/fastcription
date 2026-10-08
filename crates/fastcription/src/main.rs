@@ -8,6 +8,7 @@ mod env;
 mod i18n;
 mod icons;
 mod logging;
+mod lookup;
 mod session;
 mod theme;
 mod ui;

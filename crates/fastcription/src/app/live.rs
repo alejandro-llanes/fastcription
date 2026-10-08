@@ -74,6 +74,9 @@ fn body(app: &mut App, ui: &mut egui::Ui) {
     }
 
     let pt = app.settings.transcript_pt;
+    // Collected inside the loop, applied after it: the loop borrows the
+    // segments, and opening the editor needs the app.
+    let mut add_word: Option<Segment> = None;
     egui::ScrollArea::vertical()
         .id_salt("live-transcript-scroll")
         .auto_shrink([false, false])
@@ -100,15 +103,23 @@ fn body(app: &mut App, ui: &mut egui::Ui) {
             }
             for segment in app.segments.iter().skip(hidden) {
                 let response = transcript::row(ui, &app.palette, segment, pt);
-                transcript::line_menu(&response, segment);
+                if transcript::line_menu(&response, segment).is_some() {
+                    add_word = Some(segment.clone());
+                }
             }
             let mut pending: Vec<&Segment> = app.provisional.values().collect();
             pending.sort_by_key(|segment| segment.seq);
             for segment in pending {
                 let response = transcript::row(ui, &app.palette, segment, pt);
-                transcript::line_menu(&response, segment);
+                if transcript::line_menu(&response, segment).is_some() {
+                    add_word = Some(segment.clone());
+                }
             }
         });
+    if let Some(segment) = add_word {
+        let conversation = app.live_conversation;
+        app.open_word_editor(&segment, conversation);
+    }
 }
 
 /// What has to be true before Start does anything, and how to make it true.

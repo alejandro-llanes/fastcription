@@ -61,7 +61,8 @@ fn migrates_from_empty() {
         .conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 1);
+    // One per migration: V1 the library, V2 the word registry.
+    assert_eq!(version, 2);
 
     let table_count: i64 = store
         .conn
@@ -96,7 +97,8 @@ fn reopen_is_idempotent() {
         .conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 1);
+    // One per migration: V1 the library, V2 the word registry.
+    assert_eq!(version, 2);
     let convs = store
         .list_conversations(&ConversationFilter::default())
         .unwrap();
@@ -951,5 +953,101 @@ fn a_read_only_library_refuses_writes_by_name() {
             err.to_string().contains("read-only"),
             "the message has to name the cause: {err}"
         );
+    }
+}
+
+mod words {
+    //! The registry: one entry per expression, lookups recorded, the link to
+    //! a deleted conversation dropped without dropping the word.
+
+    use super::open_temp;
+    use crate::NewWord;
+
+    fn new_word(expression: &str) -> NewWord {
+        NewWord {
+            expression: expression.to_owned(),
+            context: "We should table this for now.".to_owned(),
+            conversation: None,
+            start_ms: Some(1_500),
+            created_at: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn adding_the_same_expression_twice_lands_on_one_entry() {
+        let (_dir, store) = open_temp();
+        let first = store.add_word(&new_word("table this")).unwrap();
+        let again = store.add_word(&new_word("Table This")).unwrap();
+        assert_eq!(first, again, "capitalisation must not make a second entry");
+        assert_eq!(store.list_words().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_lookup_is_recorded_and_read_back() {
+        let (_dir, store) = open_temp();
+        let id = store.add_word(&new_word("ballpark figure")).unwrap();
+        assert!(!store.list_words().unwrap()[0].looked_up());
+        store
+            .set_word_lookup(
+                id,
+                Some("a rough estimate"),
+                Some("una cifra aproximada"),
+                None,
+            )
+            .unwrap();
+        let word = &store.list_words().unwrap()[0];
+        assert!(word.looked_up());
+        assert_eq!(word.meaning.as_deref(), Some("a rough estimate"));
+        assert_eq!(word.translation.as_deref(), Some("una cifra aproximada"));
+        assert_eq!(word.example, None);
+    }
+
+    #[test]
+    fn newest_first() {
+        let (_dir, store) = open_temp();
+        let mut older = new_word("older");
+        older.created_at = 1;
+        let mut newer = new_word("newer");
+        newer.created_at = 2;
+        store.add_word(&older).unwrap();
+        store.add_word(&newer).unwrap();
+        let listed: Vec<String> = store
+            .list_words()
+            .unwrap()
+            .into_iter()
+            .map(|w| w.expression)
+            .collect();
+        assert_eq!(listed, ["newer", "older"]);
+    }
+
+    #[test]
+    fn deleting_removes_it_and_a_missing_id_is_an_error() {
+        let (_dir, store) = open_temp();
+        let id = store.add_word(&new_word("circle back")).unwrap();
+        store.delete_word(id).unwrap();
+        assert!(store.list_words().unwrap().is_empty());
+        assert!(store.delete_word(id).is_err());
+    }
+
+    /// The word outlives the meeting it came from; only the link goes.
+    #[test]
+    fn deleting_the_conversation_keeps_the_word_and_drops_the_link() {
+        let (_dir, store) = open_temp();
+        let conversation = store
+            .create_conversation(&super::sample_conversation("meeting", 0))
+            .unwrap();
+        let mut word = new_word("boil the ocean");
+        word.conversation = Some(conversation);
+        let id = store.add_word(&word).unwrap();
+        // The store refuses to delete a conversation still being recorded,
+        // which is right and not what this test is about.
+        store
+            .finish_conversation(conversation, 100, fc_core::ConversationStatus::Completed)
+            .unwrap();
+        store.delete_conversation(conversation).unwrap();
+        let listed = store.list_words().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+        assert_eq!(listed[0].conversation, None);
     }
 }

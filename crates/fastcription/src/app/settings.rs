@@ -84,6 +84,20 @@ pub struct State {
     /// How much the app prints to its standard error. `RUST_LOG` overrides
     /// it for a run; see `logging.rs`.
     pub log_level: crate::logging::LogLevel,
+    /// The reader's own language, in English, for the word registry's
+    /// translations.
+    pub words_language: String,
+    /// The meaning server — Ollama — and the model on it. See `lookup.rs`.
+    pub lookup_endpoint: String,
+    pub lookup_model: String,
+    /// Keep the model loaded while the app runs, so a lookup never pays the
+    /// five seconds it takes Ollama to load it after a few idle minutes.
+    pub lookup_keep_warm: bool,
+    /// The result of the last meaning-server test, like `remote_probe`.
+    #[serde(skip)]
+    pub lookup_probe: Option<Result<String, String>>,
+    #[serde(skip)]
+    pub lookup_probe_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// Whether the full window shows the visualiser as well as compact mode.
     ///
     /// Separate from the style because the two places are used differently:
@@ -124,6 +138,12 @@ impl Default for State {
             compact_theme: None,
             visualizer_in_main: true,
             log_level: crate::logging::LogLevel::default(),
+            words_language: "Spanish".to_owned(),
+            lookup_endpoint: "http://127.0.0.1:11434".to_owned(),
+            lookup_model: "gemma3:4b".to_owned(),
+            lookup_keep_warm: true,
+            lookup_probe: None,
+            lookup_probe_rx: None,
             remote_probe: None,
             remote_probe_rx: None,
         }
@@ -165,15 +185,17 @@ pub enum Tab {
     Audio,
     Transcription,
     Server,
+    Words,
     Appearance,
     System,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [
+    pub const ALL: [Tab; 6] = [
         Tab::Audio,
         Tab::Transcription,
         Tab::Server,
+        Tab::Words,
         Tab::Appearance,
         Tab::System,
     ];
@@ -183,6 +205,7 @@ impl Tab {
             Tab::Audio => t("Audio"),
             Tab::Transcription => t("Transcription"),
             Tab::Server => t("Server"),
+            Tab::Words => t("Words"),
             Tab::Appearance => t("Appearance"),
             Tab::System => t("System"),
         }
@@ -218,6 +241,7 @@ fn body(app: &mut App, ui: &mut Ui) {
         Tab::Audio => audio(app, ui),
         Tab::Transcription => transcription(app, ui),
         Tab::Server => server(app, ui),
+        Tab::Words => words(app, ui),
         Tab::Appearance => appearance(app, ui),
         Tab::System => system(app, ui),
     }
@@ -567,6 +591,99 @@ fn server(app: &mut App, ui: &mut Ui) {
                 };
             });
         });
+    });
+}
+
+// ---------------------------------------------------------------- Words
+
+fn words(app: &mut App, ui: &mut Ui) {
+    let palette = app.palette.clone();
+
+    card(ui, &palette, t("Your language"), |ui| {
+        ui.horizontal(|ui| {
+            ui.label(t("Translate meanings into"));
+            ui.add(
+                egui::TextEdit::singleline(&mut app.settings.words_language)
+                    .desired_width(140.0)
+                    .hint_text("Spanish"),
+            );
+        });
+        hint(
+            ui,
+            &palette,
+            t(
+                "In English, as you would tell a person: Spanish, Portuguese, French. The \
+               English meaning is always shown beside the translation — a small model \
+               sometimes translates an idiom word for word, and the meaning is what \
+               catches it.",
+            ),
+        );
+    });
+
+    card(ui, &palette, t("Meaning server"), |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(t("Address"));
+            ui.add(
+                egui::TextEdit::singleline(&mut app.settings.lookup_endpoint)
+                    .desired_width(220.0)
+                    .hint_text("http://desktop.lan:11434"),
+            );
+            ui.label(t("Model"));
+            ui.add(
+                egui::TextEdit::singleline(&mut app.settings.lookup_model)
+                    .desired_width(130.0)
+                    .hint_text("gemma3:4b"),
+            );
+        });
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            let testing = app.settings.lookup_probe_rx.is_some();
+            if ui
+                .add_enabled(!testing, egui::Button::new(t("Test connection")))
+                .clicked()
+            {
+                app.probe_lookup_server();
+            }
+            if testing {
+                ui.add(egui::Spinner::new().size(14.0));
+                ui.label(
+                    RichText::new(t("asking the server…"))
+                        .small()
+                        .color(palette.secondary),
+                );
+            } else {
+                match &app.settings.lookup_probe {
+                    Some(Ok(text)) => ui.colored_label(palette.accent, text.clone()),
+                    Some(Err(text)) => ui.colored_label(palette.danger, text.clone()),
+                    None => ui.label(
+                        RichText::new(t("not tested"))
+                            .small()
+                            .color(palette.secondary),
+                    ),
+                };
+            }
+        });
+        hint(
+            ui,
+            &palette,
+            t(
+                "An Ollama server, usually the same machine as the transcription server. \
+               docs/SERVER.md covers installing it, pulling the model, and which model \
+               was fast and accurate enough on an RTX 5070.",
+            ),
+        );
+    });
+
+    card(ui, &palette, t("Keep it ready"), |ui| {
+        ui.checkbox(
+            &mut app.settings.lookup_keep_warm,
+            t("Keep the model loaded while fastcription is running"),
+        )
+        .on_hover_text(t(
+            "Ollama unloads a model after a few idle minutes, and loading it again costs \
+             about five seconds on the next lookup. This asks it to stay loaded, which \
+             holds a few gigabytes of the card's memory.",
+        ));
     });
 }
 

@@ -10,7 +10,7 @@ use crate::error::{Result, StoreError};
 
 /// Each entry is the SQL that takes the schema from `index` to `index + 1`.
 /// `user_version` after a fresh open equals `MIGRATIONS.len()`.
-const MIGRATIONS: &[&str] = &[V1_INITIAL];
+const MIGRATIONS: &[&str] = &[V1_INITIAL, V2_WORDS];
 
 const V1_INITIAL: &str = r#"
 CREATE TABLE conversations (
@@ -101,6 +101,31 @@ END;
 /// Applies any migration steps the database has not seen yet, inside one
 /// transaction per step so a crash mid-migration cannot leave `user_version`
 /// ahead of what was actually run.
+/// The word registry (architecture D18).
+///
+/// `conversation_id` is `ON DELETE SET NULL` rather than `CASCADE`: a word the
+/// reader did not know is still a word they did not know after the meeting
+/// it came from is deleted. It only loses the link back.
+const V2_WORDS: &str = r#"
+CREATE TABLE words (
+    id              INTEGER PRIMARY KEY,
+    expression      TEXT NOT NULL,
+    context         TEXT NOT NULL,
+    conversation_id INTEGER REFERENCES conversations(id) ON DELETE SET NULL,
+    start_ms        INTEGER,
+    meaning         TEXT,
+    translation     TEXT,
+    example         TEXT,
+    created_at      INTEGER NOT NULL
+);
+
+CREATE INDEX idx_words_created_at ON words(created_at);
+
+-- One entry per expression, however it was capitalised: "ballpark figure"
+-- added from two meetings is one thing the reader did not know, not two.
+CREATE UNIQUE INDEX idx_words_expression ON words(expression COLLATE NOCASE);
+"#;
+
 pub fn migrate(conn: &Connection) -> Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     let current = current as usize;

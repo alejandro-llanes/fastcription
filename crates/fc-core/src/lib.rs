@@ -11,10 +11,12 @@ pub mod ids;
 pub mod source;
 pub mod time;
 pub mod transcript;
+pub mod words;
 
-pub use ids::{ConversationId, GroupId, TagId};
+pub use ids::{ConversationId, GroupId, TagId, WordId};
 pub use source::{AudioSource, SourceKind};
 pub use transcript::{single_line, Segment, Track};
+pub use words::Word;
 
 /// Milliseconds since the Unix epoch. The app stores every instant this way:
 /// SQLite has no date type, and a single integer sorts, compares and exports

@@ -38,3 +38,4 @@ macro_rules! row_id {
 row_id!(ConversationId, "conversation");
 row_id!(GroupId, "group");
 row_id!(TagId, "tag");
+row_id!(WordId, "word or expression in the registry");

@@ -216,13 +216,27 @@ const COPY_OPTIONS: fc_export::ExportOptions = fc_export::ExportOptions {
 ///
 /// Hung off the row's own response, which is why [`row`] returns it: a reader
 /// following a meeting wants the sentence they just read, not the transcript.
-pub fn line_menu(response: &Response, segment: &Segment) {
+pub fn line_menu(response: &Response, segment: &Segment) -> Option<LineAction> {
+    let mut action = None;
     response.context_menu(|ui| {
+        if ui.button(t("Add to my words\u{2026}")).clicked() {
+            action = Some(LineAction::AddWord);
+            ui.close();
+        }
         if ui.button(t("Copy line")).clicked() {
             ui.ctx().copy_text(line_text(segment));
             ui.close();
         }
     });
+    action
+}
+
+/// What a line's menu asked for. Returned rather than done, because the
+/// menu is drawn inside a loop that borrows the app's segments and the
+/// registry needs the app mutably.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LineAction {
+    AddWord,
 }
 
 /// The Copy and Copy as Markdown buttons a pane header carries.

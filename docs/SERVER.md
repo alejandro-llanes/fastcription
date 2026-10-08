@@ -501,6 +501,46 @@ uploads a larger recording than the one before it.
 | `use gpu = 1` in the log, but still slow | That line is the request, not the result. Read on for `backends = 2` and `CUDA0 total size`; `backends = 1` and `CPU total size` mean it is on the CPU. |
 | Everything is on the GPU and it is still behind | Confirm with `nvidia-smi` that the model is resident, then try `large-v3-turbo` if you are on `large-v3`, or raise **seconds between passes**. |
 
+## The meaning server
+
+The word registry (USER_GUIDE.md §11a) asks a language model what an
+expression means in the line it was said in, and for its translation. That
+is a second server, Ollama, on the same machine: it needs a few gigabytes of
+the card beside whisper and answers in well under a second.
+
+```sh
+sudo pacman -S ollama-cuda
+sudo systemctl enable --now ollama
+ollama pull gemma3:4b
+```
+
+Ollama listens on `127.0.0.1:11434` by default. To reach it from the laptop,
+have it listen on every interface — `Environment="OLLAMA_HOST=0.0.0.0"` in a
+drop-in for the unit (`systemctl edit ollama`) — and open port 11434 the way
+section 6 opens 8080. Then **Settings → Words → Address** is
+`http://desktop.lan:11434`, and **Test connection** says whether the model is
+pulled.
+
+### Which model
+
+Measured on the RTX 5070 with whisper-server resident at 2.1 GB, using the
+exact request the registry sends:
+
+| model | VRAM beside whisper | lookup | tok/s | the Spanish |
+| --- | --- | --- | --- | --- |
+| qwen2.5:1.5b | 3.4 GB total | 0.19 s | 304 | "boil the ocean" → *hervir el mar* (literal, meaningless); examples came back in Spanish despite being asked for English |
+| qwen2.5:3b | 4.4 GB total | 0.20 s | 205 | "ballpark figure" → *figure de aproximadamente*; "table this" → *tablear la discusión*. Broken |
+| **gemma3:4b** | **6.0 GB total** | **0.41 s** | 142 | "boil the ocean" → *intentar hacer demasiado a la vez*; "ballpark figure" → *estimación aproximada*. Clean JSON every time |
+
+All three ran entirely on the GPU. The two faster models would actively
+mislead a reader, which is the opposite of the feature's purpose; `gemma3:4b`
+is the default. Its one miss in the test — "table this" → *poner esto en la
+mesa*, a false friend — is why the registry always shows the English meaning
+beside the translation (it said *postpone*) and why both are editable.
+
+Cold start is about five seconds, which is why the app asks Ollama to keep the
+model loaded while it runs (**Settings → Words → Keep it ready**).
+
 ## Other servers
 
 Anything implementing the OpenAI transcription endpoint works; fastcription

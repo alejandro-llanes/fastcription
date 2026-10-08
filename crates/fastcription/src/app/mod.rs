@@ -16,6 +16,7 @@ mod session_control;
 mod settings;
 mod sidebar;
 mod transcript;
+mod words;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -52,6 +53,8 @@ use crate::i18n::t;
 pub enum MainView {
     Live,
     History(ConversationId),
+    /// The word registry.
+    Words,
     Settings,
 }
 
@@ -75,6 +78,7 @@ pub enum PendingDelete {
     Conversation(ConversationId),
     Group(GroupId),
     Tag(TagId),
+    Word(fc_core::WordId),
 }
 
 /// A rename or deletion of a group or a tag, applied by `App::edit_label`.
@@ -347,6 +351,8 @@ pub struct App {
     theme_applied: Option<crate::theme::ThemeChoice>,
     /// The log level last handed to the subscriber, for the same reason.
     log_applied: Option<crate::logging::LogLevel>,
+    /// The word registry, as loaded from the store; see `words.rs`.
+    words: words::State,
     /// Set while a deletion is awaiting confirmation.
     pending_delete: Option<PendingDelete>,
     /// A conversation and the offset to scroll to, set by clicking a search
@@ -501,6 +507,7 @@ impl App {
             settings_tab: settings::Tab::default(),
             theme_applied: None,
             log_applied: None,
+            words: words::State::default(),
             pending_delete: None,
             pending_scroll: None,
             sidebar: sidebar::State::default(),

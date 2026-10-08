@@ -255,6 +255,7 @@ impl App {
                 self.pending_delete = None;
                 match what {
                     PendingDelete::Conversation(id) => self.delete_conversation(id),
+                    PendingDelete::Word(id) => self.delete_word(id),
                     PendingDelete::Group(id) => self.edit_label(LabelEdit::DeleteGroup(id)),
                     PendingDelete::Tag(id) => self.edit_label(LabelEdit::DeleteTag(id)),
                 }
@@ -283,6 +284,20 @@ impl App {
                     t("Delete conversation"),
                     format!("{} {}?", t("Permanently delete"), quoted(name)),
                     t("The transcript cannot be recovered."),
+                )
+            }
+            PendingDelete::Word(id) => {
+                let expression = self
+                    .words
+                    .list
+                    .iter()
+                    .find(|w| w.id == id)
+                    .map(|w| w.expression.clone())
+                    .unwrap_or_default();
+                (
+                    t("Delete word?"),
+                    tf("Delete \u{201c}{}\u{201d} from your words?", &[&expression]),
+                    t("Its meaning and translation go with it."),
                 )
             }
             PendingDelete::Group(id) => {

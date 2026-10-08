@@ -39,6 +39,9 @@ dirs = "7"
 time = { version = "0.3", features = ["formatting", "parsing", "macros", "local-offset"] }
 tempfile = "3"
 toml = "0.9"
+# No TLS: the meaning server is on the user's own network, like the
+# transcription server, and the TLS stack is most of the crate.
+ureq = { version = "2", default-features = false }
 
 [profile.release]
 opt-level = 3

@@ -612,6 +612,48 @@ transcript to export."
 
 Lines that hold nothing that was said are skipped by every format.
 
+## 11a. My words
+
+The transcript gets you through the meeting. What you are still missing
+afterwards is the three or four expressions in it you had never met, and this
+is where they go — with the line they were said in, so the meaning can be
+looked up *in context*. "Table this" means nothing until you know it was said
+about a decision.
+
+**Adding one.** Right-click any line of a transcript, live or in the library,
+and choose **Add to my words…**; or press `Ctrl+D` for the newest settled
+line, which during a meeting is the one you just did not understand. A small
+window shows the line as word chips: tap the words of the expression, in any
+order, and they are joined in the order they were said with the clinging
+punctuation dropped ("ocean," is the word "ocean"). Or type it. The expression
+field has focus when the window opens, so the whole thing is `Ctrl+D`, type,
+`Enter` — nothing to click, and you are back to reading.
+
+**Add and look up** sends the expression and its line to the meaning server
+and fills in three things when it answers, usually in under half a second: a
+short **English meaning as used in that line**, the expression in **your
+language**, and one **example sentence**. **Add** stores it without asking;
+the registry shows "Not looked up yet" and a **Look up** button, and a **Look
+up N missing** button at the top catches up on all of them after a meeting.
+
+**The registry** is the **Words** view in the top bar. Newest first; each
+entry shows the expression and its translation on one line, the English
+meaning under them, the example, and the line it came from with a link back
+to that point in the conversation. **Edit** opens the four fields in place —
+the model is small and sometimes translates an idiom word for word, which is
+exactly why the English meaning is shown beside it and why both are yours to
+correct. **Delete** asks first. The search box matches the expression, the
+translation and the meaning.
+
+An expression added twice, from two meetings, is one entry: the second add
+lands on the first, and keeps its lookup. Deleting a conversation keeps its
+words and only drops the link back.
+
+**Setting it up** takes an Ollama server, usually the same machine as the
+transcription server; [SERVER.md](SERVER.md) covers installing it and which
+model to pull, and **Settings → Words** is where the address, the model and
+your language go.
+
 ## 12. Importing past voxtype meetings
 
 **Settings → Import → Import past voxtype meetings** copies meetings recorded
@@ -759,6 +801,7 @@ your captions.
 | `Ctrl+.` | Stop |
 | `Ctrl+M` | Enter or leave compact mode |
 | `Ctrl+,` | Open Settings, or go back to the transcript |
+| `Ctrl+D` | Add a word or expression from the newest transcript line |
 | `Esc` | Leave compact mode |
 | `Ctrl+=` or `Ctrl++` | Transcript text two points larger |
 | `Ctrl+-` | Transcript text two points smaller |

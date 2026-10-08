@@ -15,6 +15,7 @@ mod queries {
     pub mod search;
     pub mod segments;
     pub mod tags;
+    pub mod words;
 }
 
 use std::path::Path;
@@ -22,7 +23,7 @@ use std::path::Path;
 use rusqlite::{Connection, OpenFlags};
 
 pub use error::{Result, StoreError};
-pub use model::{ConversationFilter, ConversationSummary, NewConversation, SearchHit};
+pub use model::{ConversationFilter, ConversationSummary, NewConversation, NewWord, SearchHit};
 
 /// Handle to the fastcription library database: one rusqlite `Connection`
 /// plus the pragmas and migrations needed to make it safe to use.

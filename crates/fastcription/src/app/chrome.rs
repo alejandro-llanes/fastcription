@@ -128,6 +128,8 @@ impl App {
         self.update_search(&ctx);
         self.poll_theme(&ctx);
         self.poll_log_level();
+        self.poll_words();
+        self.poll_lookup_probe();
         self.drain_tray(&ctx, false);
         // A second launch asked for this window rather than starting another
         // copy of the app.
@@ -149,6 +151,7 @@ impl App {
         }
 
         self.delete_confirmation(&ctx);
+        super::words::editor_window(self, &ctx);
 
         egui::Panel::top("top-bar")
             .frame(crate::ui::bar(&self.palette, true))
@@ -188,6 +191,7 @@ impl App {
             .show(ui, |ui| match self.main_view {
                 MainView::Live => super::live::show(self, ui),
                 MainView::History(id) => super::history::show(self, ui, id),
+                MainView::Words => super::words::show(self, ui),
                 MainView::Settings => super::settings::show(self, ui),
             });
     }
@@ -242,8 +246,19 @@ impl App {
         // No focus check: Wayland only delivers a key to the focused surface,
         // so a key event already proves focus, and the extra condition only
         // ever lost an Escape.
-        if self.compact && ctx.input(|i| i.key_pressed(Key::Escape)) {
+        // Not while the add-a-word window is up: that window takes Escape
+        // for itself, and leaving compact mode underneath it would be two
+        // things happening for one key.
+        if self.compact && self.words.editor.is_none() && ctx.input(|i| i.key_pressed(Key::Escape))
+        {
             self.set_compact(ctx, false);
+        }
+
+        // The newest line, straight into the registry: during a meeting nobody
+        // has a hand free for a right-click, and the expression that was just
+        // said is the one that was not understood.
+        if shortcut(Modifiers::CTRL, Key::D) {
+            self.open_word_editor_for_latest();
         }
 
         // Settings was reachable only by its button in the top bar, which is
@@ -722,14 +737,21 @@ impl App {
                 }
                 // Right-to-left, so this is added after the button it sits to
                 // the left of.
-                let chosen = usize::from(self.main_view == MainView::Settings);
-                if let Some(index) =
-                    ui::segmented(ui, &palette, &[t("Live"), t("Settings")], chosen)
-                {
-                    self.main_view = if index == 0 {
-                        MainView::Live
-                    } else {
-                        MainView::Settings
+                let chosen = match self.main_view {
+                    MainView::Words => 1,
+                    MainView::Settings => 2,
+                    MainView::Live | MainView::History(_) => 0,
+                };
+                if let Some(index) = ui::segmented(
+                    ui,
+                    &palette,
+                    &[t("Live"), t("Words"), t("Settings")],
+                    chosen,
+                ) {
+                    self.main_view = match index {
+                        1 => MainView::Words,
+                        2 => MainView::Settings,
+                        _ => MainView::Live,
                     };
                 }
             });

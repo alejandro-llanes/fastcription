@@ -14,6 +14,7 @@ grouped by *when* a setting is touched rather than by what it configures:
 | **Audio** | What to transcribe, and whether to capture your own voice too |
 | **Transcription** | The engine, model and language; speed; responsiveness |
 | **Server** | Running the model on another computer |
+| **Words** | Your language, and the meaning server the word registry asks |
 | **Appearance** | Theme, audio visualiser, transcript size |
 | **System** | The voxtype service, importing, logging, where the library is |
 
@@ -193,6 +194,36 @@ The Live pane carries the same slider, and `Ctrl+=` / `Ctrl+-` / `Ctrl+0` reach
 it from anywhere. A size restored from disk that is not a finite number falls
 back to 22 rather than reaching the font stack.
 
+### Words
+
+| | |
+| --- | --- |
+| **Translate meanings into** | Your language, in English: `Spanish`, `Portuguese`, `French`. |
+| Default | Spanish |
+| Persists | Yes |
+
+| | |
+| --- | --- |
+| **Address** | The Ollama server, `http://host:11434`. Plain `http`; it is on your own network like the transcription server. |
+| Default | `http://127.0.0.1:11434` |
+| **Model** | An Ollama model tag. |
+| Default | `gemma3:4b` |
+| **Keep the model loaded while fastcription is running** | Asks Ollama to keep the model in memory. Off, Ollama unloads it after a few idle minutes and the next lookup pays about five seconds to load it. |
+| Default | On |
+| Persists | Yes, all of them |
+
+**Test connection** asks the server for its model list and says whether the
+chosen model is pulled, with the `ollama pull` command when it is not.
+
+The lookup goes to Ollama's native `/api/chat`, not its OpenAI-compatible
+endpoint, for two things only the native one has: `format: "json"`, which
+makes the model emit valid JSON rather than JSON wrapped in prose, and
+`keep_alive`. One request carries the expression, the transcript line it was
+said in, and your language; the answer is the three fields the registry
+shows. The English meaning is asked for on purpose: a small model's
+translation of an idiom is sometimes literal, and the meaning beside it is
+what lets you catch that.
+
 ### Theme
 
 | | |
@@ -350,6 +381,11 @@ All paths assume the usual XDG defaults; `XDG_DATA_HOME` and `XDG_CONFIG_HOME`
 are honoured where they are set.
 
 ### `~/.local/share/fastcription/library.db`
+
+Schema version 2 adds the `words` table — the word registry — with
+`conversation_id ON DELETE SET NULL`, so deleting a conversation keeps its
+words and drops only the link back, and a case-insensitive unique index on the
+expression, so one expression is one entry however it was capitalised.
 
 The conversation library: a SQLite database, in WAL mode, with foreign keys on.
 You will see `library.db-wal` and `library.db-shm` beside it — that is normal.
