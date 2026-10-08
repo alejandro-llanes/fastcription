@@ -8,8 +8,9 @@ request.
 
 The short version, for someone who already has a GPU box:
 
-1. Install whisper.cpp **with a CUDA backend** — on Arch that is two
-   packages, not a build.
+0. Check whether this machine's own GPU can do it — `voxtype setup gpu --enable`.
+1. On the server: install whisper.cpp **with a CUDA backend** — on Arch that is
+   two packages, not a build.
 2. Download `large-v3-turbo`.
 3. Run `whisper-server` with `--inference-path /v1/audio/transcriptions`.
 4. Reach it over Tailscale, or open the port on your LAN.
@@ -17,6 +18,67 @@ The short version, for someone who already has a GPU box:
    on another computer**, enter the address, press **Test connection**.
 
 Each step is below.
+
+## First: does *this* machine have a GPU?
+
+If it does, you may not need a server at all. voxtype ships prebuilt variants
+and switches between them itself:
+
+```sh
+voxtype setup gpu --status     # what is active, and what is available
+voxtype setup gpu --enable     # switch to the best backend it finds
+```
+
+`--status` reports the GPUs it can see and which variants are installed, and is
+worth reading before anything else:
+
+```
+Active backend: CPU (AVX2) (daemon pid 2800853)
+Available backends:
+  CPU (AVX2) - active
+  CPU (AVX-512) - installed
+  GPU (Vulkan) - installed
+Vulkan runtime: installed
+```
+
+A machine can sit on the CPU variant with the GPU one already installed, which
+is the state fastcription's readiness checklist warns about.
+
+**voxtype's Whisper engine accelerates through Vulkan**, not CUDA — CUDA and
+MIGraphX are for its Parakeet engine. So the packages in step 2 below do
+nothing for voxtype's *local* transcription; they are for the server. This has
+not been measured here, but Vulkan is generally behind CUDA on whisper.cpp and
+far ahead of any CPU.
+
+**With more than one GPU, check which one it took.** Selection is "auto (first
+available)", and on a desktop with onboard graphics the integrated GPU is
+usually enumerated first — accelerated, and still slow. Pin it:
+
+```sh
+VOXTYPE_VULKAN_DEVICE=nvidia   # or amd, or intel
+```
+
+For the systemd unit, `~/.config/systemd/user/voxtype.service.d/gpu.conf`:
+
+```ini
+[Service]
+Environment="VOXTYPE_VULKAN_DEVICE=nvidia"
+```
+
+Either way, `voxtype info accel` is the confirmation:
+
+```
+Acceleration
+  State:    cpu-only
+  Backend:  (none in play)
+  Variant:  avx2
+```
+
+fastcription reads that same backend from `voxtype status` and shows it in
+**Settings → Acceleration**.
+
+The rest of this document is for the other case: the machine running
+fastcription has no usable GPU, and another machine does.
 
 ## The protocol
 

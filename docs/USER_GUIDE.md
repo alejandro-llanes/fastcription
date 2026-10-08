@@ -61,8 +61,9 @@ catalogue and voxtype's own configured defaults are read by subprocesses on a
 background thread and fill in a moment later.
 
 With nothing recorded yet, the **Live** pane is a readiness checklist instead
-of an empty transcript. There are exactly four checks, in the order you would
-fix them.
+of an empty transcript. Four checks say whether a recording can start, in the
+order you would fix them, and a fifth says whether it will be fast enough to
+read along with.
 
 | Check | Met shows | Unmet shows |
 | --- | --- | --- |
@@ -70,6 +71,7 @@ fix them.
 | **model** | `base.en · 3 installed`, or `base.en (voxtype did not list its models)` | "No transcription model is installed. Run `voxtype setup model` to download one." |
 | **audio sources** | `12 to choose from` | "No sound server answered, so there is nothing to record from. Check that PipeWire or PulseAudio is running." |
 | **library** | the path to `library.db` | "The conversation library at … could not be opened, so recording is disabled.", or "The conversation library at … will not accept writes, so nothing can be recorded. Past transcripts are still readable and exportable." |
+| **speed** | the backend, e.g. `GPU (Vulkan)` | "voxtype is transcribing on this machine's CPU, which cannot keep up with speech — the captions will fall behind and keep falling. Turn on GPU acceleration, or send the audio to a machine that has a GPU (Settings → Transcription server)." |
 
 Each unmet row carries a button so you do not have to retype anything:
 
@@ -77,6 +79,7 @@ Each unmet row carries a button so you do not have to retype anything:
 - **Copy command** on the model row copies `voxtype setup model`
 - **Copy command** on the audio row copies `systemctl --user status pipewire wireplumber`
 - **Copy path** on the library row copies the path to the library file
+- **Copy command** on the speed row copies `voxtype setup gpu --enable`
 
 The model check passes on a name typed into Settings even when
 `voxtype info models` could not be read, because transcription works perfectly
@@ -88,9 +91,25 @@ Those two answers come from subprocesses: for the first fraction of a second
 of a launch both lists are genuinely empty, and calling that "no sound server"
 would be a complaint that corrects itself.
 
-When all four pass, the checklist collapses to one line:
+**The speed check is a warning, not a requirement.** Recording works on the
+CPU and the transcript is correct; it is the *latency* that fails, and with it
+the only thing this application is for. On one desktop a 7-second window of
+speech took 85 ms to encode on a GPU and 2.8 seconds on 24 CPU threads, against
+a budget of about a second per pass — so the captions arrive after the
+conversation has moved on, and the gap grows for as long as the meeting lasts.
+`docs/SERVER.md` covers both remedies.
+
+It is skipped in two cases, because this machine's backend then says nothing
+about the latency: when a transcription server is configured, since the model
+runs there; and when voxtype reported no backend at all, which is what happens
+while its daemon is not running.
+
+When the four requirements pass, the checklist collapses to one line:
 
 > Ready — choose a source and press Start (Ctrl+R)
+
+A speed warning does not hold the checklist open — it appears underneath that
+line, so "Ready" never hides the fact that the captions will not keep up.
 
 ## 4. Choosing what to transcribe
 

@@ -112,40 +112,63 @@ fn checklist(app: &App, ui: &mut egui::Ui) {
             ui.add(Icon::StatusOk.image(app.palette.accent, 16.0));
             ui.label(t("Ready — choose a source and press Start (Ctrl+R)"));
         });
+        // Ready is not the same as fast. An advisory is no reason to withhold
+        // the line above or to hold the whole checklist open, but this is the
+        // only place it is written down, and a reader who starts a meeting not
+        // knowing the captions cannot keep up has been failed quietly.
+        for check in checks
+            .iter()
+            .filter(|check| check.status == readiness::Status::Advisory)
+        {
+            ui.add_space(6.0);
+            row(app, ui, check);
+        }
         return;
     }
 
     ui.label(RichText::new(t("Before a conversation can be transcribed:")).strong());
     ui.add_space(6.0);
-    for check in checks {
-        ui.horizontal_wrapped(|ui| {
-            let color = match check.status {
-                readiness::Status::Met => app.palette.accent,
-                readiness::Status::Unmet => app.palette.warning,
-                readiness::Status::Waiting => app.palette.secondary,
-            };
-            match check.status {
-                readiness::Status::Met => {
-                    ui.add(Icon::StatusOk.image(color, 14.0));
-                }
-                readiness::Status::Unmet => {
-                    ui.add(Icon::StatusWarn.image(color, 14.0));
-                }
-                // No third icon: a spinner says "still looking" better than any
-                // glyph, and a warning triangle for a probe that has not
-                // answered yet would be a problem the app invented.
-                readiness::Status::Waiting => {
-                    ui.add(egui::Spinner::new().size(14.0));
-                }
-            }
-            ui.label(RichText::new(check.label).strong().color(app.palette.text));
-            ui.label(RichText::new(&check.detail).color(color));
-            if let Some(fix) = &check.fix {
-                if ui.small_button(fix.button).clicked() {
-                    ui.ctx().copy_text(fix.text.clone());
-                }
-            }
-        });
+    for check in &checks {
+        row(app, ui, check);
         ui.add_space(4.0);
     }
+}
+
+/// One line of the checklist: how it stands, what it is, what was found, and
+/// the remedy on a button.
+fn row(app: &App, ui: &mut egui::Ui, check: &readiness::Check) {
+    use crate::icons::Icon;
+
+    ui.horizontal_wrapped(|ui| {
+        let color = match check.status {
+            readiness::Status::Met => app.palette.accent,
+            // An advisory is drawn exactly like an unmet requirement. It is
+            // not one — recording works — but the thing it warns about makes
+            // the application useless for its purpose, so it does not get to
+            // look like a footnote.
+            readiness::Status::Unmet | readiness::Status::Advisory => app.palette.warning,
+            readiness::Status::Waiting => app.palette.secondary,
+        };
+        match check.status {
+            readiness::Status::Met => {
+                ui.add(Icon::StatusOk.image(color, 14.0));
+            }
+            readiness::Status::Unmet | readiness::Status::Advisory => {
+                ui.add(Icon::StatusWarn.image(color, 14.0));
+            }
+            // No third icon: a spinner says "still looking" better than any
+            // glyph, and a warning triangle for a probe that has not
+            // answered yet would be a problem the app invented.
+            readiness::Status::Waiting => {
+                ui.add(egui::Spinner::new().size(14.0));
+            }
+        }
+        ui.label(RichText::new(check.label).strong().color(app.palette.text));
+        ui.label(RichText::new(&check.detail).color(color));
+        if let Some(fix) = &check.fix {
+            if ui.small_button(fix.button).clicked() {
+                ui.ctx().copy_text(fix.text.clone());
+            }
+        }
+    });
 }
