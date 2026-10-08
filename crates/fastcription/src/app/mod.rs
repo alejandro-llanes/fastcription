@@ -478,19 +478,37 @@ impl App {
             }
         };
 
+        // Written per session so the engine always runs with what the settings
+        // pane currently says, including the optimisation realtime depends on.
+        let voxtype_config = match crate::env::write_private_config(
+            &self.settings.model,
+            &self.settings.language,
+            self.settings.threads,
+            self.settings.fast_mode,
+        ) {
+            Ok(path) => Some(path),
+            Err(err) => {
+                self.raise(format!(
+                    "Could not write fastcription's voxtype settings, so transcription \
+                     would be too slow to follow live: {err}"
+                ));
+                return;
+            }
+        };
+
         let config = SessionConfig {
             title: default_title(),
             group: None,
             source,
             mic_source: self.mic_track.then(|| self.mic_source.clone()),
-            segmenter: self.segmenter_config(),
+            stream: self.stream_config(),
             engine: self.chosen_engine(),
         };
 
         match Session::start(
             store,
             config,
-            self.transcriber_factory(),
+            self.transcriber_factory(voxtype_config),
             &self.captures,
             now_millis(),
         ) {
@@ -537,37 +555,31 @@ impl App {
 
     /// Builds the per-track transcriber.
     ///
-    /// Engine, model and language are passed as voxtype's global options, which
-    /// is what decision D6 allows: fastcription never writes the user's
-    /// `config.toml`, it only overrides per invocation. The fields were seeded
-    /// from that same config at startup, so an untouched settings pane
-    /// reproduces voxtype's own behaviour.
-    fn transcriber_factory(&self) -> session::TranscriberFactory {
+    /// Everything voxtype needs is in fastcription's own config file, so the
+    /// only argument is `-c`. Decision D6 still holds: the user's
+    /// `config.toml` is read for defaults and never written. Keeping one
+    /// source of truth matters here, because splitting model and language
+    /// across command-line flags while the optimisation realtime depends on
+    /// lives in a file is how the two drift apart.
+    fn transcriber_factory(&self, config: Option<PathBuf>) -> session::TranscriberFactory {
         let binary = self.voxtype.clone();
         let engine = self.settings.engine.clone();
-        let model = self.settings.model.clone();
-        let language = self.settings.language.clone();
-        let threads = self.settings.threads;
-        let translate = self.settings.translate;
+        // Passed explicitly even though the config file also carries it: the
+        // adapter supplies a thread count of its own by default, and a command
+        // line that disagrees with the config would silently win.
+        let threads = self.settings.threads.max(1);
         Box::new(move |_track| {
-            let mut cli = fc_asr::VoxtypeCli::new();
+            let mut cli = fc_asr::VoxtypeCli::new().with_threads(threads);
             if let Some(path) = &binary {
                 cli = cli.with_binary(path.display().to_string());
             }
+            if let Some(path) = &config {
+                cli = cli.with_config(path.clone());
+            }
+            // The engine is the one knob with no equivalent in the config file
+            // fastcription writes, which only configures whisper.
             if !engine.trim().is_empty() {
                 cli = cli.with_engine(engine.clone());
-            }
-            if !model.trim().is_empty() {
-                cli = cli.with_model(model.clone());
-            }
-            if !language.trim().is_empty() {
-                cli = cli.with_language(language.clone());
-            }
-            if threads > 0 {
-                cli = cli.with_threads(threads);
-            }
-            if translate {
-                cli = cli.with_translate(true);
             }
             Box::new(cli)
         })
@@ -578,16 +590,14 @@ impl App {
         crate::env::microphones(&self.sources)
     }
 
-    fn segmenter_config(&self) -> fc_asr::SegmenterConfig {
-        let defaults = fc_asr::SegmenterConfig::default();
-        let target_ms = (self.settings.chunk_target_secs.max(1.0) * 1_000.0) as u64;
-        let max_chunk_ms = (self.settings.chunk_max_secs.max(2.0) * 1_000.0) as u64;
-        fc_asr::SegmenterConfig {
-            // The ladder's first rung is the target the user set; the rest grow
-            // from it so backpressure still has somewhere to go.
-            growth_ladder_ms: vec![target_ms, target_ms * 3 / 2, max_chunk_ms.max(target_ms)],
-            max_chunk_ms: max_chunk_ms.max(target_ms),
-            ..defaults
+    /// How the stream is tuned, from the settings pane.
+    fn stream_config(&self) -> fc_asr::StreamConfig {
+        fc_asr::StreamConfig {
+            step: Duration::from_secs_f32(self.settings.refresh_secs.clamp(0.3, 5.0)),
+            max_utterance: Duration::from_secs_f32(
+                self.settings.max_utterance_secs.clamp(4.0, 22.0),
+            ),
+            ..Default::default()
         }
     }
 

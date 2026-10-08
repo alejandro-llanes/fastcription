@@ -1,24 +1,22 @@
-//! Chunking and transcription for fastcription's realtime path.
+//! Realtime transcription for fastcription's live view.
 //!
-//! voxtype has no live transcript feed (ARCHITECTURE.md §1), so this crate is
-//! what turns a continuous stream of 16 kHz mono f32 PCM into committed
-//! [`fc_core::Segment`]s: [`segmenter`] decides when a stretch of audio is
-//! "enough" to send off, [`voxtype_cli`] runs `voxtype -q transcribe` on it
-//! once per chunk, and [`dedup`] reconciles the half-second of audio that two
-//! consecutive chunks share. [`transcriber`] is the seam between the two
-//! halves, kept narrow enough that a future live-feed transcriber
-//! (ARCHITECTURE.md §8) can replace `voxtype_cli` without the segmenter
-//! noticing.
+//! voxtype has no live transcript feed (ARCHITECTURE.md §1), so this crate
+//! turns a continuous stream of 16 kHz mono f32 PCM into text while a
+//! conversation is still happening: [`stream`] re-transcribes the current
+//! silence-anchored utterance on every `step` and commits whatever two
+//! consecutive passes agree on (LocalAgreement-2); [`voxtype_cli`] is what
+//! actually runs `voxtype -q transcribe` for each pass. [`transcriber`] is
+//! the seam between the two, kept narrow enough that a future live-feed
+//! transcriber (ARCHITECTURE.md §8) can replace `voxtype_cli` without
+//! `stream` noticing.
 //!
-//! Nothing here drops audio under load: see `Segmenter::grow_target` for how
-//! backpressure is handled instead.
+//! Nothing here drops audio under load: a transcriber slower than `step`
+//! lengthens the effective step instead (see [`stream::Update::lagging`]).
 
-pub mod dedup;
-pub mod segmenter;
+pub mod stream;
 pub mod transcriber;
 pub mod voxtype_cli;
 
-pub use dedup::dedup_overlap;
-pub use segmenter::{Chunk, Segmenter, SegmenterConfig, SAMPLE_RATE_HZ};
-pub use transcriber::{stamp_segment, AsrError, Transcriber};
+pub use stream::{StreamConfig, TranscriptStream, Update, Utterance, SAMPLE_RATE_HZ};
+pub use transcriber::{AsrError, Transcriber};
 pub use voxtype_cli::VoxtypeCli;

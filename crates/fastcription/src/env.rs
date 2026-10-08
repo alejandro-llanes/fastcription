@@ -715,3 +715,118 @@ esac
         assert_eq!(conversation.started_at, expected);
     }
 }
+
+/// fastcription's own voxtype configuration file.
+///
+/// Decision D6 says the user's `~/.config/voxtype/config.toml` is never
+/// rewritten, and it still is not. But voxtype's most valuable knob for this
+/// app has no command-line flag: `context_window_optimization` makes clips
+/// under 22.5 seconds transcribe two to nearly three times faster, measured on
+/// this machine as 0.75s to 0.28s for a 7 second window. Realtime depends on
+/// it.
+///
+/// `voxtype -c <file>` accepts an arbitrary config, so fastcription keeps its
+/// own and passes it explicitly. The user's file is read for defaults and never
+/// touched; this one is ours to overwrite, and says so in a comment for anyone
+/// who finds it.
+pub fn write_private_config(
+    model: &str,
+    language: &str,
+    threads: u32,
+    fast_mode: bool,
+) -> Result<PathBuf, String> {
+    let dir = dirs::config_dir()
+        .ok_or("no configuration directory")?
+        .join("fastcription");
+    std::fs::create_dir_all(&dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+    let path = dir.join("voxtype.toml");
+
+    let mut body = String::from(
+        "# Written by fastcription. Edits are overwritten.\n\
+         #\n\
+         # This is not your voxtype configuration. fastcription never modifies\n\
+         # ~/.config/voxtype/config.toml; it reads it for defaults and passes\n\
+         # this file to `voxtype -c` instead.\n\n\
+         [whisper]\n",
+    );
+    if !model.trim().is_empty() {
+        body.push_str(&format!("model = {}\n", toml_string(model)));
+    }
+    if !language.trim().is_empty() {
+        body.push_str(&format!("language = {}\n", toml_string(language)));
+    }
+    // The whole reason this file exists. Exposed as a setting because the
+    // optimisation can change a word here and there, and upstream warns it can
+    // make large models repeat themselves.
+    body.push_str(&format!("context_window_optimization = {fast_mode}\n"));
+    body.push_str(&format!("threads = {}\n", threads.max(1)));
+
+    std::fs::write(&path, body).map_err(|err| format!("{}: {err}", path.display()))?;
+    Ok(path)
+}
+
+/// Quotes a value as a TOML basic string. The inputs are a model and a language
+/// code from a text field, so a stray quote or backslash must not be able to
+/// produce a config that parses as something else.
+fn toml_string(value: &str) -> String {
+    let escaped = value
+        .chars()
+        .filter(|c| !c.is_control())
+        .flat_map(|c| match c {
+            '"' => vec!['\\', '"'],
+            '\\' => vec!['\\', '\\'],
+            other => vec![other],
+        })
+        .collect::<String>();
+    format!("\"{escaped}\"")
+}
+
+/// How many inference threads to ask for by default.
+///
+/// whisper.cpp stops scaling past about eight threads for the small English
+/// models: measured on a 24-core machine, a 7 second window took 0.28s letting
+/// whisper choose and 0.21s pinned to eight. Oversubscription costs time.
+pub fn default_threads() -> u32 {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(4);
+    cores.clamp(1, 8)
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::{toml_string, write_private_config};
+
+    /// The model and language come from text fields, so a value containing a
+    /// quote must not be able to close the string and inject another key.
+    #[test]
+    fn values_are_quoted_so_a_stray_quote_cannot_inject_a_key() {
+        assert_eq!(toml_string("base.en"), "\"base.en\"");
+        assert_eq!(
+            toml_string("evil\"\nthreads = 999"),
+            "\"evil\\\"threads = 999\""
+        );
+        assert_eq!(toml_string("back\\slash"), "\"back\\\\slash\"");
+    }
+
+    /// The file must always carry the optimisation it exists for, and must
+    /// parse as the TOML voxtype expects.
+    #[test]
+    fn the_written_config_enables_the_optimisation_and_parses() {
+        let path = match write_private_config("base.en", "en", 8, true) {
+            Ok(path) => path,
+            // A sandbox with no config directory is not a test failure.
+            Err(_) => return,
+        };
+        let body = std::fs::read_to_string(&path).expect("read back");
+        assert!(body.contains("context_window_optimization = true"));
+        assert!(body.contains("threads = 8"));
+        assert!(body.contains("model = \"base.en\""));
+        let parsed: toml::Value = toml::from_str(&body).expect("valid TOML");
+        let whisper = parsed.get("whisper").expect("a whisper table");
+        assert_eq!(
+            whisper.get("context_window_optimization").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+}

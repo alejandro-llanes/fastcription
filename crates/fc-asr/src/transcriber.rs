@@ -1,11 +1,13 @@
-//! The `Transcriber` trait: the seam between the segmenter and whatever turns
-//! PCM into text. `voxtype_cli::VoxtypeCli` is the only implementation today;
-//! the trait exists so `VoxtypeMeeting`/`VoxtypeLive` (ARCHITECTURE.md §8) can
-//! slot in later without touching the segmenter or the ASR worker.
+//! The `Transcriber` trait: the seam between [`crate::stream::TranscriptStream`]
+//! and whatever turns PCM into text. `voxtype_cli::VoxtypeCli` is the only
+//! implementation today; the trait exists so `VoxtypeMeeting`/`VoxtypeLive`
+//! (ARCHITECTURE.md §8) can slot in later without `TranscriptStream` noticing,
+//! and so tests can drive the agreement logic with a scripted fake instead of
+//! the real subprocess.
 
 use std::time::Duration;
 
-use fc_core::{EngineInfo, Segment, Track};
+use fc_core::{EngineInfo, Segment};
 use thiserror::Error;
 
 /// Everything that can go wrong turning a chunk of PCM into text.
@@ -51,71 +53,22 @@ pub enum AsrError {
 
 /// Produces transcript segments from raw PCM.
 ///
-/// **Chunk identity is the caller's job, not this trait's.** An implementation
-/// only ever sees bare samples -- it has no idea which track they came from,
-/// what sequence number the chunk has, or where it sits on the session
-/// timeline. So the segments it returns are stamped with placeholders:
-/// `track: Track::Selected`, `seq: 0`, and `start_ms`/`end_ms` relative to the
-/// start of *this* PCM (i.e. the first segment typically starts at `0`). The
-/// caller -- the ASR worker, which does have the originating [`crate::segmenter::Chunk`]
-/// -- turns those into real values with [`stamp_segment`] before a segment
-/// goes anywhere else (the UI, the store, dedup).
+/// **Identity is the caller's job, not this trait's.** An implementation only
+/// ever sees bare samples -- it has no idea which track they came from, what
+/// utterance this is, or where it sits on the session timeline. So the
+/// segments it returns are stamped with placeholders: `track:
+/// Track::Selected`, `seq: 0`, and `start_ms`/`end_ms` relative to the start
+/// of *this* PCM. `TranscriptStream` only ever reads `.text` off what comes
+/// back -- it computes its own utterance-relative timestamps from how much
+/// audio it has pushed, since every pass re-transcribes the utterance from
+/// its start rather than an independent chunk.
 ///
 /// This split keeps implementations testable against bare PCM/WAV fixtures
-/// without needing to construct a `Chunk` just to call `transcribe`.
+/// without needing a [`crate::stream::TranscriptStream`] in the loop.
 pub trait Transcriber: Send {
     fn transcribe(&self, pcm: &[f32], sample_rate: u32) -> Result<Vec<Segment>, AsrError>;
 
     /// Engine/model/language actually in use, for the UI and for the record
     /// stored with a conversation (`fc_core::Conversation::engine`).
     fn describe(&self) -> EngineInfo;
-}
-
-/// Replaces a [`Transcriber`]'s placeholder fields with the real chunk
-/// identity. `chunk_start_ms` is added to the segment's (chunk-relative)
-/// `start_ms`/`end_ms` to make them session-absolute.
-pub fn stamp_segment(
-    mut seg: Segment,
-    track: Track,
-    seq: u64,
-    chunk_start_ms: u64,
-    provisional: bool,
-) -> Segment {
-    seg.track = track;
-    seg.seq = seq;
-    seg.start_ms += chunk_start_ms;
-    seg.end_ms += chunk_start_ms;
-    seg.provisional = provisional;
-    seg
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn seg(start_ms: u64, end_ms: u64, text: &str) -> Segment {
-        Segment {
-            track: Track::Selected,
-            seq: 0,
-            start_ms,
-            end_ms,
-            text: text.to_string(),
-            translation: None,
-            speaker: None,
-            confidence: None,
-            provisional: false,
-        }
-    }
-
-    #[test]
-    fn stamp_segment_makes_times_absolute_and_sets_identity() {
-        let s = seg(0, 6_930, "hello");
-        let stamped = stamp_segment(s, Track::Microphone, 42, 21_000, true);
-        assert_eq!(stamped.track, Track::Microphone);
-        assert_eq!(stamped.seq, 42);
-        assert_eq!(stamped.start_ms, 21_000);
-        assert_eq!(stamped.end_ms, 27_930);
-        assert!(stamped.provisional);
-        assert_eq!(stamped.text, "hello");
-    }
 }

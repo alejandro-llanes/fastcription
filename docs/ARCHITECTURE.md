@@ -47,10 +47,38 @@ only the source I selected" is not expressible there either.
 | Input | Wall time | Notes |
 | --- | --- | --- |
 | 6.93 s of speech | **0.78 s** | includes process spawn + model load; transcript verbatim correct |
+| 11 s of speech (JFK sample) | **0.78 s** | verbatim correct |
+| 2 s of speech | **0.71 s** | **the same cost as 11 s** |
 | model load alone | 0.04 s | ggml file is mmapped, warm page cache |
 
-~9× realtime. Per-chunk process spawn is not a problem. Steady-state lag is
-`chunk_length + ~0.8 s`.
+**Whisper always pads its input to 30 seconds**, which is why a 2 second clip
+costs what an 11 second clip costs. Short clips buy nothing, and a design that
+transcribes many small pieces pays full price for each.
+
+`context_window_optimization = true` changes that for clips under 22.5 seconds:
+
+| Window | Default | With the optimisation | Speedup |
+| --- | --- | --- | --- |
+| 2 s | 0.71 s | 0.25 s | 2.80× |
+| 5 s | 0.72 s | 0.27 s | 2.69× |
+| 7 s | 0.75 s | 0.28 s | 2.64× |
+| 11 s | 0.78 s | 0.40 s | 1.97× |
+
+It has no command-line flag, only a config key — see D6 on how fastcription
+reaches it without touching the user's configuration.
+
+Thread scaling, 7 s window with the optimisation on, on 24 cores:
+
+| Threads | Time | Duty cycle at 1 s steps |
+| --- | --- | --- |
+| auto (24) | 0.28 s | 28% |
+| **8** | **0.21 s** | **21%** |
+| 4 | 0.28 s | 28% |
+| 2 | 0.42 s | 42% |
+
+whisper.cpp stops scaling past about eight threads for the small English
+models, and oversubscription costs time, so the default is `min(8, cores)`.
+Even two threads fits, which is what makes this viable on a laptop with no GPU.
 
 Output contract: with `-q`, stdout is three banner lines (`Loading audio file:`,
 `Audio format:`, `Processing N samples`), a blank line, then the transcript.
@@ -68,8 +96,9 @@ contract — it lives behind one adapter with a test (§7).
 | D3 | **Main window plus a separate always-on-top caption overlay.** | The meeting window has to stay visible. The overlay shows the last few lines; the main window owns control, history, tagging and export. |
 | D4 | **English transcript now; a second text slot per segment from day one.** | Translation is wired in once the realtime path is proven, without a schema migration. voxtype's `--translate` only goes *into* English, so this is ours to build. The interface shows no control for it: advertising a feature that does nothing is worse than its absence, so the slot and the column exist and nothing in the UI mentions them. |
 | D5 | **Our own SQLite library.** | voxtype's `index.db` has no groups and no tags, and fastcription does not write into another application's database. Past voxtype meetings are imported read-only. |
-| D6 | **Never rewrite `~/.config/voxtype/config.toml`.** | Engine, model and language go through per-invocation CLI flags. voxtype's config is read for defaults only. Users keep ownership of their dictation setup. |
+| D6 | **Never rewrite `~/.config/voxtype/config.toml`; keep our own config and pass `voxtype -c`.** | The user's file is read for defaults and never modified — they keep ownership of their dictation setup. But voxtype's most valuable knob for this app, `context_window_optimization`, has no command-line flag, and realtime depends on it. `voxtype -c <file>` accepts an arbitrary config, so fastcription writes `~/.config/fastcription/voxtype.toml` and passes it explicitly. That file says in a comment that it is ours and gets overwritten. |
 | D7 | **Segments are persisted as they are committed.** | A crash mid-meeting costs one chunk, not the meeting. This is a deliberate improvement over voxtype's save-on-stop. |
+| D9 | **Re-transcribe the current utterance about once a second and commit words once two consecutive passes agree** (LocalAgreement-2), instead of transcribing disjoint chunks once each. | Chunking meant reading a sentence roughly eight seconds after it was spoken — chunk length plus inference — which is useless for following a live conversation, and it was the first thing testing exposed. Because Whisper pads to 30 s anyway, re-transcribing a growing utterance costs little more than transcribing it once, and the optimisation above pays for the repetition. Measured: 100% of 66 words correct across a 30.4 s six-utterance sample at 23% of one CPU's time, with words appearing ~1.5–2 s behind the speaker. Every pass sees the utterance from its start, so there are no chunk boundaries to lose context across and no overlap to reconcile — this deleted the segmenter and the dedup pass outright. The trade is that a committed word is never revised, so an occasional word commits early and wrong. |
 | D8 | **No async runtime in the app core.** | std threads plus `crossbeam-channel`, waking egui with `ctx.request_repaint()`. egui is a synchronous immediate-mode loop; a tokio runtime would buy nothing and complicate the audio path. |
 
 ---
@@ -80,49 +109,91 @@ contract — it lives behind one adapter with a test (§7).
                     ┌──────────────── UI thread (eframe/egui) ────────────────┐
                     │  live view · history · overlay · settings · export      │
                     └───▲───────────────────────────────┬─────────────────────┘
-      Event channel     │                               │  Command channel
-   (segments, levels,   │                               │  (start/stop/pause,
-    state, errors)      │                               │   source change)
-                    ┌───┴───────────────────────────────▼─────────────────────┐
-                    │                   Session supervisor                    │
-                    └───┬───────────────┬───────────────┬─────────────────────┘
-                        │               │               │
-          ┌─────────────▼──┐   ┌────────▼───────┐  ┌────▼──────────────┐
-          │ capture thread │   │ capture thread │  │   store thread    │
-          │   (selected)   │   │  (mic, opt.)   │  │ rusqlite, WAL     │
-          └─────────┬──────┘   └────────┬───────┘  └────▲──────────────┘
-                    │  PCM + peak/RMS            │      │ committed segments
-          ┌─────────▼──────────────────────────┐ │      │
-          │ segmenter (per track)              │ │      │
-          │  ring buffer · RMS/VAD gate        │ │      │
-          │  silence-boundary cuts             │ │      │
-          │  min 1.5s / target 7s / max 15s    │ │      │
-          │  0.5s overlap                      │ │      │
-          └─────────┬──────────────────────────┘ │      │
-                    │ Chunk { track, seq, pcm, t0_ms, provisional }           │
-          ┌─────────▼───────────────────────────────────────────┐             │
-          │ ASR worker (one per track, ordered, bounded queue)  ├─────────────┘
-          │  tmp WAV → `voxtype -q transcribe` → Vec<Segment>   │
-          └─────────────────────────────────────────────────────┘
+      Event channel     │                               │  start / pause / stop
+   (stable text, the    │                               ▼
+    unstable tail,  ┌───┴───────────────────────────────────────────────────────┐
+    levels, state)  │                   Session supervisor                      │
+                    └───┬───────────────────────────────┬───────────────────────┘
+                        │                               │
+          ┌─────────────▼──────────┐         ┌──────────▼─────────────┐
+          │ capture (selected src) │         │ capture (mic, optional)│
+          │   parec → PCM frames   │         │                        │
+          └─────────────┬──────────┘         └──────────┬─────────────┘
+                        │  unbounded: audio waits here, never dropped
+          ┌─────────────▼───────────────────────────────▼─────────────┐
+          │ stream thread, one per track (fc_asr::TranscriptStream)   │
+          │                                                          │
+          │  accumulate utterance ──► every ~1 s ──► transcribe the  │
+          │  (VAD; silence before            whole utterance from    │
+          │   speech discarded)              its start               │
+          │                                        │                 │
+          │  longest common prefix of the last two passes = stable   │
+          │  remainder = unstable tail, shown dimmed, replaced       │
+          │                                                          │
+          │  silence ≥ 0.4 s, or 20 s elapsed ──► finalise utterance │
+          └─────────────┬────────────────────────────────────────────┘
+                        │ finalised utterance
+                 ┌──────▼──────────┐
+                 │ store (rusqlite)│  one row per utterance, on finalise
+                 └─────────────────┘
 ```
 
-**Capture.** `parec --device <source> --raw --format=s16le --rate=16000 --channels=1`,
-the same mechanism voxtype uses for its loopback track. A subprocess here is a
+**Capture.** `parec --device <source>` or `--monitor-stream=<index>`, the same
+mechanism voxtype uses for its own loopback track. A subprocess here is a
 feature: it is already how voxtype reaches monitor sources, it survives a
 PipeWire restart, and it costs us no `libpipewire` binding. Behind a
-`CaptureBackend` trait so a native `pipewire-rs` backend can replace it.
+`CaptureHandle` trait, so a native `pipewire-rs` or `pw-record` backend can
+replace it without touching the supervisor — and so the whole pipeline can be
+driven by a fake capture in tests, which on a machine with no working audio
+device is the difference between the supervisor being tested and not.
 
-**Backpressure.** The ASR queue is bounded at 2. On overflow the segmenter grows
-its target chunk length (7 s → 10 s → 15 s) instead of dropping audio, and the UI
-shows a "transcription behind" indicator. Audio is never discarded silently.
+**Why audio is never dropped.** The PCM channel is unbounded and `push` blocks
+for the length of one transcription pass. When transcription falls behind,
+captured audio waits in the channel instead of being discarded — 16 kHz mono
+f32 costs 64 KB per second of lag, which is cheap next to losing part of a
+meeting.
 
-**Two-tier results.** A short 1.5–2 s chunk yields a *provisional* segment,
-rendered dimmed; the overlapping 7 s chunk replaces it with a *committed*
-segment, which has more context and so transcribes better. Only committed
-segments reach SQLite. This is what makes the app feel live without overstating
-its accuracy. Overlap means the tail of one chunk repeats in the head of the
-next: committed segments are joined with a word-level tail/head dedup (voxtype
-solves the analogous problem with `dedup_bleed_through`).
+**Why the interval adapts.** A pass is triggered by accumulated *audio*, so on a
+machine where a pass takes longer than the interval, a fixed interval never
+catches up: the backlog grows without bound. Stretching the interval to at least
+the duration of the last pass fixes it, and costs nothing, because every pass
+transcribes the whole utterance anyway — fewer passes means less repeated work,
+not less transcript. Measured on the same 30.4 s sample with a transcriber slowed
+until each pass took longer than the interval:
+
+| | Duty cycle | Passes | Longest interval | Accuracy |
+| --- | --- | --- | --- | --- |
+| Fixed 1 s interval | **149%** (never catches up) | 26 | 1.0 s | 98% |
+| Adaptive interval | **86%** (keeps up) | 15 | 2.1 s | **100%** |
+
+This is load-bearing, not a refinement.
+
+**End to end, through the real voxtype binary**, six sentences separated by
+silence, fed from a separate thread paced on a wall clock so the audio timeline
+never stalls:
+
+| | |
+| --- | --- |
+| Utterances finalised | 6 of 6, boundaries on the silences |
+| Latency from end of utterance to committed text | 0.37 s – 0.77 s, flat across the session |
+| Duty cycle | 38.6% of one CPU's time |
+
+Measuring this needs care. Feeding frames synchronously from the same thread
+that transcribes stalls the audio clock whenever a pass overruns its frame
+budget, and the reported latency then grows steadily — indistinguishable from a
+pipeline that cannot keep up. The first version of this test measured its own
+drift and read as 1.9 s climbing to 8.7 s. Pace the producer independently.
+
+**What the user sees.** Stable words are append-only and never revised, so the
+transcript does not flicker. The tail of the current pass is shown dimmed and
+replaced on each pass, which is where a word that has not settled yet lives. On
+finalise the whole utterance becomes one committed row and one line in the
+transcript.
+
+**What this replaced.** A segmenter that cut disjoint chunks on silence, a
+bounded chunk queue with a growth ladder for backpressure, a separate shorter
+"provisional" inference, and a word-level overlap dedup pass. None of it is
+needed when every pass covers the utterance from its start.
 
 ---
 
@@ -147,8 +218,9 @@ crates/
                  tags, FTS5 search. Segments persisted as they commit.
   fc-audio/      source enumeration (pactl -f json) and capture (parec),
                  behind a CaptureBackend trait; peak/RMS metering.
-  fc-asr/        segmenter (VAD, chunk boundaries, overlap, backpressure),
-                 Transcriber trait, the `voxtype transcribe` adapter, dedup.
+  fc-asr/        the streaming transcriber: utterance accumulation with VAD,
+                 re-transcription on an interval, LocalAgreement-2 stability,
+                 the Transcriber trait and the `voxtype transcribe` adapter.
   fc-voxtype/    the only crate that knows voxtype exists: CLI probes, read-only
                  config parse, systemd unit control, runtime-state watcher, and
                  the two meeting-mode calls import needs (list and export).

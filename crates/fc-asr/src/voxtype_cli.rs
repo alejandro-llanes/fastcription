@@ -212,9 +212,20 @@ fn run_with_timeout(
 #[derive(Debug, Clone)]
 pub struct VoxtypeCli {
     binary: String,
+    /// A config file passed as `-c`, for the settings voxtype exposes only
+    /// through a file. The caller owns that file; this never writes one.
+    config: Option<std::path::PathBuf>,
     engine: Option<String>,
     model: Option<String>,
     language: Option<String>,
+    /// `--threads`. Always `Some` by default (see [`Default`] below) rather
+    /// than leaving voxtype to pick its own: measured on this machine (Core
+    /// Ultra 9 285K, `base.en`, CPU), 8 threads transcribes a 7s window in
+    /// 0.21s versus 0.28s when voxtype schedules across all 24 cores --
+    /// whisper.cpp stops scaling past ~8 threads for a model this size, so
+    /// more cores just adds scheduling overhead. [`Self::with_threads`] still
+    /// overrides this for a caller that knows better (a bigger model, a
+    /// different engine, a machine with few cores).
     threads: Option<u32>,
     translate: bool,
     /// `None` means "compute a generous default from the chunk's duration"
@@ -227,14 +238,27 @@ impl Default for VoxtypeCli {
     fn default() -> Self {
         Self {
             binary: "voxtype".to_string(),
+            config: None,
             engine: None,
             model: None,
             language: None,
-            threads: None,
+            threads: Some(default_thread_count()),
             translate: false,
             timeout: None,
         }
     }
+}
+
+/// `min(8, available_parallelism())`: see the doc comment on
+/// [`VoxtypeCli::threads`] for the measurement behind the cap. The
+/// `available_parallelism` floor keeps a machine with fewer cores from being
+/// told to use more threads than it has; the `unwrap_or(4)` fallback only
+/// matters on a platform where the OS can't report core count at all.
+fn default_thread_count() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(4)
+        .min(8)
 }
 
 impl VoxtypeCli {
@@ -245,8 +269,23 @@ impl VoxtypeCli {
     /// one after the subcommand makes voxtype exit 2 with a usage error instead
     /// of transcribing. That failure mode is silent enough (a usage message on
     /// stderr, no transcript) to be worth a regression test.
+    /// Runs voxtype against a specific config file.
+    ///
+    /// Some of voxtype's most useful settings have no command-line flag —
+    /// `context_window_optimization`, which more than doubles the speed of the
+    /// short passes realtime transcription needs, is one. `voxtype -c <file>`
+    /// is how to reach them without touching the user's own configuration.
+    pub fn with_config(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.config = Some(path.into());
+        self
+    }
+
     fn global_args(&self) -> Vec<String> {
         let mut args = vec!["-q".to_string()];
+        if let Some(config) = &self.config {
+            args.push("-c".into());
+            args.push(config.display().to_string());
+        }
         if let Some(engine) = &self.engine {
             args.push("--engine".into());
             args.push(engine.clone());
@@ -738,7 +777,22 @@ hi\n";
     }
 
     #[test]
-    fn default_invocation_passes_only_quiet() {
-        assert_eq!(VoxtypeCli::new().global_args(), vec!["-q"]);
+    fn default_invocation_passes_quiet_and_a_bounded_thread_count() {
+        let args = VoxtypeCli::new().global_args();
+        assert_eq!(args[0], "-q");
+        assert_eq!(args[1], "--threads");
+        let threads: u32 = args[2].parse().expect("threads value should be numeric");
+        assert!((1..=8).contains(&threads), "got {threads}");
+        assert_eq!(
+            args.len(),
+            3,
+            "no other override should be present by default"
+        );
+    }
+
+    #[test]
+    fn default_thread_count_never_exceeds_eight() {
+        assert!(default_thread_count() >= 1);
+        assert!(default_thread_count() <= 8);
     }
 }

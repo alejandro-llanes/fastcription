@@ -16,13 +16,16 @@ pub struct State {
     pub engine: String,
     pub model: String,
     pub language: String,
-    pub chunk_target_secs: f32,
-    pub chunk_max_secs: f32,
-    /// Asks voxtype to translate non-English speech into English. This is
-    /// voxtype's own `--translate`, which replaces the transcript text; it is
-    /// not the reserved per-segment translation slot.
-    pub translate: bool,
-    /// CPU threads for inference. Zero leaves the choice to voxtype.
+    /// How often the current utterance is re-transcribed. Lower shows words
+    /// sooner and costs more CPU.
+    pub refresh_secs: f32,
+    /// How long an utterance may run before it is finalised without a pause.
+    /// Kept under voxtype's 22.5 second context-optimisation threshold.
+    pub max_utterance_secs: f32,
+    /// voxtype's `context_window_optimization`: two to nearly three times
+    /// faster under 22.5 seconds, which is what makes realtime possible.
+    pub fast_mode: bool,
+    /// CPU threads for inference.
     pub threads: u32,
 }
 
@@ -32,10 +35,10 @@ impl Default for State {
             engine: "whisper".to_owned(),
             model: "base.en".to_owned(),
             language: "en".to_owned(),
-            chunk_target_secs: 7.0,
-            chunk_max_secs: 15.0,
-            translate: false,
-            threads: 0,
+            refresh_secs: 1.0,
+            max_utterance_secs: 20.0,
+            fast_mode: true,
+            threads: crate::env::default_threads(),
         }
     }
 }
@@ -76,26 +79,17 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             "A language code such as en or es, a comma-separated list, or auto.",
         ));
     });
-    ui.checkbox(
-        &mut app.settings.translate,
-        t("Translate non-English speech into English"),
-    )
-    .on_hover_text(t(
-        "voxtype transcribes the speech directly into English. Only useful when \
-         the conversation is not already in English.",
-    ));
-    ui.horizontal(|ui| {
-        ui.add(
-            egui::Slider::new(&mut app.settings.threads, 0..=32).text(t("inference threads")),
-        );
-        if app.settings.threads == 0 {
-            ui.label(
-                egui::RichText::new(t("(voxtype decides)"))
-                    .small()
-                    .color(app.palette.secondary),
-            );
-        }
-    });
+    ui.checkbox(&mut app.settings.fast_mode, t("Fast mode"))
+        .on_hover_text(t(
+            "Uses voxtype's context-window optimisation: two to nearly three \
+             times faster for the short passes realtime needs. Turn it off if \
+             you see words repeating.",
+        ));
+    ui.add(egui::Slider::new(&mut app.settings.threads, 1..=32).text(t("inference threads")))
+        .on_hover_text(t(
+            "whisper.cpp stops getting faster past about eight threads for the \
+             small English models.",
+        ));
     if let Some(backend) = app.engine.backend.as_deref() {
         ui.label(
             egui::RichText::new(format!("{} {backend}", t("Acceleration:")))
@@ -114,20 +108,20 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     }
 
     ui.add_space(8.0);
-    ui.label(t("Chunking"));
+    ui.label(t("Responsiveness"));
     ui.add(
-        egui::Slider::new(&mut app.settings.chunk_target_secs, 1.5..=10.0)
-            .text(t("target seconds")),
+        egui::Slider::new(&mut app.settings.refresh_secs, 0.5..=3.0)
+            .text(t("seconds between passes")),
     );
     ui.add(
-        egui::Slider::new(&mut app.settings.chunk_max_secs, 7.0..=20.0).text(t(
-            "max seconds (the segmenter grows into this under pressure)",
-        )),
+        egui::Slider::new(&mut app.settings.max_utterance_secs, 8.0..=22.0)
+            .text(t("longest utterance in seconds")),
     );
     ui.label(
         egui::RichText::new(t(
-            "A shorter target shows words sooner; a longer one transcribes them \
-             more accurately. Changes apply to the next conversation.",
+            "The sentence being spoken is re-transcribed this often, and words \
+             appear once two passes agree on them. Shorter means words sooner \
+             and more CPU. Changes apply to the next conversation.",
         ))
         .small()
         .color(app.palette.secondary),
