@@ -93,13 +93,14 @@ contract — it lives behind one adapter with a test (§7).
 | --- | --- | --- |
 | D1 | **Own the capture, use `voxtype transcribe` per chunk.** Ship this; pursue a live feed upstream in parallel. | Works against the stock package today, puts latency and source selection fully under our control. Measured at 0.78 s per 7 s chunk, so the per-chunk spawn cost that worried us is a non-issue. |
 | D2 | **One selected source by default; the microphone is an opt-in second track.** | `CLAUDE.md` asks for the selected source only. The mic toggle, labelled `You` vs `Remote`, is what makes a transcript a record of a conversation rather than half of one. |
-| D3 | **Main window plus a separate always-on-top caption overlay.** | The meeting window has to stay visible. The overlay shows the last few lines; the main window owns control, history, tagging and export. |
+| D3 | **One window, with a compact mode.** The main window shrinks to a borderless, always-on-top caption bar showing the last few lines and the one being spoken, and restores on a click, Escape or Ctrl+Shift+C. | The first design used a second always-on-top window, an egui *deferred viewport*. Review found it had never worked: the app's repaint requests reach only the root viewport, so after its first frame the overlay never repainted; it synced only on finished utterances, a sentence behind the speaker; and hiding the main window to the tray destroyed it, because a deferred viewport is a child of the root — so the one arrangement a user wants, main window out of the way and captions over the call, was the one that could not exist. Making the main window *be* the caption bar needs no second viewport, repaints correctly for free, and still works with a compositor rule, now matched on the window title. The trade is that hiding to the tray hides the captions too, which is what hiding means. |
 | D4 | **English transcript now; a second text slot per segment from day one.** | Translation is wired in once the realtime path is proven, without a schema migration. voxtype's `--translate` only goes *into* English, so this is ours to build. The interface shows no control for it: advertising a feature that does nothing is worse than its absence, so the slot and the column exist and nothing in the UI mentions them. |
 | D5 | **Our own SQLite library.** | voxtype's `index.db` has no groups and no tags, and fastcription does not write into another application's database. Past voxtype meetings are imported read-only. |
 | D6 | **Never rewrite `~/.config/voxtype/config.toml`; keep our own config and pass `voxtype -c`.** | The user's file is read for defaults and never modified — they keep ownership of their dictation setup. But voxtype's most valuable knob for this app, `context_window_optimization`, has no command-line flag, and realtime depends on it. `voxtype -c <file>` accepts an arbitrary config, so fastcription writes `~/.config/fastcription/voxtype.toml` and passes it explicitly. That file says in a comment that it is ours and gets overwritten. |
 | D7 | **Segments are persisted as they are committed.** | A crash mid-meeting costs one chunk, not the meeting. This is a deliberate improvement over voxtype's save-on-stop. |
 | D10 | **Transcription may run on another machine, through voxtype's remote mode.** | The model stays resident on a box with a GPU, so a laptop with none gets a large model's accuracy and pays no per-pass load. It needs no new code in the transcription path: voxtype's remote mode speaks the OpenAI audio API, and fastcription already writes the config that selects it. Verified against upstream's `remote.rs` and exercised end to end against a mock server in the test suite. The cost is that audio leaves the machine, which the settings pane warns about, and that each pass uploads the utterance so far — about 32 KB per second of speech. See `docs/SERVER.md`. |
 | D9 | **Re-transcribe the current utterance about once a second and commit words once two consecutive passes agree** (LocalAgreement-2), instead of transcribing disjoint chunks once each. | Chunking meant reading a sentence roughly eight seconds after it was spoken — chunk length plus inference — which is useless for following a live conversation, and it was the first thing testing exposed. Because Whisper pads to 30 s anyway, re-transcribing a growing utterance costs little more than transcribing it once, and the optimisation above pays for the repetition. Measured: 100% of 66 words correct across a 30.4 s six-utterance sample at 23% of one CPU's time, with words appearing ~1.5–2 s behind the speaker. Every pass sees the utterance from its start, so there are no chunk boundaries to lose context across and no overlap to reconcile — this deleted the segmenter and the dedup pass outright. The trade is that a committed word is never revised, so an occasional word commits early and wrong. |
+| D11 | **Settings and the chosen source persist across launches; the API key does not.** | A user who configured a transcription server must not re-enter it every time, and `remote_enabled` silently reverting would run their next meeting on the wrong machine. eframe's storage is a plain-text file, so the key is excluded from it; it already lives user-only in the per-session voxtype config and is kept for the session. |
 | D8 | **No async runtime in the app core.** | std threads plus `crossbeam-channel`, waking egui with `ctx.request_repaint()`. egui is a synchronous immediate-mode loop; a tokio runtime would buy nothing and complicate the audio path. |
 
 ---
@@ -240,24 +241,31 @@ Inside the binary crate:
 
 ```
 src/
-  main.rs            eframe bootstrap; fastframe wiring (log, theme, fonts,
-                     text, icons, instance, tray, shell, update)
-  session.rs         the supervisor: owns the capture threads, the segmenter,
-                     the ASR workers and the store handle; the only place that
-                     knows how the crates fit together
-  env.rs             what the app reads from the machine it runs on: the
-                     library, the capture sources, voxtype's configured engine
-                     and its service state. Each probe fails on its own, since
-                     the useful states are partial — a missing voxtype is no
-                     reason to hide a past transcript
+  main.rs            eframe bootstrap; fastframe wiring (log, instance, shell,
+                     tray, update); the single-instance "show" request
+  env.rs             what the app reads from and writes to the machine: the
+                     library, capture sources, voxtype's catalog and service
+                     state (probed on a thread so the window opens at once),
+                     the per-session voxtype config, import of past meetings
+  session.rs         the supervisor: capture threads, one TranscriptStream per
+                     track, the store handle; the only place that knows how
+                     the crates fit together
+  theme.rs           the palette, following the Omarchy desktop theme
   app/
-    mod.rs           App state, drains SessionEvent each frame, repaint plumbing
-    live.rs          live transcript: auto-scroll, sticky bottom, segment rows
-    overlay.rs       always-on-top caption window (last N lines)
-    sidebar.rs       groups tree, tag filter, conversation list, search box
-    history.rs       conversation detail, rename, regroup, retag, speaker labels
-    settings.rs      source, engine/model, chunking, service control, translation
-    export_ui.rs     format picker and destination
+    mod.rs           the App struct, notices (a short levelled log), what is
+                     persisted across launches (settings and the chosen
+                     source; never the API key)
+    chrome.rs        attach, frame, top bar, status, compact mode, shortcuts,
+                     the tray Resident, source re-selection by identity
+    session_control.rs  start / pause / stop, draining session events,
+                     engine settings, the threaded server probe
+    library.rs       conversations, groups, tags, search, export, import
+    live.rs          the live transcript
+    sidebar.rs       groups, tags, search box, conversation list
+    history.rs       one conversation: rename, group, tags, transcript
+    settings.rs      source, microphone, engine, responsiveness, server,
+                     service, import
+    export_ui.rs     format picker, options and destination
 ```
 
 ### Transcriber trait
@@ -440,7 +448,7 @@ desktop for free.
 | --- | --- |
 | voxtype CLI output changes | One adapter, golden test, version check at startup, parse failure is an error |
 | Chunk boundaries cut words | 0.5 s overlap + word-level tail/head dedup; provisional/committed two-tier display |
-| Always-on-top overlay on Wayland | winit gives no layer-shell; ship a Hyprland window rule and document the equivalent for sway/river. Fall back to a normal window. |
+| Always-on-top on Wayland | winit gives no layer-shell, so compact mode asks for `WindowLevel::AlwaysOnTop` and relies on a compositor rule matched on the compact title (`docs/OVERLAY.md` has Hyprland, sway and river). Without the rule it is an ordinary window the user keeps in front by hand. |
 | Transcription falls behind on a slow machine or a large model | Bounded queue, growing chunk length, visible indicator; recommend `base.en` or Parakeet; never drop audio |
 | fastframe API churn ("early, APIs will change") | Pinned revisions; fastframe crates are confined to `main.rs` and the view layer |
 | No usable PipeWire devices on the dev machine | Fix wireplumber before the first capture test (§5) |
