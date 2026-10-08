@@ -23,6 +23,9 @@ pub type PcmFrame = Vec<f32>;
 
 use crate::SAMPLE_RATE;
 const LEVEL_HZ: usize = 20;
+/// How promptly parec hands audio over. See the argument list in
+/// [`run_capture_loop`].
+const PAREC_LATENCY_MS: usize = 1000 / LEVEL_HZ;
 const LEVEL_WINDOW_SAMPLES: usize = SAMPLE_RATE / LEVEL_HZ;
 const BASE_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(4);
@@ -61,7 +64,8 @@ pub trait CaptureBackend: Send + 'static {
     fn stop(&mut self);
 }
 
-/// Captures via `parec --raw --format=s16le --rate=16000 --channels=1`.
+/// Captures via `parec --raw --format=s16le --rate=16000 --channels=1
+/// --latency-msec=50`.
 pub struct ParecCapture {
     stop_flag: Arc<AtomicBool>,
     current_child: Arc<Mutex<Option<Child>>>,
@@ -249,6 +253,14 @@ fn run_one_session(
         "--raw".to_string(),
         "--format=s16le".to_string(),
         "--rate=16000".to_string(),
+        // Without this parec hands audio over at the sound server's default
+        // record latency, which was measured here at two seconds: the capture
+        // loop saw nothing for 2 s and then forty level windows at once, so
+        // the visualiser held one spectrum for two seconds and jumped, and
+        // the transcriber received every word up to two seconds after it was
+        // said. Fifty milliseconds is one level window, so each arrives on
+        // its own.
+        format!("--latency-msec={PAREC_LATENCY_MS}"),
         "--channels=1".to_string(),
     ]);
 

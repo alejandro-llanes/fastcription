@@ -61,10 +61,23 @@ const IDLE_TAU: f32 = 0.25;
 /// So the display auto-ranges, the way a meter with no fixed scale does. It
 /// tracks the loudest band it has seen recently and scales to that, which
 /// makes a quiet room and a loud one both fill the strip and leaves the shape
-/// the same either way. The reference rises instantly and falls on this time
-/// constant, so one loud syllable does not shrink everything else for the
-/// next second.
-const GAIN_TAU: f32 = 2.5;
+/// the same either way. The reference falls on this time constant, so one
+/// loud syllable does not shrink everything else for the next second.
+const GAIN_FALL_TAU: f32 = 3.0;
+
+/// How long the reference takes to rise to a louder level.
+///
+/// Not instant, which is what the first version did and what made the
+/// display look wrong in a way that was hard to name. With the reference
+/// snapping to the loudest band every frame, that band sat at exactly the
+/// target height whatever the room was doing: the display could change
+/// *shape* but never *size*, and a spectrum that never breathes with the
+/// volume reads as frozen. Worse, between syllables every bar crept upward as
+/// the reference decayed and then snapped down on the next one — the motion
+/// on screen was the gain envelope, not the audio. Smoothing the rise lets a
+/// loud syllable overshoot the reference and pop, a quiet stretch sink, and
+/// the range follow the room over a second rather than a frame.
+const GAIN_RISE_TAU: f32 = 0.6;
 
 /// The quietest reference the display will scale to.
 ///
@@ -74,11 +87,12 @@ const GAIN_TAU: f32 = 2.5;
 /// difference between silence and a cough.
 const GAIN_FLOOR: f32 = 0.12;
 
-/// Where the loudest band sits once the display has settled on its range.
+/// Where the loudest band settles once the display has found its range.
 ///
-/// Not 1.0: a band that is always exactly at the ceiling has nowhere to go
-/// when someone actually raises their voice.
-const GAIN_TARGET: f32 = 0.92;
+/// Well short of 1.0 on purpose: the room above it is where a syllable louder
+/// than the recent average goes, and that overshoot is most of what makes the
+/// display look alive. At 0.92 there was almost none.
+const GAIN_TARGET: f32 = 0.78;
 
 /// Roughly how far apart bars are placed, in points.
 ///
@@ -254,15 +268,18 @@ impl Visualizer {
             *shown += (target - *shown) * k;
         }
 
-        // Instant up, slow down: the reference is what the display divides by,
-        // and a reference that fell as fast as the audio would simply undo the
-        // auto-ranging on every gap between words.
+        // Quick up, slow down — but neither instant. The reference is what
+        // the display divides by: one that fell as fast as the audio would
+        // undo the auto-ranging on every gap between words, and one that rose
+        // as fast as the audio pinned the loudest band in place (see
+        // `GAIN_RISE_TAU`).
         let loudest = self.shown.iter().copied().fold(0.0, f32::max);
-        if loudest >= self.reference {
-            self.reference = loudest;
+        let tau = if loudest > self.reference {
+            GAIN_RISE_TAU
         } else {
-            self.reference += (loudest - self.reference) * (1.0 - (-dt / GAIN_TAU).exp());
-        }
+            GAIN_FALL_TAU
+        };
+        self.reference += (loudest - self.reference) * (1.0 - (-dt / tau).exp());
     }
 
     /// What the display multiplies the bands by, so the loudest recent one
@@ -662,8 +679,35 @@ mod tests {
         }
         let shown = visualizer.sample(0.5);
         assert!(
-            shown > 0.8,
+            shown > 0.7,
             "a steady quiet spectrum should fill the strip, got {shown}"
+        );
+    }
+
+    /// The display has to breathe with the volume. A syllable louder than the
+    /// recent level must show as taller than the settled height, not be
+    /// absorbed by a reference that jumps to meet it in the same frame.
+    #[test]
+    fn a_sudden_louder_sound_overshoots_the_settled_height() {
+        let mut visualizer = Visualizer::default();
+        visualizer.feed([0.2; BANDS]);
+        let mut now = Instant::now();
+        visualizer.step(now);
+        for _ in 0..120 {
+            now += std::time::Duration::from_millis(25);
+            visualizer.step(now);
+        }
+        let settled = visualizer.sample(0.5);
+
+        visualizer.feed([0.6; BANDS]);
+        now += std::time::Duration::from_millis(25);
+        visualizer.step(now);
+        now += std::time::Duration::from_millis(25);
+        visualizer.step(now);
+        let popped = visualizer.sample(0.5);
+        assert!(
+            popped > settled + 0.1,
+            "a louder sound should pop above the settled level: {settled} then {popped}"
         );
     }
 
@@ -692,7 +736,8 @@ mod tests {
         visualizer.feed([0.9; BANDS]);
         let mut now = Instant::now();
         visualizer.step(now);
-        for _ in 0..20 {
+        // Long enough for the reference to climb: the rise is smoothed too.
+        for _ in 0..120 {
             now += std::time::Duration::from_millis(25);
             visualizer.step(now);
         }
