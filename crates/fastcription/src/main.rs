@@ -3,6 +3,7 @@
 //! in `app`; this file only gets a window open.
 
 mod app;
+mod compositor;
 mod env;
 mod i18n;
 mod icons;

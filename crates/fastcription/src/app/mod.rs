@@ -318,8 +318,6 @@ pub struct App {
     /// only sent when it actually changes — `ViewportCommand::Title` every
     /// frame is a Wayland round trip sixty times a second.
     title_shown: String,
-    /// The window size to go back to when compact mode is left.
-    restore_size: Option<egui::Vec2>,
 
     // Library, read from `fc-store` at startup and after any change.
     conversations: Vec<Conversation>,
@@ -475,7 +473,6 @@ impl App {
             provisional: HashMap::new(),
             compact: false,
             title_shown: String::new(),
-            restore_size: None,
             conversations: library.value.conversations,
             search_extra: Vec::new(),
             groups: library.value.groups,

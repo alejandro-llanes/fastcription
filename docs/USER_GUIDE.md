@@ -49,8 +49,10 @@ It runs `fastcription`, declares `StartupWMClass=fastcription`, and asks for
 an icon named `fastcription` — fastcription ships no icon file, so your theme
 will fall back to a generic one.
 
-Compact mode (section 7) also wants one compositor window rule on Wayland. See
-[OVERLAY.md](OVERLAY.md).
+Compact mode (section 7) needs nothing configured on Hyprland: fastcription
+asks the compositor for the caption bar's shape itself. On other compositors it
+changes what is drawn and leaves the window alone, and
+[OVERLAY.md](OVERLAY.md) has the rules that give it a shape there.
 
 ## 3. First run
 
@@ -304,9 +306,12 @@ to the tray hides the captions with it. Stop compact mode before hiding, or
 leave the window up.
 
 On Wayland, "always on top" is a hint the compositor may ignore, so compact
-mode needs one window rule to float reliably above a fullscreened window.
-[OVERLAY.md](OVERLAY.md) has it for Hyprland, sway and river, and explains
-what you get without it.
+On Hyprland nothing needs configuring: fastcription asks the compositor to
+float the window, resize it to the caption bar and pin it to every workspace,
+and puts back what was there when you leave. On other compositors it changes
+only what is drawn, and the window keeps whatever shape it had;
+[OVERLAY.md](OVERLAY.md) has rules for sway and river, and explains why a
+window rule alone cannot do this on Hyprland.
 
 ## 8. The microphone track
 

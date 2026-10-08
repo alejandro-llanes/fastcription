@@ -223,16 +223,6 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 .color(app.palette.secondary),
         );
     }
-    if app.engines.is_empty() && app.models.is_empty() {
-        ui.label(
-            egui::RichText::new(t(
-                "voxtype did not report its engines or models; the fields above are free text.",
-            ))
-            .small()
-            .color(app.palette.secondary),
-        );
-    }
-
     if ui
         .small_button(t("Use voxtype's defaults"))
         .on_hover_text(t(
@@ -242,6 +232,16 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         .clicked()
     {
         app.reset_engine_to_voxtype();
+    }
+
+    if app.engines.is_empty() && app.models.is_empty() {
+        ui.label(
+            egui::RichText::new(t(
+                "voxtype did not report its engines or models; the fields above are free text.",
+            ))
+            .small()
+            .color(app.palette.secondary),
+        );
     }
 
     ui.add_space(8.0);

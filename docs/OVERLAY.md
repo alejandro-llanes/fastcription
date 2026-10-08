@@ -60,42 +60,56 @@ current.
 
 winit has no layer-shell backend: on Wayland, "always on top" is an
 `xdg_toplevel` hint the compositor is free to ignore, not a protocol guarantee
-the way `zwlr_layer_shell_v1` would be. On this machine (Hyprland/Omarchy) that
-means compact mode needs a window rule to actually float above a fullscreened
-meeting window; without one, a focused call can still cover it.
+the way `zwlr_layer_shell_v1` would be. Worse, egui cannot resize its own
+window on Wayland at all — measured against this workspace's egui revision, a
+window opens at the size it asks for and every later resize request is ignored,
+floating or tiled. So compact mode cannot shrink itself.
 
-The rule matches on the **window title**, `fastcription — captions`, because
-that is what changes when compact mode is entered and reverts when it is left —
-the `app_id` stays `fastcription` for both shapes, so a rule on the app id
-would also apply to the full window. The em dash in the title is U+2014, with
-an ordinary space on each side.
+## Hyprland: nothing to configure
 
-## Hyprland
+On Hyprland, fastcription asks the compositor directly, through `hyprctl`, and
+no window rule is needed. Entering compact mode floats the window, resizes it
+to the caption bar and pins it to every workspace; leaving puts back whatever
+was there before, including leaving the window floating if that is how you
+already had it.
 
-Add to `~/.config/hypr/hyprland.conf` (or a file it `source`s, as Omarchy's
-`~/.config/hypr/windowrules.conf`):
+A window rule cannot do this job, which is worth recording because it is the
+obvious thing to try:
 
+- **A rule matched on the compact title does nothing.** Hyprland evaluates
+  window rules when a window maps and does not re-evaluate them when the title
+  changes, so neither `float` nor `size` ever fires for a window that is
+  already open. Verified with the rule installed before the window mapped.
+- **A rule matched on the class floats the window**, because the class is known
+  at map time — but a floating window still ignores the application's own
+  resize requests, so the captions fill the whole window.
+
+If you want the main window floating as well, that part is still yours to
+configure, and it does work on the class:
+
+```lua
+hl.window_rule({
+    name = "fastcription",
+    match = { class = "^fastcription$" },
+    float = true,
+})
 ```
-windowrulev2 = float, title:^(fastcription — captions)$
-windowrulev2 = pin, title:^(fastcription — captions)$
-windowrulev2 = noborder, title:^(fastcription — captions)$
-windowrulev2 = noshadow, title:^(fastcription — captions)$
-windowrulev2 = stayfocused, title:^(fastcription — captions)$, negative:true
-```
 
-- `float` takes it out of tiling, so it keeps the size the app requests.
-- `pin` keeps it visible on every workspace, including over a fullscreened
-  window — this is what the always-on-top hint cannot get on its own.
-- `noborder`/`noshadow` match compact mode's own undecorated styling.
-- The `stayfocused ... negative:true` rule stops Hyprland from ever handing the
-  captions keyboard focus, so a meeting app underneath keeps its own focus while
-  the captions float on top of it. Note the consequence: with focus never
-  arriving, `Esc` cannot reach fastcription, which is why compact mode draws its
-  own **Restore** button.
-
-Reload with `hyprctl reload`, or restart Hyprland.
+Hyprland 0.56 configures in Lua; older releases take
+`windowrule = float, class:^(fastcription)$`. fastcription tries the Lua
+dispatcher first and falls back to the older `hyprctl dispatch` syntax, so one
+binary serves both — though only the Lua path has been exercised here.
 
 ## sway / river
+
+fastcription only drives Hyprland. Everywhere else compact mode changes what is
+drawn and leaves the window alone, so the caption bar is whatever size the
+window already is, and these rules are how to give it a shape.
+
+Whether a title-matched rule applies to a window that is already open is a
+compositor's own business, and neither of these was tested here — if the rule
+appears to do nothing, that is why, and matching on `app_id` instead will at
+least apply from the moment the window opens.
 
 Neither has `pin`; the equivalent is marking the window for every workspace and
 keeping it floating.

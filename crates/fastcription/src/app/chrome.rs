@@ -26,14 +26,16 @@ pub(super) const COMPACT_TITLE: &str = "fastcription — captions";
 /// Compact mode's window size: wide enough for a sentence at 22 pt, short
 /// enough to sit under a video call without covering a face.
 const COMPACT_SIZE: [f32; 2] = [760.0, 170.0];
-
-/// How many committed lines compact mode shows above the live one.
-const COMPACT_LINES: usize = 4;
+/// The main window's size minimum, matching what `main.rs` opens it with.
+const MAIN_MIN_SIZE: [f32; 2] = [760.0, 480.0];
 
 /// The source picker's width. Wide enough for a sink input's application name
 /// and most device descriptions, narrow enough that the transport still fits
 /// beside it at the window's 760 pt minimum.
 const COMBO_WIDTH: f32 = 230.0;
+/// How many characters of a source name the picker shows. Chosen to sit inside
+/// `COMBO_WIDTH` at the default text size.
+const COMBO_CHARS: usize = 34;
 
 impl App {
     /// Re-applies everything tied to an `egui::Context`: fonts, text
@@ -263,19 +265,16 @@ impl App {
         }
         self.compact = compact;
         if compact {
-            // `viewport_rect` rather than `viewport().inner_rect`: on Wayland
-            // the compositor never tells a client where its window is, so the
-            // viewport info's rect is `None` and this is the only size there is.
-            self.restore_size = Some(ctx.viewport_rect().size());
             self.apply_compact(ctx);
         } else {
-            let size = self
-                .restore_size
-                .take()
-                .unwrap_or(egui::vec2(1180.0, 760.0));
+            // The size to go back to is the compositor's to remember, since it
+            // is the compositor that changed it; the minimum is this window's
+            // own and has to be put back, or nothing stops the user dragging
+            // the restored window down to a caption bar's height.
+            ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(MAIN_MIN_SIZE.into()));
+            crate::compositor::leave_compact();
             ctx.send_viewport_cmd(ViewportCommand::Decorations(true));
             ctx.send_viewport_cmd(ViewportCommand::WindowLevel(WindowLevel::Normal));
-            ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
             // Not sent here: `sync_title` owns the ordinary title and knows
             // whether the session is recording, which this does not. Clearing
             // what the compositor was last told is what makes it send one.
@@ -284,7 +283,13 @@ impl App {
     }
 
     fn apply_compact(&mut self, ctx: &egui::Context) {
-        ctx.send_viewport_cmd(ViewportCommand::InnerSize(COMPACT_SIZE.into()));
+        // Both halves are needed. The size minimum is the window's own, and a
+        // compositor honours it, so without lowering it first the caption bar
+        // is clamped to `MAIN_MIN_SIZE` — measured: a resize to 760x170 landed
+        // at 760x480. Lowering the minimum works (it is a different winit
+        // call); only the resize itself has to go through the compositor.
+        ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(COMPACT_SIZE.into()));
+        crate::compositor::enter_compact(COMPACT_SIZE);
         ctx.send_viewport_cmd(ViewportCommand::Decorations(false));
         ctx.send_viewport_cmd(ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop));
         ctx.send_viewport_cmd(ViewportCommand::Title(COMPACT_TITLE.to_owned()));
@@ -319,43 +324,65 @@ impl App {
                     });
                 });
 
-                egui::ScrollArea::vertical()
-                    .id_salt("compact-transcript")
-                    .auto_shrink([false, false])
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        let hidden = self.segments.len().saturating_sub(COMPACT_LINES);
-                        for segment in self.segments.iter().skip(hidden) {
-                            ui.label(
-                                RichText::new(&segment.text)
-                                    .size(size)
-                                    .color(self.palette.text),
-                            );
-                        }
-                        let mut pending: Vec<&fc_core::Segment> =
-                            self.provisional.values().collect();
-                        pending.sort_by_key(|segment| segment.seq);
-                        for segment in pending {
-                            // The in-flight tail is replaced on every pass, so
-                            // it is marked as not yet settled — in italics, at
-                            // a colour that still clears AA. It used to be
-                            // drawn in `dim`, which made the newest words on
-                            // screen the hardest ones to read.
-                            ui.label(
-                                RichText::new(&segment.text)
-                                    .size(size)
-                                    .italics()
-                                    .color(self.palette.secondary),
-                            );
-                        }
-                        if self.segments.is_empty() && self.provisional.is_empty() {
-                            ui.label(
-                                RichText::new(t("Waiting for speech…"))
-                                    .size(size)
-                                    .color(self.palette.secondary),
-                            );
-                        }
+                // Whole lines only, newest at the bottom. A scroll area stuck
+                // to the bottom cut the oldest visible line horizontally
+                // through its glyphs, which in a caption bar reads as broken
+                // rather than as scrolled, so the lines that fit are measured
+                // and the rest are left out.
+                let wrap = ui.available_width();
+                let budget = ui.available_height();
+                let font = egui::FontId::proportional(size);
+                let mut lines: Vec<(&str, bool)> = Vec::new();
+
+                let mut pending: Vec<&fc_core::Segment> = self.provisional.values().collect();
+                pending.sort_by_key(|segment| segment.seq);
+                // Newest first while measuring, then reversed to read in order.
+                for segment in pending.iter().rev() {
+                    lines.push((segment.text.as_str(), true));
+                }
+                for segment in self.segments.iter().rev() {
+                    lines.push((segment.text.as_str(), false));
+                }
+
+                let spacing = ui.spacing().item_spacing.y;
+                let mut used = 0.0;
+                let mut shown = 0;
+                for (text, _) in &lines {
+                    let galley = ui.painter().layout(
+                        (*text).to_owned(),
+                        font.clone(),
+                        self.palette.text,
+                        wrap,
+                    );
+                    let height = galley.size().y + spacing;
+                    if shown > 0 && used + height > budget {
+                        break;
+                    }
+                    used += height;
+                    shown += 1;
+                }
+                lines.truncate(shown);
+                lines.reverse();
+
+                if lines.is_empty() {
+                    ui.label(
+                        RichText::new(t("Waiting for speech…"))
+                            .size(size)
+                            .color(self.palette.secondary),
+                    );
+                }
+                for (text, unsettled) in lines {
+                    // The in-flight tail is replaced on every pass, so it is
+                    // marked as not yet settled — in italics, at a colour that
+                    // still clears AA. It used to be drawn in `dim`, which made
+                    // the newest words on screen the hardest ones to read.
+                    let rich = RichText::new(text).size(size);
+                    ui.label(if unsettled {
+                        rich.italics().color(self.palette.secondary)
+                    } else {
+                        rich.color(self.palette.text)
                     });
+                }
             });
         if leave {
             let ctx = ui.ctx().clone();
@@ -753,14 +780,12 @@ pub(super) fn source_combo(app: &mut App, ui: &mut egui::Ui, id_salt: &str) {
     };
     ui.add_enabled_ui(!locked, |ui| {
         let combo = egui::ComboBox::from_id_salt(id_salt)
-            .selected_text(current.clone())
-            // Bounded and elided, because the label is the sound server's and
-            // can be sixty characters of "Monitor of Built-in Audio Analogue
-            // Stereo": an unbounded picker pushed the transport buttons off the
-            // right edge of the window, which is the bug the status bar below
-            // was split out to fix.
+            // Elided here rather than by the widget: `ComboBox::width` sizes
+            // the drop-down menu, not the button, so the button grew to the
+            // sound server's full name — measured at 630 points for one HDMI
+            // monitor, which pushed the transport off the edge of the window.
+            .selected_text(elide(&current, COMBO_CHARS))
             .width(COMBO_WIDTH)
-            .truncate()
             .show_ui(ui, |ui| {
                 if app.sources.is_empty() {
                     ui.label(t("Nothing to record"));
@@ -902,6 +927,25 @@ pub(super) fn transport_for(key: TransportKey, state: SessionState) -> Option<Tr
     }
 }
 
+/// Shortens a label to fit a fixed-width control, keeping both ends.
+///
+/// A source name carries its meaning at both ends — "Monitor of" at the front
+/// and the device at the back, as in "Monitor of 800 Series … (HDMI)
+/// [U28E590]" — so the middle is what goes.
+pub(super) fn elide(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars || max_chars < 5 {
+        return text.to_owned();
+    }
+    let keep = max_chars - 1;
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    let chars: Vec<char> = text.chars().collect();
+    let front: String = chars[..head].iter().collect();
+    let back: String = chars[count - tail..].iter().collect();
+    format!("{}\u{2026}{}", front.trim_end(), back.trim_start())
+}
+
 /// What to select when nothing was remembered.
 ///
 /// The monitor of the default sink is what the user is actually hearing, so it
@@ -941,7 +985,7 @@ pub(super) fn reselect(previous: Option<&AudioSource>, sources: &[AudioSource]) 
 
 #[cfg(test)]
 mod tests {
-    use super::{default_selection, reselect, transport_for, Transport, TransportKey};
+    use super::{default_selection, elide, reselect, transport_for, Transport, TransportKey};
     use fc_core::{AudioSource, SessionState, SourceKind};
 
     /// One key starts and resumes, because a reader who paused to answer the
@@ -1006,6 +1050,21 @@ mod tests {
 
     fn monitor(name: &str) -> AudioSource {
         AudioSource::named(SourceKind::SinkMonitor, name, name)
+    }
+
+    #[test]
+    fn a_source_name_is_elided_in_the_middle_keeping_both_ends() {
+        let long = "Monitor of 800 Series Chipset Family Audio Context Engine (ACE) Digital Stereo (HDMI) [U28E590]";
+        let short = elide(long, 34);
+        assert_eq!(short.chars().count(), 34);
+        assert!(short.starts_with("Monitor of"), "{short}");
+        assert!(short.ends_with("[U28E590]"), "{short}");
+        assert!(short.contains('\u{2026}'));
+        // Short enough already: left exactly alone.
+        assert_eq!(elide("Built-in Audio", 34), "Built-in Audio");
+        // Multi-byte text must not be split through a character.
+        let cjk = "会議の音声をここから取り込みます、とても長い名前です";
+        assert_eq!(elide(cjk, 10).chars().count(), 10);
     }
 
     #[test]

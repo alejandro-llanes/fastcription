@@ -30,11 +30,14 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal_wrapped(|ui| {
         ui.heading(t("Live transcript"));
         ui.separator();
+        // Labelled in front and showing its value: a bare slider with a word
+        // after it reads as a stray control rather than as a text size.
+        ui.label(t("Text size"));
         ui.add(
             egui::Slider::new(&mut app.settings.transcript_pt, transcript::PT_RANGE)
-                .show_value(false)
                 .step_by(1.0)
-                .text(t("size")),
+                .fixed_decimals(0)
+                .suffix(" pt"),
         )
         .on_hover_text(t(
             "How large the transcript is drawn, here and in compact mode. \

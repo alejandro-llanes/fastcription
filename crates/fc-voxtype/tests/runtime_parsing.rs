@@ -189,7 +189,10 @@ fn dropping_the_receiver_stops_the_watcher_thread() {
     let voxtype_dir = base.path().join("voxtype");
     std::fs::create_dir_all(&voxtype_dir).expect("create voxtype dir");
 
-    let before = thread_count();
+    // The serial guard orders the tests but not the teardown: the previous
+    // test's watcher may still be on its way out when this one starts
+    // counting, which made this assertion fail about one run in three.
+    let before = wait_for_no_watchers();
     assert_eq!(
         before, 0,
         "no other watcher may be running: see watcher_guard"
@@ -245,6 +248,19 @@ where
 /// back a receiver, not a join handle, so there is nothing else to observe. By
 /// name rather than in total, because the test harness and `notify` have threads
 /// of their own coming and going.
+/// Waits for every watcher thread from an earlier test to exit, returning the
+/// count that remains. Bounded, so a genuine leak still fails the assertion
+/// that follows rather than hanging the suite.
+fn wait_for_no_watchers() -> usize {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut count = thread_count();
+    while count > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        count = thread_count();
+    }
+    count
+}
+
 fn thread_count() -> usize {
     std::fs::read_dir("/proc/self/task")
         .expect("read /proc/self/task")
