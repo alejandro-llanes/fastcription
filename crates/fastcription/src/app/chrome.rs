@@ -377,6 +377,43 @@ impl App {
         }
     }
 
+    /// One caption line, laid out exactly as it will be painted.
+    ///
+    /// Both the fitting and the drawing go through here, which is the whole
+    /// point: a line measured in one face and drawn in another wraps to a
+    /// different number of rows, and the difference lands on the reader as
+    /// text over the controls.
+    fn caption_galley(
+        &self,
+        ui: &egui::Ui,
+        text: &str,
+        unsettled: bool,
+        size: f32,
+        wrap: f32,
+    ) -> std::sync::Arc<egui::Galley> {
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap.max_width = wrap;
+        job.append(
+            text,
+            0.0,
+            egui::TextFormat {
+                font_id: egui::FontId::proportional(size),
+                // The in-flight tail is replaced on every pass, so it is marked
+                // as not yet settled — in italics, at a colour that still
+                // clears AA. It used to be drawn in `dim`, which made the
+                // newest words on screen the hardest ones to read.
+                color: if unsettled {
+                    self.palette.secondary
+                } else {
+                    self.palette.text
+                },
+                italics: unsettled,
+                ..Default::default()
+            },
+        );
+        ui.painter().layout_job(job)
+    }
+
     /// Captions and nothing else: the last few committed lines, then the one
     /// being spoken, in italics because its tail is still being revised.
     fn compact_frame(&mut self, ui: &mut egui::Ui) {
@@ -400,7 +437,14 @@ impl App {
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             leave = ui
-                                .small_button(t("Restore"))
+                                .add(
+                                    egui::Button::image(
+                                        crate::icons::Icon::Restore.image(self.palette.text, 14.0),
+                                    )
+                                    .fill(self.palette.surface)
+                                    .corner_radius(COMPACT_BUTTON / 2.0)
+                                    .min_size(egui::vec2(COMPACT_BUTTON, COMPACT_BUTTON)),
+                                )
                                 .on_hover_text(t("Back to the full window (Esc)"))
                                 .clicked();
                             // Between the clock and the Restore button, taking
@@ -422,19 +466,26 @@ impl App {
                     self.toggle_transcribing();
                 }
 
-                // Whole lines only, newest at the bottom. A scroll area stuck
-                // to the bottom cut the oldest visible line horizontally
-                // through its glyphs, which in a caption bar reads as broken
-                // rather than as scrolled, so the lines that fit are measured
-                // and the rest are left out.
-                let wrap = ui.available_width();
-                let budget = ui.available_height();
-                let font = egui::FontId::proportional(size);
-                let mut lines: Vec<(&str, bool)> = Vec::new();
+                // Newest at the bottom, whole lines only, and clipped to the
+                // room that is actually left.
+                //
+                // This used to measure every line in the regular face and then
+                // draw the line being spoken in italics. Italic glyphs are not
+                // the same width, so a provisional line could wrap to one more
+                // row than it had been measured at — and since the newest
+                // lines are the provisional ones, a strip full of them walked
+                // straight down over the controls. Laying out once and
+                // painting *that* galley is the only arrangement where the two
+                // cannot drift apart; clipping the painter means even a line
+                // longer than the whole strip stays inside it.
+                let (area, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
+                let painter = ui.painter_at(area);
+                let spacing = ui.spacing().item_spacing.y;
 
+                let mut lines: Vec<(&str, bool)> = Vec::new();
                 let mut pending: Vec<&fc_core::Segment> = self.provisional.values().collect();
                 pending.sort_by_key(|segment| segment.seq);
-                // Newest first while measuring, then reversed to read in order.
+                // Newest first: this paints upward from the bottom edge.
                 for segment in pending.iter().rev() {
                     lines.push((segment.text.as_str(), true));
                 }
@@ -442,44 +493,33 @@ impl App {
                     lines.push((segment.text.as_str(), false));
                 }
 
-                let spacing = ui.spacing().item_spacing.y;
-                let mut used = 0.0;
-                let mut shown = 0;
-                for (text, _) in &lines {
-                    let galley = ui.painter().layout(
-                        (*text).to_owned(),
-                        font.clone(),
-                        self.palette.text,
-                        wrap,
-                    );
-                    let height = galley.size().y + spacing;
-                    if shown > 0 && used + height > budget {
-                        break;
-                    }
-                    used += height;
-                    shown += 1;
-                }
-                lines.truncate(shown);
-                lines.reverse();
-
                 if lines.is_empty() {
-                    ui.label(
-                        RichText::new(t("Waiting for speech…"))
-                            .size(size)
-                            .color(self.palette.secondary),
-                    );
-                }
-                for (text, unsettled) in lines {
-                    // The in-flight tail is replaced on every pass, so it is
-                    // marked as not yet settled — in italics, at a colour that
-                    // still clears AA. It used to be drawn in `dim`, which made
-                    // the newest words on screen the hardest ones to read.
-                    let rich = RichText::new(text).size(size);
-                    ui.label(if unsettled {
-                        rich.italics().color(self.palette.secondary)
-                    } else {
-                        rich.color(self.palette.text)
-                    });
+                    let galley =
+                        self.caption_galley(ui, t("Waiting for speech…"), true, size, area.width());
+                    painter.galley(area.left_top(), galley, self.palette.secondary);
+                } else {
+                    let mut baseline = area.bottom();
+                    for (index, (text, unsettled)) in lines.iter().enumerate() {
+                        let galley = self.caption_galley(ui, text, *unsettled, size, area.width());
+                        let top = baseline - galley.size().y;
+                        // A line cut horizontally through its glyphs reads as
+                        // broken rather than as scrolled, so a line that does
+                        // not fit whole is left out. The newest line is the
+                        // exception: showing the last rows of what is being
+                        // said beats showing nothing at all.
+                        if top < area.top() && index > 0 {
+                            break;
+                        }
+                        painter.galley(
+                            egui::Pos2::new(area.left(), top),
+                            galley,
+                            self.palette.text,
+                        );
+                        baseline = top - spacing;
+                        if baseline <= area.top() {
+                            break;
+                        }
+                    }
                 }
             });
         if leave {

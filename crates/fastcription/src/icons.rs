@@ -31,5 +31,9 @@ fastframe_icons::icons! {
         StatusOk => lucide "circle-check",
         StatusWarn => lucide "circle-alert",
         Export => lucide "external-link",
+        /// Leave compact mode. The caption strip is too narrow to spend on the
+        /// word "Restore", and the two arrows say "make this big again" in a
+        /// shape anyone has already seen on a video player.
+        Restore => lucide "maximize-2",
     }
 }
