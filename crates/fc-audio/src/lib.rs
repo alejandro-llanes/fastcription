@@ -8,6 +8,7 @@
 //! — and capture sits behind [`capture::CaptureBackend`] so a native backend
 //! can replace the subprocess later without touching callers.
 
+mod bounded;
 pub mod capture;
 pub mod levels;
 pub mod sources;
@@ -22,6 +23,23 @@ pub enum AudioError {
     Spawn(&'static str, #[source] std::io::Error),
     #[error("`{0}` exited reporting an error: {1}")]
     CommandFailed(&'static str, String),
+    /// A command that never answered. Separate from [`Self::CommandFailed`]
+    /// because the remedy is different: nothing is wrong with the arguments,
+    /// the sound server is not responding.
+    #[error("`{command}` did not answer within {after:?}; the sound server may be restarting")]
+    Timeout {
+        command: String,
+        after: std::time::Duration,
+    },
+    /// More than one live stream fits the stored descriptor, and recording the
+    /// wrong half of a meeting is worse than asking. Raised by
+    /// [`sources::resolve`] and, on a reconnect, reported as
+    /// [`fc_core::SessionEvent::SourceLost`] while the capture keeps retrying.
+    #[error("{looked_for} matches {} streams right now ({}); fastcription will not guess which one to record", candidates.len(), candidates.join(", "))]
+    Ambiguous {
+        looked_for: String,
+        candidates: Vec<String>,
+    },
     #[error("failed to parse pactl output: {0}")]
     Json(#[from] serde_json::Error),
     #[error(transparent)]

@@ -1,10 +1,13 @@
 //! Locating the `voxtype` binary and reading its diagnostic subcommands.
 //!
-//! Every probe here fails independently: a missing model must not hide a
-//! found binary, and a binary at the wrong version must not hide installed
-//! models. [`probe`] is the one call the rest of the app needs to learn what
-//! is usable right now, and it never panics or short-circuits on the first
-//! failure.
+//! Every probe here fails independently: a missing model must not hide a found
+//! binary, and a binary at the wrong version must not hide installed models.
+//! None of them panics or short-circuits on the first failure.
+//!
+//! The probes are split by cost, not by subject: [`probe_catalog`] is the ~10 ms
+//! half (version, engines, models) and [`probe_health`] the ~290 ms half
+//! (devices, accel), measured below. [`probe`] runs both, for a caller that
+//! genuinely wants all five.
 //!
 //! voxtype's `info *` subcommands print for a human terminal, not a machine,
 //! so every parser here works on whitespace-split tokens and indentation
@@ -16,10 +19,19 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::bounded;
 use crate::error::{Result, VoxtypeError};
+
+/// Measured on this machine (voxtype 1.0.1): `--version`, `info engines` and
+/// `info models` answer in 2-4 ms, `info accel` in ~35 ms, and `info devices`
+/// in 239 ms cold (14 ms warm). Thirty seconds is therefore nowhere near any
+/// working call — it is the line past which the binary is wedged rather than
+/// slow. It has to exist because these run on the interface thread.
+const INFO_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Finds `voxtype` on `$PATH`, falling back to the path the Arch package
 /// installs it at. Returns `None` rather than erroring so a caller can show
@@ -52,14 +64,30 @@ fn is_executable(path: &Path) -> bool {
 }
 
 /// Runs `voxtype <args>`, returning stdout on success. A non-zero exit is an
-/// error carrying stderr, never an empty string standing in for failure.
+/// error carrying stderr, never an empty string standing in for failure, and a
+/// binary that never answers is [`VoxtypeError::Timeout`] rather than a wait.
 pub(crate) fn run(binary: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new(binary).args(args).output()?;
+    run_within(binary, args, INFO_TIMEOUT)
+}
+
+/// The timeout is a parameter so the give-up path can be tested against a
+/// deliberately slow fake binary without a test spending the real budget.
+pub(crate) fn run_within(binary: &Path, args: &[&str], timeout: Duration) -> Result<String> {
+    let mut command = Command::new(binary);
+    command.args(args);
+    let described = || format!("{} {}", binary.display(), args.join(" "));
+
+    let Some(output) = bounded::output_within(&mut command, timeout)? else {
+        return Err(VoxtypeError::Timeout {
+            command: described(),
+            after: timeout,
+        });
+    };
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
         Err(VoxtypeError::CommandFailed {
-            command: format!("{} {}", binary.display(), args.join(" ")),
+            command: described(),
             status: output.status,
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
@@ -222,8 +250,14 @@ pub struct AccelInfo {
     pub daemon: Option<String>,
 }
 
-pub fn parse_accel(text: &str) -> AccelInfo {
+/// An all-`None` [`AccelInfo`] is indistinguishable from a successful parse of
+/// output that said nothing this module recognises, so text with no recognised
+/// key at all is an error (the crate's rule, see [`crate::error`]). Individual
+/// missing keys stay `None`: `backend` is genuinely absent on a CPU-only
+/// machine, and a daemon that is not running reports no `daemon` line.
+pub fn parse_accel(text: &str) -> Result<AccelInfo> {
     let mut info = AccelInfo::default();
+    let mut recognised = false;
     for line in text.lines() {
         let Some((key, value)) = line.split_once(':') else {
             continue;
@@ -237,10 +271,18 @@ pub fn parse_accel(text: &str) -> AccelInfo {
             "backend" => info.backend = Some(value.to_string()),
             "variant" => info.variant = Some(value.to_string()),
             "daemon" => info.daemon = Some(value.to_string()),
-            _ => {}
+            _ => continue,
         }
+        recognised = true;
     }
-    info
+    if !recognised {
+        return Err(VoxtypeError::Parse {
+            command: "info accel",
+            reason: "no state/backend/variant/daemon line found".into(),
+            text: text.to_string(),
+        });
+    }
+    Ok(info)
 }
 
 /// `voxtype status --format json --extended`, one line per state change.
@@ -293,8 +335,76 @@ pub fn status(binary: &Path) -> Result<StatusInfo> {
     })
 }
 
-/// A full health report: what the UI shows for "is voxtype usable, and how".
-/// Every field fails on its own, stringified so the struct stays `Clone`.
+/// What voxtype can be asked to do: its version and the engines and models it
+/// knows about. Every field fails on its own, stringified so the struct stays
+/// `Clone`.
+///
+/// Cheap on purpose. Measured on this machine (voxtype 1.0.1): `--version`,
+/// `info engines` and `info models` cost 2-4 ms each, about 10 ms for the three.
+/// This is what the settings pane needs, and keeping it apart from
+/// [`probe_health`] is the difference between opening that pane costing 10 ms
+/// and costing 290 ms.
+#[derive(Debug, Clone)]
+pub struct Catalog {
+    pub version: std::result::Result<String, String>,
+    pub engines: std::result::Result<Vec<EngineEntry>, String>,
+    pub models: std::result::Result<Vec<ModelEntry>, String>,
+}
+
+/// What the machine can actually do right now: capture devices and GPU
+/// acceleration.
+///
+/// The slow half. `info devices` measured 239 ms cold on this machine (14 ms
+/// warm, so the cost is enumerating ALSA, not voxtype) and `info accel` ~35 ms.
+/// Nothing in the app needs these to start recording, so nothing should pay for
+/// them until it asks.
+#[derive(Debug, Clone)]
+pub struct Health {
+    pub devices: std::result::Result<Vec<DeviceEntry>, String>,
+    pub accel: std::result::Result<AccelInfo, String>,
+}
+
+pub fn probe_catalog() -> Catalog {
+    let Some(bin) = find_binary() else {
+        let missing = || VoxtypeError::BinaryNotFound.to_string();
+        return Catalog {
+            version: Err(missing()),
+            engines: Err(missing()),
+            models: Err(missing()),
+        };
+    };
+    Catalog {
+        version: version(&bin).map_err(|e| e.to_string()),
+        engines: run(&bin, &["info", "engines"])
+            .and_then(|t| parse_engines(&t))
+            .map_err(|e| e.to_string()),
+        models: run(&bin, &["info", "models"])
+            .and_then(|t| parse_models(&t))
+            .map_err(|e| e.to_string()),
+    }
+}
+
+pub fn probe_health() -> Health {
+    let Some(bin) = find_binary() else {
+        let missing = || VoxtypeError::BinaryNotFound.to_string();
+        return Health {
+            devices: Err(missing()),
+            accel: Err(missing()),
+        };
+    };
+    Health {
+        devices: run(&bin, &["info", "devices"])
+            .map(|t| parse_devices(&t))
+            .map_err(|e| e.to_string()),
+        accel: run(&bin, &["info", "accel"])
+            .and_then(|t| parse_accel(&t))
+            .map_err(|e| e.to_string()),
+    }
+}
+
+/// Both halves at once, plus where the binary is. Five subprocesses, so a
+/// caller that reads two fields should call [`probe_catalog`] or
+/// [`probe_health`] instead.
 #[derive(Debug, Clone)]
 pub struct Probe {
     pub binary: Option<PathBuf>,
@@ -306,32 +416,60 @@ pub struct Probe {
 }
 
 pub fn probe() -> Probe {
-    let binary = find_binary();
-    let Some(bin) = binary.clone() else {
-        let missing = || VoxtypeError::BinaryNotFound.to_string();
-        return Probe {
-            binary: None,
-            version: Err(missing()),
-            engines: Err(missing()),
-            models: Err(missing()),
-            devices: Err(missing()),
-            accel: Err(missing()),
-        };
-    };
+    let catalog = probe_catalog();
+    let health = probe_health();
     Probe {
-        binary,
-        version: version(&bin).map_err(|e| e.to_string()),
-        engines: run(&bin, &["info", "engines"])
-            .and_then(|t| parse_engines(&t))
-            .map_err(|e| e.to_string()),
-        models: run(&bin, &["info", "models"])
-            .and_then(|t| parse_models(&t))
-            .map_err(|e| e.to_string()),
-        devices: run(&bin, &["info", "devices"])
-            .map(|t| parse_devices(&t))
-            .map_err(|e| e.to_string()),
-        accel: run(&bin, &["info", "accel"])
-            .map(|t| parse_accel(&t))
-            .map_err(|e| e.to_string()),
+        binary: find_binary(),
+        version: catalog.version,
+        engines: catalog.engines,
+        models: catalog.models,
+        devices: health.devices,
+        accel: health.accel,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::bounded::fake_binary;
+
+    /// These probes run on the interface thread, so a `voxtype` that never
+    /// answers would freeze the window rather than report anything.
+    #[test]
+    fn a_voxtype_that_never_answers_times_out_instead_of_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = fake_binary(dir.path(), "slow-voxtype", "#!/bin/sh\nexec sleep 30\n");
+
+        // A shorter budget than production's `INFO_TIMEOUT`: what is under test
+        // is that a wedged binary becomes an error, not the constant's value.
+        let budget = Duration::from_millis(200);
+        let start = std::time::Instant::now();
+        let err = run_within(&script, &["info", "engines"], budget)
+            .expect_err("a wedged binary must be an error, not a wait");
+        match err {
+            VoxtypeError::Timeout { after, command } => {
+                assert_eq!(after, budget);
+                assert!(command.contains("info engines"), "{command}");
+            }
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_prompt_binary_still_returns_its_stdout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = fake_binary(
+            dir.path(),
+            "quick-voxtype",
+            "#!/bin/sh\necho voxtype 1.0.1\n",
+        );
+        let out = version(&script).expect("parses");
+        assert_eq!(out, "1.0.1");
     }
 }

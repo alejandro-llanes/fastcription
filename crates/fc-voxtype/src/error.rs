@@ -19,6 +19,17 @@ pub enum VoxtypeError {
         stderr: String,
     },
 
+    /// A command that ran but never answered. Separate from
+    /// [`Self::CommandFailed`]: nothing is wrong with the arguments, and the
+    /// caller's remedy ("try again later") is different. This exists because
+    /// these calls run on the interface thread, where an unbounded wait is a
+    /// frozen window.
+    #[error("`{command}` did not answer within {after:?}")]
+    Timeout {
+        command: String,
+        after: std::time::Duration,
+    },
+
     /// Output came back, but it did not match what this adapter expects.
     /// Carries the raw text so a bug report can include exactly what voxtype
     /// printed, rather than a caller guessing from a generic message.

@@ -1142,6 +1142,7 @@ dependencies = [
  "crossbeam-channel",
  "fc-core",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tracing",
 ]
@@ -1191,6 +1192,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "toml",
+ "tracing",
 ]
 
 [[package]]

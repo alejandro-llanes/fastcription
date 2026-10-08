@@ -22,9 +22,10 @@
 //! is a parse error, never silently treated as an empty transcript, because
 //! that would quietly drop real meeting audio.
 
-use std::io::Read;
-use std::path::Path;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use fc_core::{EngineInfo, Segment};
@@ -34,6 +35,15 @@ use crate::transcriber::{AsrError, Transcriber};
 const LOADING_PREFIX: &str = "Loading audio file:";
 const FORMAT_PREFIX: &str = "Audio format:";
 const PROCESSING_PREFIX: &str = "Processing ";
+
+/// What voxtype prints on stderr when `--model` names something it has never
+/// heard of. It then **exits 0** having transcribed with its own default model,
+/// so without this check the `EngineInfo` recorded with the conversation claims
+/// a model that never ran. Measured on voxtype 1.0.1: the string lives in the
+/// binary (`strings` finds `Unknown model '…', using default model '…'`) but
+/// `-q` suppressed it on this machine's `transcribe` path, so this is a guard
+/// against the builds and engines that do print it, not a verified capture.
+const UNKNOWN_MODEL_MARKER: &str = "Unknown model";
 
 /// Floor under the duration-scaled default timeout, so a very short chunk
 /// (which still pays model-load cost) isn't given an unreasonably tight
@@ -122,14 +132,26 @@ fn parse_transcript_output(stdout: &str) -> Result<String, AsrError> {
     Ok(transcript.trim().to_string())
 }
 
-fn write_wav(path: &Path, pcm: &[f32], sample_rate: u32) -> Result<(), AsrError> {
+/// Rewrites `file` from the start as a 16-bit mono WAV of `pcm`.
+///
+/// Takes an open file rather than a path because one `VoxtypeCli` reuses a
+/// single scratch file for every pass: a pass runs about once a second for the
+/// length of a meeting, and a three-hour meeting creating and unlinking that
+/// many temporary WAVs — each holding up to `max_utterance` of audio, ~640 KB
+/// at 20 s — churns through gigabytes for no reason. Truncating first matters:
+/// a shorter utterance must not leave the tail of a longer one behind the
+/// header it just wrote.
+fn rewrite_wav(file: &mut std::fs::File, pcm: &[f32], sample_rate: u32) -> Result<(), AsrError> {
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut writer = hound::WavWriter::create(path, spec)
+    file.seek(SeekFrom::Start(0)).map_err(AsrError::TempFile)?;
+    file.set_len(0).map_err(AsrError::TempFile)?;
+
+    let mut writer = hound::WavWriter::new(&mut *file, spec)
         .map_err(|e| AsrError::TempFile(std::io::Error::other(e)))?;
     for &s in pcm {
         let clamped = s.clamp(-1.0, 1.0);
@@ -141,43 +163,33 @@ fn write_wav(path: &Path, pcm: &[f32], sample_rate: u32) -> Result<(), AsrError>
     writer
         .finalize()
         .map_err(|e| AsrError::TempFile(std::io::Error::other(e)))?;
+    // voxtype reads this file from another process, so the bytes have to be out
+    // of our buffers before it is told the path.
+    file.flush().map_err(AsrError::TempFile)?;
     Ok(())
 }
 
 /// Runs `child` to completion, reading stdout/stderr on background threads so
-/// a chatty process can't deadlock the pipe, and killing it if `timeout`
-/// elapses first.
+/// a chatty process can't deadlock the pipe, and giving up after `timeout`.
 ///
-/// On timeout the reader threads are deliberately **not** joined. `child.kill()`
-/// only terminates the direct child; if it had forked a descendant that
-/// inherited our stdout/stderr pipes (the ordinary case for e.g. a wrapper
-/// shell script: the shell itself dies, but a command it ran keeps running
-/// and keeps the pipe's write end open), the pipe never sees EOF until that
-/// orphan exits on its own -- which may be long after `timeout`, or never.
-/// Joining here would silently turn a bounded timeout into an unbounded hang,
-/// which is worse than the thing it's meant to prevent. The reader threads
-/// are abandoned instead: each one still exits and is cleaned up by the OS
-/// the moment its pipe actually closes, we just don't wait around for it.
+/// **`timeout` bounds the whole call, not just the wait for the child.**
+/// `child.kill()` only terminates the direct child; a descendant that inherited
+/// our stdout/stderr pipes keeps their write ends open, so the pipe sees no EOF
+/// until that orphan exits on its own -- which may be long after `timeout`, or
+/// never. That is reachable in normal use: `--gpu-isolation` runs the model in a
+/// helper process, and a wrapper shell script around `voxtype` does the same
+/// thing by accident. If the child's exit were followed by a plain `join` on the
+/// readers, such a run would wedge `transcribe()` for ever, which wedges the
+/// stream thread, which means `Session::stop` never returns. So the readers hand
+/// their buffers over a channel and are waited on with whatever is left of the
+/// budget; on expiry they are abandoned, each still exiting and being reaped by
+/// the OS the moment its pipe actually closes.
 fn run_with_timeout(
     mut child: std::process::Child,
     timeout: Duration,
 ) -> Result<std::process::Output, AsrError> {
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-    let stdout_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(p) = stdout_pipe.as_mut() {
-            let _ = p.read_to_end(&mut buf);
-        }
-        buf
-    });
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(p) = stderr_pipe.as_mut() {
-            let _ = p.read_to_end(&mut buf);
-        }
-        buf
-    });
+    let stdout_rx = read_to_end_on_a_thread(child.stdout.take());
+    let stderr_rx = read_to_end_on_a_thread(child.stderr.take());
 
     let start = Instant::now();
     let status = loop {
@@ -187,7 +199,6 @@ fn run_with_timeout(
                 if start.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    // Not joined -- see the doc comment above.
                     return Err(AsrError::Timeout { timeout });
                 }
                 std::thread::sleep(Duration::from_millis(20));
@@ -195,8 +206,10 @@ fn run_with_timeout(
         }
     };
 
-    let stdout = stdout_handle.join().unwrap_or_default();
-    let stderr = stderr_handle.join().unwrap_or_default();
+    let stdout = collect_within(&stdout_rx, timeout.saturating_sub(start.elapsed()))
+        .ok_or(AsrError::Timeout { timeout })?;
+    let stderr = collect_within(&stderr_rx, timeout.saturating_sub(start.elapsed()))
+        .ok_or(AsrError::Timeout { timeout })?;
     Ok(std::process::Output {
         status,
         stdout,
@@ -204,12 +217,42 @@ fn run_with_timeout(
     })
 }
 
+/// Drains one pipe on its own thread, handing the whole buffer back at EOF.
+fn read_to_end_on_a_thread<R: Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        let _ = tx.send(buf);
+    });
+    rx
+}
+
+/// `None` means the reader did not reach EOF in time -- someone still holds the
+/// pipe. A disconnected channel (the reader thread panicked) is treated as an
+/// empty read, since the caller's parse will reject it with the real stdout in
+/// the message.
+fn collect_within(rx: &mpsc::Receiver<Vec<u8>>, budget: Duration) -> Option<Vec<u8>> {
+    match rx.recv_timeout(budget) {
+        Ok(buf) => Some(buf),
+        Err(RecvTimeoutError::Timeout) => None,
+        Err(RecvTimeoutError::Disconnected) => Some(Vec::new()),
+    }
+}
+
 /// Adapter that shells out to `voxtype -q transcribe` for each chunk.
 ///
 /// Never writes to `~/.config/voxtype/config.toml` (ARCHITECTURE.md D6): all
 /// overrides go through per-invocation CLI flags, and a `None` override
 /// leaves voxtype to use whatever its own config file says.
-#[derive(Debug, Clone)]
+///
+/// Not `Clone`: the scratch WAV every pass rewrites is part of the adapter, and
+/// two clones transcribing at once would overwrite each other's audio. One
+/// adapter per stream, which is what `session.rs`'s per-track factory already
+/// builds.
+#[derive(Debug)]
 pub struct VoxtypeCli {
     binary: String,
     /// A config file passed as `-c`, for the settings voxtype exposes only
@@ -232,6 +275,11 @@ pub struct VoxtypeCli {
     /// (see [`TIMEOUT_REALTIME_MULTIPLE`]); `Some` pins an exact timeout,
     /// mainly useful for tests.
     timeout: Option<Duration>,
+    /// The one WAV every pass rewrites, created on the first pass and unlinked
+    /// when this adapter is dropped. Behind a mutex because [`Transcriber`] is
+    /// `&self`: the lock is held for the whole subprocess run, so a second
+    /// caller waits rather than rewriting the file voxtype is reading.
+    scratch: Mutex<Option<tempfile::NamedTempFile>>,
 }
 
 impl Default for VoxtypeCli {
@@ -245,6 +293,7 @@ impl Default for VoxtypeCli {
             threads: Some(default_thread_count()),
             translate: false,
             timeout: None,
+            scratch: Mutex::new(None),
         }
     }
 }
@@ -362,12 +411,33 @@ impl Transcriber for VoxtypeCli {
             return Ok(Vec::new());
         }
 
-        let tmp = tempfile::Builder::new()
-            .prefix("fc-asr-")
-            .suffix(".wav")
-            .tempfile()
-            .map_err(AsrError::TempFile)?;
-        write_wav(tmp.path(), pcm, sample_rate)?;
+        // Checked here rather than once at construction: the file is written by
+        // the app at session start and could be removed underneath a running
+        // meeting. `voxtype -c <missing>` exits 0 with its own defaults, so this
+        // is the only way the caller learns the optimisation stopped applying.
+        if let Some(config) = &self.config {
+            if !config.exists() {
+                return Err(AsrError::ConfigMissing(config.clone()));
+            }
+        }
+
+        // Held across the whole run: the path handed to voxtype must still hold
+        // this pass's audio when voxtype opens it.
+        let mut scratch = self
+            .scratch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if scratch.is_none() {
+            *scratch = Some(
+                tempfile::Builder::new()
+                    .prefix("fc-asr-")
+                    .suffix(".wav")
+                    .tempfile()
+                    .map_err(AsrError::TempFile)?,
+            );
+        }
+        let tmp = scratch.as_mut().expect("just created above");
+        rewrite_wav(tmp.as_file_mut(), pcm, sample_rate)?;
 
         let timeout = self
             .timeout
@@ -398,14 +468,21 @@ impl Transcriber for VoxtypeCli {
         })?;
 
         let output = run_with_timeout(child, timeout)?;
-        // `tmp` is dropped (and deleted) here regardless of the outcome
-        // below, since nothing after this point holds a borrow of it.
-        drop(tmp);
+        // The scratch file stays; the next pass rewrites it. Releasing the lock
+        // here keeps it held for exactly as long as voxtype held the file open.
+        drop(scratch);
 
         if !output.status.success() {
             return Err(AsrError::NonZeroExit {
                 status: output.status.code().unwrap_or(-1),
                 stderr: truncate_for_error(&String::from_utf8_lossy(&output.stderr)),
+            });
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains(UNKNOWN_MODEL_MARKER) {
+            return Err(AsrError::UnknownModel {
+                requested: self.model.clone().unwrap_or_else(|| "default".to_string()),
             });
         }
 
@@ -454,6 +531,51 @@ impl Transcriber for VoxtypeCli {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writes an executable shell script and hands back its path, for the
+    /// behaviours only an actual child process can produce (a wedged pipe, a
+    /// WARN on stderr, the argv a pass was given).
+    ///
+    /// The spawn-and-kill at the end is not pointless. Writing an executable in
+    /// one test thread while another test's `Command` forks leaves a window
+    /// where the forked child still holds an inherited write descriptor to the
+    /// new file, and the kernel refuses to exec a file anyone has open for
+    /// writing (`ETXTBSY`). That window is absorbed here, where retrying is
+    /// free, rather than surfacing as a baffling failure in whichever test lost
+    /// the race.
+    fn fake_binary(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join(name);
+        std::fs::write(&path, body).expect("write fake binary");
+        #[cfg(unix)]
+        {
+            let mut perms = std::fs::metadata(&path).expect("stat").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod");
+        }
+
+        for _ in 0..200 {
+            match Command::new(&path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(mut child) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+        path
+    }
 
     const GOLDEN_OK: &str = "Loading audio file: \"sp.wav\"\n\
 Audio format: 16000 Hz, 1 channel(s), Int\n\
@@ -638,16 +760,8 @@ hi\n";
     /// suite exercised `run_with_timeout`'s timeout branch at all.
     #[test]
     fn timeout_kills_and_reaps_a_hanging_child_promptly() {
-        use std::fs;
-        #[cfg(unix)]
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().expect("tempdir");
-        let script = dir.path().join("hang.sh");
-        fs::write(&script, "#!/bin/sh\nsleep 30\n").expect("write fake binary");
-        let mut perms = fs::metadata(&script).expect("stat script").permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script, perms).expect("chmod script");
+        let script = fake_binary(dir.path(), "hang.sh", "#!/bin/sh\nexec sleep 30\n");
 
         let cli = VoxtypeCli::new()
             .with_binary(script.to_str().expect("utf8 path"))
@@ -667,6 +781,164 @@ hi\n";
             elapsed < Duration::from_secs(5),
             "transcribe() took {elapsed:?}; the timed-out child was not killed/reaped promptly"
         );
+    }
+
+    /// The case a plain `join` on the reader threads turns into an unbounded
+    /// hang: the child exits promptly, but a descendant it left behind still
+    /// holds the stdout/stderr pipes, so EOF never comes. `--gpu-isolation` and
+    /// a wrapper shell script both produce exactly this shape, and a wedge here
+    /// wedges the stream thread, so `Session::stop` would never return.
+    #[test]
+    fn a_descendant_holding_the_pipe_does_not_outlast_the_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = fake_binary(dir.path(), "orphan.sh", "#!/bin/sh\nsleep 6 &\nexit 0\n");
+
+        let cli = VoxtypeCli::new()
+            .with_binary(script.to_str().expect("utf8 path"))
+            .with_timeout(Duration::from_millis(200));
+
+        let start = Instant::now();
+        let err = cli
+            .transcribe(&[0.1, -0.1, 0.2, -0.2], 16_000)
+            .expect_err("an unread pipe past the budget is a timeout");
+        let elapsed = start.elapsed();
+
+        assert!(matches!(err, AsrError::Timeout { .. }), "got {err:?}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "transcribe() took {elapsed:?}; it waited on the orphan's pipe \
+             instead of abandoning the reader"
+        );
+    }
+
+    /// A pass runs about once a second for the length of a meeting, so creating
+    /// and unlinking a temporary WAV per pass churns gigabytes over three hours.
+    #[test]
+    fn consecutive_passes_reuse_one_scratch_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("argv.log");
+        let script = fake_binary(
+            dir.path(),
+            "log.sh",
+            &format!(
+                "#!/bin/sh\n\
+                 for a in \"$@\"; do echo \"$a\" >> {log}; done\n\
+                 echo 'Loading audio file: \"x.wav\"'\n\
+                 echo 'Audio format: 16000 Hz, 1 channel(s), Int'\n\
+                 echo 'Processing 4 samples (0.00s)...'\n\
+                 echo ''\n\
+                 echo 'hello'\n",
+                log = log.display()
+            ),
+        );
+
+        let cli = VoxtypeCli::new().with_binary(script.to_str().expect("utf8 path"));
+        for _ in 0..2 {
+            cli.transcribe(&[0.1, -0.1, 0.2, -0.2], 16_000)
+                .expect("the fake binary produces a parseable transcript");
+        }
+
+        let logged = std::fs::read_to_string(&log).expect("read argv log");
+        let wavs: Vec<&str> = logged
+            .lines()
+            .filter(|line| line.ends_with(".wav"))
+            .collect();
+        assert_eq!(
+            wavs.len(),
+            2,
+            "expected one wav path per pass, got {wavs:?}"
+        );
+        assert_eq!(wavs[0], wavs[1], "each pass created its own temporary WAV");
+    }
+
+    /// Truncation, not just rewinding: a short pass after a long one must not
+    /// leave the tail of the long one behind its own header.
+    #[test]
+    fn a_shorter_pass_does_not_inherit_the_previous_pass_audio() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("sizes.log");
+        let script = fake_binary(
+            dir.path(),
+            "size.sh",
+            &format!(
+                "#!/bin/sh\n\
+                 for a in \"$@\"; do case \"$a\" in *.wav) wc -c < \"$a\" >> {log};; esac; done\n\
+                 echo 'Loading audio file: \"x.wav\"'\n\
+                 echo 'Audio format: 16000 Hz, 1 channel(s), Int'\n\
+                 echo 'Processing 4 samples (0.00s)...'\n\
+                 echo ''\n\
+                 echo 'hello'\n",
+                log = log.display()
+            ),
+        );
+
+        let cli = VoxtypeCli::new().with_binary(script.to_str().expect("utf8 path"));
+        cli.transcribe(&vec![0.1_f32; 8_000], 16_000).expect("long");
+        cli.transcribe(&vec![0.1_f32; 100], 16_000).expect("short");
+
+        let sizes: Vec<u64> = std::fs::read_to_string(&log)
+            .expect("read size log")
+            .lines()
+            .map(|l| l.trim().parse().expect("numeric size"))
+            .collect();
+        assert_eq!(sizes.len(), 2);
+        assert!(
+            sizes[1] < sizes[0],
+            "the short pass's WAV was {} bytes after a {} byte pass: the file \
+             was not truncated",
+            sizes[1],
+            sizes[0]
+        );
+    }
+
+    /// `--model <unknown>` exits 0 and transcribes with voxtype's own default,
+    /// so without this the engine recorded with the conversation is false.
+    #[test]
+    fn an_unknown_model_is_an_error_not_a_silent_fallback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = fake_binary(
+            dir.path(),
+            "fallback.sh",
+            "#!/bin/sh\n\
+             echo \"WARN Unknown model 'nope', using default model 'base.en'\" >&2\n\
+             echo 'Loading audio file: \"x.wav\"'\n\
+             echo 'Audio format: 16000 Hz, 1 channel(s), Int'\n\
+             echo 'Processing 4 samples (0.00s)...'\n\
+             echo ''\n\
+             echo 'transcribed with the wrong model'\n",
+        );
+
+        let cli = VoxtypeCli::new()
+            .with_binary(script.to_str().expect("utf8 path"))
+            .with_model("nope");
+        let err = cli
+            .transcribe(&[0.1, -0.1], 16_000)
+            .expect_err("a silent model fallback must not look like success");
+        match err {
+            AsrError::UnknownModel { requested } => assert_eq!(requested, "nope"),
+            other => panic!("expected UnknownModel, got {other:?}"),
+        }
+    }
+
+    /// `voxtype -c <missing file>` also exits 0 with its own defaults, which
+    /// silently drops the context-window optimisation and remote mode.
+    #[test]
+    fn a_missing_config_file_fails_before_anything_is_spawned() {
+        // The binary name is deliberately absent too: reaching the spawn would
+        // report `BinaryNotFound`, so `ConfigMissing` proves the check ran first.
+        let cli = VoxtypeCli::new()
+            .with_binary("fc-asr-definitely-not-a-real-binary")
+            .with_config("/nonexistent/fastcription/voxtype.toml");
+        let err = cli.transcribe(&[0.1, 0.2], 16_000).unwrap_err();
+        match err {
+            AsrError::ConfigMissing(path) => {
+                assert_eq!(
+                    path,
+                    std::path::PathBuf::from("/nonexistent/fastcription/voxtype.toml")
+                );
+            }
+            other => panic!("expected ConfigMissing, got {other:?}"),
+        }
     }
 
     /// Runs the real `voxtype` CLI, which this crate otherwise never touches
@@ -754,6 +1026,7 @@ hi\n";
     #[test]
     fn overrides_precede_the_subcommand() {
         let cli = VoxtypeCli::new()
+            .with_config("/tmp/fastcription/voxtype.toml")
             .with_engine("parakeet")
             .with_model("large-v3-turbo")
             .with_language("es")
@@ -762,7 +1035,13 @@ hi\n";
         assert_eq!(
             cli.global_args(),
             vec![
+                // `-c` is the one override whose misplacement is invisible:
+                // voxtype after the subcommand exits 2, but voxtype with no
+                // `-c` transcribes happily with the user's own config, losing
+                // the optimisation and remote mode without a word.
                 "-q",
+                "-c",
+                "/tmp/fastcription/voxtype.toml",
                 "--engine",
                 "parakeet",
                 "--model",

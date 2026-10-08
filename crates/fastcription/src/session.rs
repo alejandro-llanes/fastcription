@@ -68,9 +68,7 @@ pub type CaptureFactory =
 
 /// The real capture: `parec` on the chosen PipeWire source.
 pub fn parec_captures() -> CaptureFactory {
-    Box::new(|source, pcm_tx, event_tx| {
-        Box::new(ParecCapture::start(source, pcm_tx, event_tx))
-    })
+    Box::new(|source, pcm_tx, event_tx| Box::new(ParecCapture::start(source, pcm_tx, event_tx)))
 }
 
 /// Builds the transcriber for a track. A factory rather than one shared
@@ -110,6 +108,12 @@ pub struct Session {
     pub events: Receiver<SessionEvent>,
     event_tx: Sender<SessionEvent>,
     paused: Arc<AtomicBool>,
+    /// Asks every stream thread to finalise the utterance it has in flight.
+    ///
+    /// Only the stream thread may touch its `TranscriptStream`, so a pause
+    /// cannot cut the sentence itself: it leaves this flag, and the thread acts
+    /// on it before dropping the next frame.
+    cut_pending: Arc<AtomicBool>,
     tracks: Vec<TrackRuntime>,
     store: SharedStore,
 }
@@ -134,20 +138,23 @@ impl Session {
             return Err(SessionError::UnusableSource(cfg.source.label()));
         }
 
-        let conversation = store.lock().expect("store mutex").create_conversation(
-            &NewConversation {
-                title: cfg.title.clone(),
-                group: cfg.group,
-                started_at: now,
-                source: cfg.source.clone(),
-                mic_track: cfg.mic_source.is_some(),
-                engine: cfg.engine.clone(),
-                voxtype_meeting_id: None,
-            },
-        )?;
+        let conversation =
+            store
+                .lock()
+                .expect("store mutex")
+                .create_conversation(&NewConversation {
+                    title: cfg.title.clone(),
+                    group: cfg.group,
+                    started_at: now,
+                    source: cfg.source.clone(),
+                    mic_track: cfg.mic_source.is_some(),
+                    engine: cfg.engine.clone(),
+                    voxtype_meeting_id: None,
+                })?;
 
         let (event_tx, events) = unbounded::<SessionEvent>();
         let paused = Arc::new(AtomicBool::new(false));
+        let cut_pending = Arc::new(AtomicBool::new(false));
         let transcriber = Arc::new(transcriber);
 
         let mut tracks = Vec::new();
@@ -159,6 +166,7 @@ impl Session {
             Arc::clone(&store),
             event_tx.clone(),
             Arc::clone(&paused),
+            Arc::clone(&cut_pending),
             Arc::clone(&transcriber),
             captures,
             true,
@@ -172,6 +180,7 @@ impl Session {
                 Arc::clone(&store),
                 event_tx.clone(),
                 Arc::clone(&paused),
+                Arc::clone(&cut_pending),
                 Arc::clone(&transcriber),
                 captures,
                 // Only the selected track reports levels: two tracks driving one
@@ -187,6 +196,7 @@ impl Session {
             events,
             event_tx,
             paused,
+            cut_pending,
             tracks,
             store,
         })
@@ -196,8 +206,15 @@ impl Session {
     /// meeting pause does. The consequence is that segment timestamps close the
     /// gap rather than preserving it: a transcript measures speech, not the
     /// wall clock.
+    ///
+    /// Which is exactly why pausing also cuts the utterance in flight. With the
+    /// gap closed and no cut, the sentence spoken before the pause and the one
+    /// spoken after it become a single utterance -- one row in the store, read
+    /// as though they were said together. The cut happens on the stream thread,
+    /// which owns the stream; this only asks for it.
     pub fn pause(&self) {
         if !self.paused.swap(true, Ordering::SeqCst) {
+            self.cut_pending.store(true, Ordering::SeqCst);
             let _ = self
                 .event_tx
                 .send(SessionEvent::StateChanged(SessionState::Paused));
@@ -266,7 +283,6 @@ impl Session {
             .send(SessionEvent::StateChanged(SessionState::Idle));
         Ok(())
     }
-
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -278,6 +294,7 @@ fn spawn_track(
     store: SharedStore,
     event_tx: Sender<SessionEvent>,
     paused: Arc<AtomicBool>,
+    cut_pending: Arc<AtomicBool>,
     transcriber: Arc<TranscriberFactory>,
     captures: &CaptureFactory,
     report_levels: bool,
@@ -299,7 +316,16 @@ fn spawn_track(
         .name(format!("fc-stream-{}", track.as_str()))
         .spawn(move || {
             let stream = TranscriptStream::new(Boxed(transcriber(track)), cfg);
-            run_stream(track, conversation, store, pcm_rx, event_tx, paused, stream)
+            run_stream(
+                track,
+                conversation,
+                store,
+                pcm_rx,
+                event_tx,
+                paused,
+                cut_pending,
+                stream,
+            )
         })
         .expect("spawn transcription thread");
 
@@ -341,6 +367,7 @@ fn level_filtered(downstream: Sender<SessionEvent>) -> Sender<SessionEvent> {
     tx
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_stream(
     track: Track,
     conversation: ConversationId,
@@ -348,11 +375,21 @@ fn run_stream(
     pcm_rx: Receiver<PcmFrame>,
     event_tx: Sender<SessionEvent>,
     paused: Arc<AtomicBool>,
+    cut_pending: Arc<AtomicBool>,
     mut stream: TranscriptStream<Boxed>,
 ) {
     let mut state = TrackState::default();
 
     for frame in &pcm_rx {
+        if cut_pending.swap(false, Ordering::SeqCst) {
+            // `Session::pause` asked for this. It runs here because only this
+            // thread may touch the stream, and before the frame is dropped
+            // below, so the utterance ends where the user paused rather than
+            // absorbing the first words spoken after they resume.
+            if let Some(update) = stream.cut() {
+                apply(&mut state, update, track, conversation, &store, &event_tx);
+            }
+        }
         if paused.load(Ordering::SeqCst) {
             // Audio arriving while paused is discarded, matching voxtype's own
             // meeting pause.
@@ -381,6 +418,15 @@ struct TrackState {
     lagging: bool,
 }
 
+/// Turns one [`Update`] into events and rows, in that order: every failure, then
+/// every finalised utterance, then the live line.
+///
+/// Nothing here is mutually exclusive. The stream's give-up path reports a
+/// failure *and* hands back the words it had already agreed on, and a single
+/// push can finalise more than one utterance and still leave a hypothesis in
+/// flight. An earlier version checked the error first and returned, so a
+/// permanently broken engine threw away the only text it managed to salvage --
+/// it reached neither the interface nor the store.
 fn apply(
     state: &mut TrackState,
     update: Update,
@@ -389,16 +435,15 @@ fn apply(
     store: &SharedStore,
     event_tx: &Sender<SessionEvent>,
 ) {
-    if let Some(message) = update.error {
+    for message in update.errors {
         // A failing engine must be visible: silence from a broken transcriber
         // is indistinguishable from a quiet room, which is the worst way for
-        // this app to fail. The utterance stays buffered and the next pass
-        // retries it, so nothing is lost by reporting and carrying on.
+        // this app to fail. Unless it gave up, the utterance stays buffered and
+        // the next pass retries it, so nothing is lost by carrying on.
         let _ = event_tx.send(SessionEvent::Failed {
             stage: "transcribe",
             message,
         });
-        return;
     }
 
     if update.lagging != state.lagging {
@@ -418,10 +463,11 @@ fn apply(
         state.stable.push_str(update.stable.trim());
     }
 
-    if let Some(finished) = update.finished {
+    for finished in update.finished {
+        // Each finalised utterance is its own row, in the order it was spoken.
         state.stable.clear();
         if finished.text.trim().is_empty() {
-            return;
+            continue;
         }
         let segment = Segment {
             track,
@@ -439,7 +485,6 @@ fn apply(
         // reporting, but it is not a reason to hide words that were said.
         persist(store, conversation, &segment, event_tx);
         let _ = event_tx.send(SessionEvent::Committed(segment));
-        return;
     }
 
     // The live line: what is agreed, plus the tail that is not yet. It is
@@ -450,11 +495,15 @@ fn apply(
         ("", tail) => tail.to_owned(),
         (stable, tail) => format!("{stable} {tail}"),
     };
+    // Stamped with where the sentence being spoken began, which is the stream's
+    // to know: this used to be a flat zero, so every live row read `00:00`. A
+    // line still being spoken has no end yet, so the span is a point.
+    let start_ms = update.utterance_start_ms.unwrap_or(0);
     let _ = event_tx.send(SessionEvent::Provisional(Segment {
         track,
         seq: state.next_seq,
-        start_ms: 0,
-        end_ms: 0,
+        start_ms,
+        end_ms: start_ms,
         text: line,
         translation: None,
         speaker: None,
@@ -499,10 +548,17 @@ mod tests {
 
     /// A capture that plays a fixed script of PCM and then ends, standing in
     /// for `parec` on a machine with no usable audio device.
-    struct ScriptedCapture;
+    ///
+    /// `stop` really stops it, like the real one: a test that asks for more
+    /// audio than it consumes would otherwise have `Session::stop` wait out the
+    /// whole script, since the stream thread only exits when the PCM sender is
+    /// dropped.
+    struct ScriptedCapture(Arc<AtomicBool>);
 
     impl CaptureHandle for ScriptedCapture {
-        fn stop(&mut self) {}
+        fn stop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
     }
 
     /// Feeds `seconds` of loud samples followed by `silence_seconds` of quiet,
@@ -514,8 +570,13 @@ mod tests {
         delay: Duration,
     ) -> CaptureFactory {
         Box::new(move |_source, pcm_tx, _event_tx| {
+            let stopped = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&stopped);
             thread::spawn(move || {
                 for _ in 0..repeats {
+                    if flag.load(Ordering::SeqCst) {
+                        return;
+                    }
                     let speech = tone(seconds, SPEECH_RMS);
                     if pcm_tx.send(speech).is_err() {
                         return;
@@ -529,7 +590,7 @@ mod tests {
                     }
                 }
             });
-            Box::new(ScriptedCapture)
+            Box::new(ScriptedCapture(stopped))
         })
     }
 
@@ -605,6 +666,58 @@ mod tests {
         }
     }
 
+    /// Works for its first `succeed_for` passes, then fails for ever: a
+    /// transcription server that has gone away mid-meeting.
+    ///
+    /// The text is the same every pass, so two consecutive passes agree and the
+    /// stream reports it stable — which is the only reason there is anything to
+    /// salvage when it later gives up.
+    struct DyingTranscriber {
+        calls: Arc<AtomicUsize>,
+        succeed_for: usize,
+    }
+
+    impl Transcriber for DyingTranscriber {
+        fn transcribe(
+            &self,
+            _pcm: &[f32],
+            _sample_rate: u32,
+        ) -> Result<Vec<Segment>, fc_asr::AsrError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) >= self.succeed_for {
+                return Err(fc_asr::AsrError::Io(std::io::Error::other("server gone")));
+            }
+            Ok(vec![Segment {
+                track: Track::Selected,
+                seq: 0,
+                start_ms: 0,
+                end_ms: 1_000,
+                text: SALVAGED.into(),
+                translation: None,
+                speaker: None,
+                confidence: None,
+                provisional: false,
+            }])
+        }
+
+        fn describe(&self) -> EngineInfo {
+            engine_info()
+        }
+    }
+
+    const SALVAGED: &str = "the words that were agreed";
+
+    fn dying_transcribers(succeed_for: usize) -> (TranscriberFactory, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let factory: TranscriberFactory = Box::new(move |_track| {
+            Box::new(DyingTranscriber {
+                calls: Arc::clone(&counter),
+                succeed_for,
+            })
+        });
+        (factory, calls)
+    }
+
     fn transcribers(delay: Duration, fail: bool) -> (TranscriberFactory, Arc<AtomicUsize>) {
         let seen = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&seen);
@@ -647,7 +760,11 @@ mod tests {
         (dir, Arc::new(Mutex::new(store)))
     }
 
-    fn drain_until<F>(events: &Receiver<SessionEvent>, timeout: Duration, mut done: F) -> Vec<SessionEvent>
+    fn drain_until<F>(
+        events: &Receiver<SessionEvent>,
+        timeout: Duration,
+        mut done: F,
+    ) -> Vec<SessionEvent>
     where
         F: FnMut(&[SessionEvent]) -> bool,
     {
@@ -700,7 +817,10 @@ mod tests {
 
         let guard = store.lock().unwrap();
         let stored = guard.load_segments(id).expect("load");
-        assert!(!stored.is_empty(), "segments must be persisted as they commit");
+        assert!(
+            !stored.is_empty(),
+            "segments must be persisted as they commit"
+        );
         assert!(stored.iter().all(|s| !s.provisional));
         let conversation = guard.get_conversation(id).expect("conversation");
         assert_eq!(conversation.status, ConversationStatus::Completed);
@@ -778,17 +898,16 @@ mod tests {
         .expect("start");
 
         let events = drain_until(&session.events, Duration::from_secs(20), |seen| {
-            seen.iter().any(|e| {
-                matches!(e, SessionEvent::PressureChanged(Pressure::Lagging))
-            }) && committed(seen).len() >= 2
+            seen.iter()
+                .any(|e| matches!(e, SessionEvent::PressureChanged(Pressure::Lagging)))
+                && committed(seen).len() >= 2
         });
         session.stop(1_700_000_060_000).expect("stop");
 
         assert!(
-            events.iter().any(|e| matches!(
-                e,
-                SessionEvent::PressureChanged(Pressure::Lagging)
-            )),
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::PressureChanged(Pressure::Lagging))),
             "a transcriber slower than realtime must report pressure, saw {events:?}"
         );
         // 6 repeats of 2.0s speech + 0.6s silence at 16 kHz. Every sample is
@@ -818,16 +937,28 @@ mod tests {
 
         let events = drain_until(&session.events, Duration::from_secs(10), |seen| {
             seen.iter()
-                .filter(|e| matches!(e, SessionEvent::Failed { stage: "transcribe", .. }))
+                .filter(|e| {
+                    matches!(
+                        e,
+                        SessionEvent::Failed {
+                            stage: "transcribe",
+                            ..
+                        }
+                    )
+                })
                 .count()
                 >= 2
         });
         session.stop(1_700_000_060_000).expect("stop");
 
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, SessionEvent::Failed { stage: "transcribe", .. })),
+            events.iter().any(|e| matches!(
+                e,
+                SessionEvent::Failed {
+                    stage: "transcribe",
+                    ..
+                }
+            )),
             "a transcription failure must be reported, saw {events:?}"
         );
         assert!(
@@ -855,7 +986,8 @@ mod tests {
         let id = session.conversation;
 
         let events = drain_until(&session.events, Duration::from_secs(10), |seen| {
-            seen.iter().any(|e| matches!(e, SessionEvent::Provisional(_)))
+            seen.iter()
+                .any(|e| matches!(e, SessionEvent::Provisional(_)))
                 && !committed(seen).is_empty()
         });
         session.stop(1_700_000_060_000).expect("stop");
@@ -870,6 +1002,130 @@ mod tests {
         assert!(
             stored.iter().all(|s| !s.provisional),
             "provisional segments must never be persisted"
+        );
+    }
+
+    /// An engine that dies mid-meeting reports a failure *and* hands back the
+    /// words it had already agreed on. Those are the only text that survives the
+    /// utterance, so they have to reach the user and the store — a version of
+    /// `apply` that checked the error first and returned threw them away, and
+    /// the failure made it look as though there had never been anything there.
+    #[test]
+    fn words_salvaged_when_the_engine_gives_up_are_shown_and_stored() {
+        let (_dir, store) = temp_store();
+        // Two agreeing passes make the text stable, then every pass fails: the
+        // mid-utterance ones, and all three finalisation attempts.
+        let (factory, _calls) = dying_transcribers(2);
+        let session = Session::start(
+            Arc::clone(&store),
+            config(brisk()),
+            factory,
+            // One utterance, then enough silence for the failed finalisation to
+            // be retried to exhaustion (0.3s hold plus two 0.3s waits).
+            &scripted_captures(2.0, 1.4, 1, Duration::ZERO),
+            1_700_000_000_000,
+        )
+        .expect("start session");
+        let id = session.conversation;
+
+        let events = drain_until(&session.events, Duration::from_secs(10), |seen| {
+            !committed(seen).is_empty()
+        });
+        session.stop(1_700_000_060_000).expect("stop");
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                SessionEvent::Failed {
+                    stage: "transcribe",
+                    ..
+                }
+            )),
+            "the failure must still be reported, saw {events:?}"
+        );
+        let shown: Vec<String> = committed(&events).iter().map(|s| s.text.clone()).collect();
+        assert!(
+            shown.iter().any(|t| t == SALVAGED),
+            "the salvaged words must reach the interface, saw {shown:?}"
+        );
+
+        let stored = store.lock().unwrap().load_segments(id).expect("load");
+        assert!(
+            stored.iter().any(|s| s.text == SALVAGED),
+            "and they must be persisted, not only shown: {stored:?}"
+        );
+    }
+
+    /// Audio arriving while paused is discarded, so without a cut the sentence
+    /// before the pause and the sentence after it become one utterance with the
+    /// gap closed — one row reading as though they were said together.
+    #[test]
+    fn pausing_mid_utterance_commits_the_half_already_spoken() {
+        let (_dir, store) = temp_store();
+        let (factory, _) = transcribers(Duration::ZERO, false);
+        let session = Session::start(
+            Arc::clone(&store),
+            SessionConfig {
+                stream: StreamConfig {
+                    step: Duration::from_millis(300),
+                    // Both boundaries out of reach: speech never stops and the
+                    // test is over long before eight seconds, so a committed
+                    // segment can only have come from the pause.
+                    silence_hold: Duration::from_secs(30),
+                    max_utterance: Duration::from_secs(8),
+                    ..Default::default()
+                },
+                ..config(brisk())
+            },
+            factory,
+            // Continuous speech in 0.5s frames, with no silence between them,
+            // for far longer than this test runs: the capture ending would
+            // itself finalise the utterance, so it must not be what happens.
+            &scripted_captures(0.5, 0.0, 400, Duration::from_millis(60)),
+            1_700_000_000_000,
+        )
+        .expect("start session");
+        let id = session.conversation;
+
+        // Wait until an utterance is genuinely in flight before pausing.
+        let before = drain_until(&session.events, Duration::from_secs(10), |seen| {
+            seen.iter()
+                .any(|e| matches!(e, SessionEvent::Provisional(_)))
+        });
+        assert!(
+            committed(&before).is_empty(),
+            "nothing may have finalised on its own yet, saw {before:?}"
+        );
+
+        session.pause();
+        // Short on purpose: the cut lands on the next frame, about 60ms later.
+        // Nothing else in this configuration can finalise an utterance inside
+        // two seconds -- the silence hold is thirty, the ceiling is eight, and
+        // the capture runs for twenty.
+        let after = drain_until(&session.events, Duration::from_secs(2), |seen| {
+            !committed(seen).is_empty()
+        });
+        session.stop(1_700_000_060_000).expect("stop");
+
+        let committed_after = committed(&after);
+        assert!(
+            !committed_after.is_empty(),
+            "a pause must finalise the sentence in flight, saw {after:?}"
+        );
+        let first = &committed_after[0];
+        assert!(
+            !first.text.trim().is_empty(),
+            "the committed half must carry the words spoken before the pause"
+        );
+        assert_eq!(
+            first.start_ms, 0,
+            "it is the first utterance of the session"
+        );
+
+        let stored = store.lock().unwrap().load_segments(id).expect("load");
+        assert!(
+            stored.iter().any(|s| s.text == first.text),
+            "the cut utterance must be persisted like any other: {stored:?}"
         );
     }
 
@@ -897,8 +1153,7 @@ mod tests {
     #[test]
     #[ignore = "needs a sound server, espeak-ng, ffmpeg and voxtype with a model"]
     fn end_to_end_through_the_real_pipeline() {
-        const SPOKEN: &str =
-            "The quarterly roadmap review is scheduled for next Tuesday, \
+        const SPOKEN: &str = "The quarterly roadmap review is scheduled for next Tuesday, \
              and we still need owners for the migration work.";
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -936,7 +1191,7 @@ mod tests {
                 source,
                 mic_source: None,
                 stream: brisk(),
-                    engine: engine_info(),
+                engine: engine_info(),
             },
             factory,
             &parec_captures(),
@@ -951,7 +1206,10 @@ mod tests {
             .arg(&wav)
             .status()
             .expect("run paplay");
-        assert!(played.success(), "paplay could not play into the default sink");
+        assert!(
+            played.success(),
+            "paplay could not play into the default sink"
+        );
 
         let events = drain_until(&session.events, Duration::from_secs(45), |seen| {
             committed(seen)
@@ -971,5 +1229,4 @@ mod tests {
             "a transcript that reached the UI must also have been stored"
         );
     }
-
 }

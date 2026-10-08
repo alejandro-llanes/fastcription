@@ -6,6 +6,7 @@
 //! files, not its database. See `docs/ARCHITECTURE.md` §7 for the rules this
 //! crate exists to enforce.
 
+mod bounded;
 pub mod cli;
 pub mod config;
 mod error;

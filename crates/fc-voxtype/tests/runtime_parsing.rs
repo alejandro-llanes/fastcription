@@ -4,9 +4,22 @@
 //! daemon; the in-meeting case is hand-written since no meeting was started
 //! to capture it (the task constraints forbid starting one).
 
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use fc_voxtype::runtime::{watch, DaemonState, MeetingState, RuntimePaths, RuntimeUpdate};
+
+/// The three tests that start a real watcher run one at a time. They assert on
+/// watcher threads of this process, and cargo runs the tests in this file
+/// concurrently in one process, so overlapping them would make each one's
+/// bookkeeping depend on the others.
+static ONE_WATCHER_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+fn watcher_guard() -> MutexGuard<'static, ()> {
+    ONE_WATCHER_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[test]
 fn daemon_state_real_capture_idle() {
@@ -86,6 +99,7 @@ fn runtime_paths_derive_from_dir() {
 /// not just the pure parsers above.
 #[test]
 fn watch_emits_initial_state_and_meeting_once_the_directory_appears() {
+    let _serial = watcher_guard();
     let base = tempfile::tempdir().expect("tempdir");
     let voxtype_dir = base.path().join("voxtype");
     assert!(!voxtype_dir.exists(), "directory must not exist yet");
@@ -122,4 +136,123 @@ fn watch_emits_initial_state_and_meeting_once_the_directory_appears() {
         saw_meeting,
         "expected an initial Meeting(..) once the directory appeared, not just State"
     );
+}
+
+/// `systemctl --user restart voxtype` with a `RuntimeDirectory=` removes the
+/// directory and creates a new one. An inotify watch on the removed directory
+/// is blind from then on: it reports nothing about its replacement, so the app
+/// would show a stale daemon state for the rest of its run.
+#[test]
+fn watch_follows_the_directory_through_a_remove_and_recreate() {
+    let _serial = watcher_guard();
+    let base = tempfile::tempdir().expect("tempdir");
+    let voxtype_dir = base.path().join("voxtype");
+    std::fs::create_dir_all(&voxtype_dir).expect("create voxtype dir");
+    std::fs::write(voxtype_dir.join("state"), "idle").expect("write state");
+
+    let paths = RuntimePaths {
+        dir: voxtype_dir.clone(),
+    };
+    let rx = watch(paths).expect("watch an existing directory");
+
+    // The first change is seen through the original watch.
+    std::fs::write(voxtype_dir.join("state"), "recording").expect("write state");
+    assert!(
+        wait_for(&rx, Duration::from_secs(5), |u| matches!(
+            u,
+            RuntimeUpdate::State(DaemonState::Recording)
+        )),
+        "the watch on the original directory must work"
+    );
+
+    // The daemon restarts: directory gone, then a new one in its place.
+    std::fs::remove_dir_all(&voxtype_dir).expect("remove voxtype dir");
+    std::thread::sleep(Duration::from_millis(400));
+    std::fs::create_dir_all(&voxtype_dir).expect("recreate voxtype dir");
+    std::fs::write(voxtype_dir.join("state"), "transcribing").expect("write state");
+
+    assert!(
+        wait_for(&rx, Duration::from_secs(5), |u| matches!(
+            u,
+            RuntimeUpdate::State(DaemonState::Transcribing)
+        )),
+        "the watcher must follow the directory to its replacement"
+    );
+}
+
+/// The app rebuilds this watcher whenever it rediscovers the runtime directory,
+/// so a thread per attempt that never exits is a leak that grows with uptime.
+#[test]
+fn dropping_the_receiver_stops_the_watcher_thread() {
+    let _serial = watcher_guard();
+    let base = tempfile::tempdir().expect("tempdir");
+    let voxtype_dir = base.path().join("voxtype");
+    std::fs::create_dir_all(&voxtype_dir).expect("create voxtype dir");
+
+    let before = thread_count();
+    assert_eq!(
+        before, 0,
+        "no other watcher may be running: see watcher_guard"
+    );
+    let rx = watch(RuntimePaths {
+        dir: voxtype_dir.clone(),
+    })
+    .expect("watch");
+    std::fs::write(voxtype_dir.join("state"), "idle").expect("write state");
+    assert!(
+        wait_for(&rx, Duration::from_secs(5), |u| matches!(
+            u,
+            RuntimeUpdate::State(DaemonState::Idle)
+        )),
+        "the watcher must be running before the drop means anything"
+    );
+
+    drop(rx);
+    // The loop wakes on its own every quarter second, so it notices without
+    // needing another filesystem event.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && thread_count() > before {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        thread_count() <= before,
+        "the watcher thread outlived its receiver: {} threads, started from {before}",
+        thread_count()
+    );
+}
+
+fn wait_for<F>(
+    rx: &crossbeam_channel::Receiver<RuntimeUpdate>,
+    timeout: Duration,
+    mut want: F,
+) -> bool
+where
+    F: FnMut(&RuntimeUpdate) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(update) = rx.recv_timeout(Duration::from_millis(100)) {
+            if want(&update) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// How many watcher threads this process has, by name, from `/proc/self/task`.
+/// Counting them is how "the thread exited" becomes an assertion: `watch` hands
+/// back a receiver, not a join handle, so there is nothing else to observe. By
+/// name rather than in total, because the test harness and `notify` have threads
+/// of their own coming and going.
+fn thread_count() -> usize {
+    std::fs::read_dir("/proc/self/task")
+        .expect("read /proc/self/task")
+        .filter_map(std::result::Result::ok)
+        .filter(|task| {
+            std::fs::read_to_string(task.path().join("comm"))
+                .map(|comm| comm.trim() == "fc-vox-runtime")
+                .unwrap_or(false)
+        })
+        .count()
 }

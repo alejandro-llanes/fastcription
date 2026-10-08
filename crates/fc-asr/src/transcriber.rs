@@ -5,6 +5,7 @@
 //! and so tests can drive the agreement logic with a scripted fake instead of
 //! the real subprocess.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use fc_core::{EngineInfo, Segment};
@@ -46,6 +47,21 @@ pub enum AsrError {
          meeting audio. stdout was: {stdout:?}"
     )]
     UnexpectedOutput { reason: String, stdout: String },
+
+    #[error(
+        "voxtype does not know the model '{requested}' and silently fell back to \
+         its own default, so the engine recorded with this conversation would be \
+         a lie. Pick an installed model (`voxtype info models`)."
+    )]
+    UnknownModel { requested: String },
+
+    #[error(
+        "the voxtype config file '{}' does not exist. voxtype exits 0 and uses \
+         its own defaults for a missing `-c` file, which silently drops the \
+         context-window optimisation and remote mode (ARCHITECTURE.md D6, D10).",
+        .0.display()
+    )]
+    ConfigMissing(PathBuf),
 
     #[error("i/o error running voxtype: {0}")]
     Io(#[from] std::io::Error),

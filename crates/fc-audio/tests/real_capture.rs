@@ -43,7 +43,10 @@ fn captures_a_tone_played_into_the_default_sink() {
         .arg(&wav)
         .status()
         .expect("run paplay");
-    assert!(played.success(), "paplay could not play into the default sink");
+    assert!(
+        played.success(),
+        "paplay could not play into the default sink"
+    );
     std::thread::sleep(Duration::from_millis(300));
 
     capture.stop();
@@ -51,7 +54,11 @@ fn captures_a_tone_played_into_the_default_sink() {
 
     let captured: Vec<f32> = pcm_rx.try_iter().flatten().collect();
     let events: Vec<_> = event_rx.try_iter().collect();
-    println!("captured {} samples, {} events", captured.len(), events.len());
+    println!(
+        "captured {} samples, {} events",
+        captured.len(),
+        events.len()
+    );
 
     assert!(
         !captured.is_empty(),

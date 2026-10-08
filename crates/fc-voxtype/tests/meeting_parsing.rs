@@ -111,3 +111,39 @@ fn export_json_rejects_the_old_bare_array_shape() {
     let err = parse_export_json(r#"[{"startMs": 0, "endMs": 100, "text": "hi"}]"#).unwrap_err();
     assert!(err.to_string().contains("startMs"));
 }
+
+/// A block this parser cannot read is skipped, not fatal. A "block" here is
+/// anything between two blank lines, so any footer line upstream decides to add
+/// would otherwise make every past meeting unimportable.
+#[test]
+fn an_unreadable_block_is_skipped_rather_than_failing_the_listing() {
+    let mut text = fixture("meeting_list_multiple.txt");
+    text.push_str("\n\nShowing 3 of 42 meetings. Use: voxtype meeting show <ID>\n");
+
+    let records = parse_list(&text).expect("one odd block must not fail the listing");
+    assert_eq!(
+        records.len(),
+        3,
+        "every real meeting must still be imported"
+    );
+    assert_eq!(records[2].title, "Design review");
+}
+
+/// A listing where *nothing* parsed is a different thing: that is the output
+/// shape having changed, and reporting it as "no meetings" would silently
+/// present an empty import as a successful one.
+#[test]
+fn a_listing_where_no_block_parses_is_an_error_not_an_empty_list() {
+    let text = "Recent Meetings\n===============\n\nSomething: entirely\nDifferent: here\n";
+    let err = parse_list(text).unwrap_err();
+    assert!(err.to_string().contains("Different: here"), "{err}");
+}
+
+/// Still true, and the reason the above is not simply "return what parsed":
+/// voxtype prints this, exit 0, when there is nothing to list.
+#[test]
+fn the_empty_listing_wording_is_not_mistaken_for_a_parse_failure() {
+    assert!(parse_list("No meetings found.\n")
+        .expect("parses")
+        .is_empty());
+}

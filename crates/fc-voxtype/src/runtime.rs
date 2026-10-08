@@ -13,11 +13,17 @@
 //! then re-watches that directory directly.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, Sender};
 use notify::{Event, RecursiveMode, Watcher};
 
 use crate::error::{Result, VoxtypeError};
+
+/// How often the watcher thread wakes up with no filesystem event to look at,
+/// so that dropping the receiver stops it within about that long rather than
+/// whenever the daemon next happens to write a file.
+const IDLE_TICK: Duration = Duration::from_millis(250);
 
 /// State the daemon reports via the `state` file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,90 +122,158 @@ pub enum RuntimeUpdate {
 }
 
 /// Spawns a background thread that watches `paths` and sends
-/// [`RuntimeUpdate`]s until the returned [`Receiver`] is dropped. The thread
-/// owns the `notify` watcher for its whole lifetime; dropping the receiver
-/// does not explicitly stop it, but the OS reclaims the watch (and the
-/// sender channel disconnects, so the next send is a no-op) once the process
-/// that spawned it exits -- consistent with the rest of the app's "std
-/// threads, no async runtime" design (ARCHITECTURE.md D8).
+/// [`RuntimeUpdate`]s until the returned [`Receiver`] is dropped.
+///
+/// The thread owns the `notify` watcher for its whole lifetime and stops within
+/// about [`IDLE_TICK`] of the receiver being dropped — it has to be able to
+/// stop, because the app rebuilds this watcher whenever the runtime directory is
+/// rediscovered, and a thread per attempt that never exits is a leak that grows
+/// with uptime. Consistent with the rest of the app's "std threads, no async
+/// runtime" design (ARCHITECTURE.md D8).
+///
+/// The watch itself follows the directory rather than assuming it stays put: the
+/// daemon's runtime directory can be removed and recreated (`systemctl --user
+/// restart voxtype` with `RuntimeDirectory=` does exactly that), and an inotify
+/// watch on a removed directory is simply blind — it reports nothing about the
+/// new one, for ever.
 pub fn watch(paths: RuntimePaths) -> Result<Receiver<RuntimeUpdate>> {
     let (raw_tx, raw_rx) = crossbeam_channel::unbounded::<notify::Result<Event>>();
     let mut watcher = notify::recommended_watcher(raw_tx)?;
 
-    let mut watching_dir = paths.dir.is_dir();
-    if watching_dir {
-        watcher.watch(&paths.dir, RecursiveMode::NonRecursive)?;
-    } else {
+    let watching_dir = paths.dir.is_dir()
+        && watcher
+            .watch(&paths.dir, RecursiveMode::NonRecursive)
+            .is_ok();
+    if !watching_dir {
         let parent = paths.dir.parent().unwrap_or(&paths.dir).to_path_buf();
         watcher.watch(&parent, RecursiveMode::NonRecursive)?;
+        // The directory can appear between that check and this watch attaching,
+        // and that creation produces no event this watcher would ever see. The
+        // loop re-checks `is_dir()` on every tick rather than only on an event
+        // naming the directory, which closes the race without needing the
+        // creation event at all.
     }
 
     let (tx, rx) = crossbeam_channel::unbounded();
-    std::thread::spawn(move || {
-        let mut watcher = watcher; // moved in; kept alive for this thread's life
-        let dir = paths.dir.clone();
-        let state_path = paths.state();
-        let meeting_path = paths.meeting_state();
+    // Named so that "this thread exited when its receiver was dropped" is
+    // something a test can actually check: `watch` hands back a receiver, not a
+    // join handle. Under 15 characters, which is all `/proc/*/comm` keeps.
+    std::thread::Builder::new()
+        .name("fc-vox-runtime".into())
+        .spawn(move || run_watch_loop(watcher, raw_rx, tx, paths, watching_dir))
+        .map_err(VoxtypeError::Io)?;
 
-        for event in raw_rx {
-            let Ok(event) = event else { continue };
+    Ok(rx)
+}
 
-            if !watching_dir {
-                if event.paths.iter().any(|p| p == &dir) && dir.is_dir() {
-                    let parent: Option<PathBuf> = dir.parent().map(Path::to_path_buf);
-                    if watcher.watch(&dir, RecursiveMode::NonRecursive).is_ok() {
-                        watching_dir = true;
-                        if let Some(parent) = parent {
-                            let _ = watcher.unwatch(&parent);
-                        }
-                        // Read the initial state immediately so the caller
-                        // does not have to wait for a second filesystem event.
-                        // Both files, mirroring read_now(): a meeting can
-                        // already be in progress by the time this directory
-                        // shows up (the daemon creates it once at startup,
-                        // before any meeting state exists, but a watcher that
-                        // only attaches once the app starts could still race
-                        // a daemon that was already mid-meeting).
-                        if let Some(state) = std::fs::read_to_string(&state_path)
-                            .ok()
-                            .and_then(|s| DaemonState::parse(&s))
-                        {
-                            let _ = tx.send(RuntimeUpdate::State(state));
-                        }
-                        if let Some(meeting) = std::fs::read_to_string(&meeting_path)
-                            .ok()
-                            .and_then(|s| MeetingState::parse(&s))
-                        {
-                            let _ = tx.send(RuntimeUpdate::Meeting(meeting));
-                        }
+/// The watcher thread's body. Split out from [`watch`] so a test can run it
+/// directly and watch it exit when the receiver goes away.
+fn run_watch_loop(
+    mut watcher: impl Watcher,
+    raw_rx: Receiver<notify::Result<Event>>,
+    tx: Sender<RuntimeUpdate>,
+    paths: RuntimePaths,
+    mut watching_dir: bool,
+) {
+    let dir = paths.dir.clone();
+    let state_path = paths.state();
+    let meeting_path = paths.meeting_state();
+
+    // Nothing is emitted for a directory that already existed: the caller has
+    // `read_now` for the initial snapshot, and this reports changes.
+    loop {
+        let event = match raw_rx.recv_timeout(IDLE_TICK) {
+            Ok(Ok(event)) => Some(event),
+            // A malformed event still means something happened, and the ticks
+            // below do not depend on which.
+            Ok(Err(_)) => None,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+        };
+
+        if !watching_dir {
+            // Waiting for the directory to appear. Checked on every tick, not
+            // only on an event naming it: the creation can be missed entirely
+            // (see the race above), and `is_dir` costs one stat.
+            if dir.is_dir() && watcher.watch(&dir, RecursiveMode::NonRecursive).is_ok() {
+                watching_dir = true;
+                if let Some(parent) = dir.parent() {
+                    let _ = watcher.unwatch(parent);
+                }
+                // Both files, mirroring `read_now`: a meeting can already be in
+                // progress by the time this directory shows up.
+                if emit_current(&tx, &state_path, &meeting_path).is_err() {
+                    return;
+                }
+            }
+            continue;
+        }
+
+        if !dir.is_dir() {
+            // The directory was removed (or renamed away). An inotify watch on
+            // a removed directory is blind, not merely quiet: it will never
+            // report anything about the directory that takes its place. So drop
+            // it, watch the parent again, and let the tick above notice the
+            // replacement -- which it may have to do immediately, since the
+            // daemon can recreate the directory before this even runs.
+            let _ = watcher.unwatch(&dir);
+            watching_dir = false;
+            let parent: Option<PathBuf> = dir.parent().map(Path::to_path_buf);
+            if let Some(parent) = parent {
+                let _ = watcher.watch(&parent, RecursiveMode::NonRecursive);
+            }
+            // Whatever meeting was in progress is certainly not any more.
+            if tx.send(RuntimeUpdate::MeetingEnded).is_err() {
+                return;
+            }
+            continue;
+        }
+
+        let Some(event) = event else { continue };
+        for path in &event.paths {
+            if *path == state_path {
+                if let Some(state) = read_state(&state_path) {
+                    if tx.send(RuntimeUpdate::State(state)).is_err() {
+                        return;
                     }
                 }
-                continue;
-            }
-
-            for path in &event.paths {
-                if *path == state_path {
-                    if let Some(state) = std::fs::read_to_string(&state_path)
-                        .ok()
-                        .and_then(|s| DaemonState::parse(&s))
-                    {
-                        let _ = tx.send(RuntimeUpdate::State(state));
-                    }
-                } else if *path == meeting_path {
-                    match std::fs::read_to_string(&meeting_path) {
-                        Ok(s) => {
-                            if let Some(m) = MeetingState::parse(&s) {
-                                let _ = tx.send(RuntimeUpdate::Meeting(m));
-                            }
-                        }
-                        Err(_) => {
-                            let _ = tx.send(RuntimeUpdate::MeetingEnded);
-                        }
-                    }
+            } else if *path == meeting_path {
+                let update = match read_meeting(&meeting_path) {
+                    Some(meeting) => RuntimeUpdate::Meeting(meeting),
+                    None => RuntimeUpdate::MeetingEnded,
+                };
+                if tx.send(update).is_err() {
+                    return;
                 }
             }
         }
-    });
+    }
+}
 
-    Ok(rx)
+fn read_state(path: &Path) -> Option<DaemonState> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| DaemonState::parse(&s))
+}
+
+fn read_meeting(path: &Path) -> Option<MeetingState> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| MeetingState::parse(&s))
+}
+
+/// Sends whatever the two state files say right now. `Err(())` means the
+/// receiver is gone and the caller should stop.
+fn emit_current(
+    tx: &Sender<RuntimeUpdate>,
+    state_path: &Path,
+    meeting_path: &Path,
+) -> std::result::Result<(), ()> {
+    if let Some(state) = read_state(state_path) {
+        tx.send(RuntimeUpdate::State(state)).map_err(|_| ())?;
+    }
+    if let Some(meeting) = read_meeting(meeting_path) {
+        tx.send(RuntimeUpdate::Meeting(meeting)).map_err(|_| ())?;
+    }
+    Ok(())
 }

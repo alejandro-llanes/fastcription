@@ -12,10 +12,20 @@
 //! dictation daemon, running for real.
 
 use std::process::Command;
+use std::time::Duration;
 
+use crate::bounded;
 use crate::error::{Result, VoxtypeError};
 
 pub const UNIT: &str = "voxtype.service";
+
+/// `systemctl --user` talks to `systemd --user` over the session bus, and a bus
+/// that is not answering (a `systemd --user` reload, a D-Bus hiccup) makes the
+/// call wait indefinitely. [`status`] runs on the interface thread, so that wait
+/// is a frozen window. Ten seconds is far past any healthy call — `show` is a
+/// few milliseconds — while still leaving room for a `start` that is slow
+/// because the unit itself is slow to come up.
+const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// `systemctl --user show -p ActiveState,SubState,UnitFileState` for
 /// [`UNIT`], already split into the three properties fastcription needs.
@@ -75,15 +85,30 @@ pub fn parse_show(text: &str) -> ServiceStatus {
 }
 
 fn show(unit: &str) -> Result<String> {
-    let output = Command::new("systemctl")
-        .args([
-            "--user",
-            "show",
-            "-p",
-            "ActiveState,SubState,UnitFileState",
-            unit,
-        ])
-        .output()?;
+    show_with("systemctl", unit, SYSTEMCTL_TIMEOUT)
+}
+
+/// The program and timeout are parameters so the give-up path can be tested
+/// against a deliberately slow fake binary — without putting one on `PATH`,
+/// which would mean mutating the environment under every other test, and
+/// without a test spending the real budget.
+fn show_with(program: &str, unit: &str, timeout: Duration) -> Result<String> {
+    let args = [
+        "--user",
+        "show",
+        "-p",
+        "ActiveState,SubState,UnitFileState",
+        unit,
+    ];
+    let mut command = Command::new(program);
+    command.args(args);
+
+    let Some(output) = bounded::output_within(&mut command, timeout)? else {
+        return Err(VoxtypeError::Timeout {
+            command: format!("{program} {}", args.join(" ")),
+            after: timeout,
+        });
+    };
     if !output.status.success() {
         return Err(VoxtypeError::CommandFailed {
             command: format!("systemctl --user show -p ActiveState,SubState,UnitFileState {unit}"),
@@ -106,9 +131,19 @@ pub fn is_active() -> Result<bool> {
 }
 
 fn action(verb: &str) -> Result<()> {
-    let output = Command::new("systemctl")
-        .args(["--user", verb, UNIT])
-        .output()?;
+    action_with("systemctl", verb, SYSTEMCTL_TIMEOUT)
+}
+
+fn action_with(program: &str, verb: &str, timeout: Duration) -> Result<()> {
+    let mut command = Command::new(program);
+    command.args(["--user", verb, UNIT]);
+
+    let Some(output) = bounded::output_within(&mut command, timeout)? else {
+        return Err(VoxtypeError::Timeout {
+            command: format!("{program} --user {verb} {UNIT}"),
+            after: timeout,
+        });
+    };
     if output.status.success() {
         Ok(())
     } else {
@@ -130,4 +165,66 @@ pub fn stop() -> Result<()> {
 
 pub fn restart() -> Result<()> {
     action("restart")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_systemctl(dir: &std::path::Path, name: &str, body: &str) -> String {
+        crate::bounded::fake_binary(dir, name, body)
+            .to_str()
+            .expect("utf8 path")
+            .to_string()
+    }
+
+    /// `status` runs on the interface thread, so a `systemctl` waiting on a bus
+    /// that will not answer must become an error rather than a frozen window.
+    /// Uses a fake binary throughout: the real unit on this machine is the
+    /// user's own dictation daemon, and the task forbids touching it.
+    #[test]
+    fn a_systemctl_that_never_answers_times_out_instead_of_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let program = fake_systemctl(dir.path(), "wedged-systemctl", "#!/bin/sh\nexec sleep 30\n");
+
+        let budget = Duration::from_millis(200);
+        let start = std::time::Instant::now();
+        let err = show_with(&program, UNIT, budget).expect_err("a wedged systemctl is an error");
+        match err {
+            VoxtypeError::Timeout { after, command } => {
+                assert_eq!(after, budget);
+                assert!(command.contains("ActiveState"), "{command}");
+            }
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// Starting and stopping the unit is a button in the settings pane, so the
+    /// same wait would freeze the window there.
+    #[test]
+    fn a_wedged_start_times_out_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let program = fake_systemctl(dir.path(), "wedged-systemctl", "#!/bin/sh\nexec sleep 30\n");
+
+        let err = action_with(&program, "start", Duration::from_millis(200))
+            .expect_err("a wedged systemctl is an error");
+        assert!(matches!(err, VoxtypeError::Timeout { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn a_prompt_systemctl_is_parsed_as_usual() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let program = fake_systemctl(
+            dir.path(),
+            "prompt-systemctl",
+            "#!/bin/sh\necho ActiveState=active\necho SubState=running\necho UnitFileState=enabled\n",
+        );
+        let text = show_with(&program, UNIT, Duration::from_secs(5)).expect("prompt");
+        assert!(parse_show(&text).is_active());
+    }
 }

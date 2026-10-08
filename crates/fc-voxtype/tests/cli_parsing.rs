@@ -87,11 +87,31 @@ fn devices_empty_is_not_an_error() {
 
 #[test]
 fn accel_real_capture() {
-    let info = parse_accel(&fixture("info_accel.txt"));
+    let info = parse_accel(&fixture("info_accel.txt")).expect("parses");
     assert_eq!(info.state.as_deref(), Some("cpu-only"));
     assert_eq!(info.backend.as_deref(), Some("(none in play)"));
     assert_eq!(info.variant.as_deref(), Some("avx2"));
     assert_eq!(info.daemon.as_deref(), Some("pid 2800853"));
+}
+
+/// An all-`None` `AccelInfo` is indistinguishable from a successful parse of
+/// text that happened to say nothing, so output with no recognised key is an
+/// error carrying what voxtype actually printed -- the same rule the engine and
+/// model parsers follow.
+#[test]
+fn accel_rejects_output_with_no_recognised_key() {
+    let err = parse_accel("GPU acceleration\n  something: else\n").unwrap_err();
+    assert!(err.to_string().contains("something: else"), "{err}");
+}
+
+/// Individual keys do go missing for real: a CPU-only machine reports no
+/// backend, and a daemon that is not running reports no pid.
+#[test]
+fn accel_keeps_parsing_when_only_some_keys_are_present() {
+    let info = parse_accel("GPU acceleration\n  State: cpu-only\n").expect("parses");
+    assert_eq!(info.state.as_deref(), Some("cpu-only"));
+    assert_eq!(info.backend, None);
+    assert_eq!(info.daemon, None);
 }
 
 #[test]

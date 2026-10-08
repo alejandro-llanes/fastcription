@@ -93,7 +93,6 @@ pub struct ExportOptions {
     pub metadata: bool,
 }
 
-
 /// `src/meeting/data.rs`'s `MeetingStatus` enum, as rendered by `{:?}` in
 /// `list`/`show` text (`Active`/`Paused`/`Completed`/`Cancelled`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,7 +169,6 @@ fn key_values(text: &str) -> HashMap<String, String> {
     map
 }
 
-
 /// The one field every one of `list`/`show`/`status`'s outputs must carry.
 /// Its absence is the only thing that turns a permissive parse into an
 /// error.
@@ -193,7 +191,6 @@ fn is_no_meetings(text: &str) -> bool {
     text.to_lowercase().contains("no meetings found")
 }
 
-
 /// `voxtype meeting list [--limit N]`. Verified empty-list wording
 /// (`No meetings found.`, exit 0) against the real binary; the populated
 /// case is derived from `src/app/meeting.rs`'s `MeetingAction::List` arm,
@@ -209,23 +206,67 @@ fn is_no_meetings(text: &str) -> bool {
 /// separated by a blank line, after a `Recent Meetings\n===============`
 /// banner. Unlike `show`, there is no `Title:` line at all -- the title is
 /// the block's bare first line -- and no `Segments:`/`Speakers:` row.
+/// `limit: None` means **no limit**, not "voxtype's default". Import is the only
+/// caller, and it exists to bring across everything the user has; leaving the
+/// flag off makes voxtype apply its own default of 10, which silently imported
+/// the ten most recent meetings and quietly dropped the rest.
 pub fn list(binary: &Path, limit: Option<u32>) -> Result<Vec<MeetingRecord>> {
-    let limit_str = limit.unwrap_or(10).to_string();
-    let out = run(binary, &["meeting", "list", "--limit", &limit_str])?;
-    parse_list(&out)
+    let args = list_args(limit);
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    parse_list(&run(binary, &borrowed)?)
 }
 
+/// Kept pure so the argv is testable without a meeting to list — this machine
+/// has none, and starting one is not an option.
+fn list_args(limit: Option<u32>) -> Vec<String> {
+    // There is no "unlimited" value for `--limit`, so "all of them" is spelled
+    // as a number no meeting history will ever reach.
+    let limit = limit.unwrap_or(u32::MAX);
+    vec![
+        "meeting".to_string(),
+        "list".to_string(),
+        "--limit".to_string(),
+        limit.to_string(),
+    ]
+}
+
+/// One unparseable block is skipped and counted rather than failing the whole
+/// listing: a block here is anything between two blank lines, so a footer line
+/// upstream adds ("Showing 10 of 42", "Use `voxtype meeting show <id>` ...")
+/// would otherwise make every past meeting unimportable. A listing where *no*
+/// block parsed is still an error — that is not one odd block, that is the
+/// output shape having changed, and reporting it as "no meetings" would be the
+/// silent loss this crate exists to avoid.
 pub fn parse_list(text: &str) -> Result<Vec<MeetingRecord>> {
     if is_no_meetings(text) {
         return Ok(Vec::new());
     }
     let mut records = Vec::new();
+    let mut candidates = 0usize;
     for block in text.split("\n\n") {
         let block = block.trim_end();
         if block.is_empty() || !block.contains(':') {
             continue; // the "Recent Meetings\n===============" banner, or a trailing blank block
         }
-        records.push(parse_list_block(block)?);
+        candidates += 1;
+        match parse_list_block(block) {
+            Ok(record) => records.push(record),
+            Err(err) => tracing::debug!(%err, "skipped an unparseable meeting block"),
+        }
+    }
+    if candidates > 0 && records.is_empty() {
+        return Err(VoxtypeError::Parse {
+            command: "meeting list",
+            reason: format!("none of the {candidates} blocks carried an `ID:` line"),
+            text: text.to_string(),
+        });
+    }
+    if candidates > records.len() {
+        tracing::warn!(
+            skipped = candidates - records.len(),
+            seen = candidates,
+            "some meetings could not be read from `voxtype meeting list`"
+        );
     }
     Ok(records)
 }
@@ -343,4 +384,25 @@ pub fn export(
         args.push("--metadata");
     }
     run(binary, &args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `None` has to mean "no limit": voxtype's own default is 10, so leaving
+    /// the flag at that silently imported the ten most recent meetings and
+    /// dropped every earlier one.
+    #[test]
+    fn no_limit_asks_for_everything_rather_than_voxtype_s_default_ten() {
+        assert_eq!(
+            list_args(None),
+            vec!["meeting", "list", "--limit", &u32::MAX.to_string()]
+        );
+    }
+
+    #[test]
+    fn an_explicit_limit_is_passed_through() {
+        assert_eq!(list_args(Some(5)), vec!["meeting", "list", "--limit", "5"]);
+    }
 }
