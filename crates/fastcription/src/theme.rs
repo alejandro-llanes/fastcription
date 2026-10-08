@@ -77,10 +77,26 @@ impl Palette {
         }
     }
 
-    /// Maps the sixteen colours onto an `egui::Visuals` and applies it.
-    /// Widgets that need a colour `Visuals` has no slot for (the danger
-    /// banner, provisional-segment dimming) read the palette directly.
+    /// Maps the sixteen colours onto an `egui::Visuals` and applies it to
+    /// **both** of egui's theme slots.
+    ///
+    /// `set_visuals` only fills the slot for the theme currently in use, and
+    /// egui follows the desktop's light/dark preference: a desktop that
+    /// flipped to light while fastcription was running fell through to stock
+    /// egui light, which shares nothing with the user's theme. The palette
+    /// already is whichever one fastframe resolved for the desktop, so the
+    /// right answer is to put it in both slots and let the flip change
+    /// nothing.
+    ///
+    /// Widgets that need a colour `Visuals` has no slot for (notice colours,
+    /// provisional-segment dimming) read the palette directly.
     pub fn apply(&self, ctx: &egui::Context) {
+        let visuals = self.visuals();
+        ctx.set_visuals_of(egui::Theme::Dark, visuals.clone());
+        ctx.set_visuals_of(egui::Theme::Light, visuals);
+    }
+
+    fn visuals(&self) -> Visuals {
         let mut visuals = if self.dark {
             Visuals::dark()
         } else {
@@ -104,9 +120,19 @@ impl Palette {
         visuals.widgets.hovered.bg_fill = self.surface_hover;
         visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, self.text);
         visuals.widgets.active.bg_fill = self.surface_active;
-        visuals.widgets.active.fg_stroke = Stroke::new(1.0, self.on_accent);
+        // `on_accent` is the colour for text *on* the accent fill, and this
+        // fill is `surface_active`. On the dark default that made a pressed
+        // button's label near-black on dark grey — the label vanished for as
+        // long as the mouse was down.
+        visuals.widgets.active.fg_stroke = Stroke::new(1.0, self.text);
+        visuals.widgets.active.bg_stroke = Stroke::new(1.0, self.accent);
+        // An open combo box or menu has its own slot, which nothing filled:
+        // every dropdown in the app was drawn in stock egui's grey.
+        visuals.widgets.open.bg_fill = self.surface_active;
+        visuals.widgets.open.fg_stroke = Stroke::new(1.0, self.text);
+        visuals.widgets.open.bg_stroke = Stroke::new(1.0, self.outline);
         visuals.override_text_color = Some(self.text);
-        ctx.set_visuals(visuals);
+        visuals
     }
 }
 

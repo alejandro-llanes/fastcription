@@ -6,6 +6,8 @@
 //! partial. voxtype missing is not a reason to hide a past transcript; a
 //! suspended sound server is not a reason to refuse to open.
 
+use std::fs::OpenOptions;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -29,11 +31,7 @@ const LIBRARY_PAGE: u32 = 200;
 /// device found would silently record the wrong microphone on any machine with
 /// more than one.
 pub fn default_microphone() -> AudioSource {
-    AudioSource::named(
-        SourceKind::Device,
-        "@DEFAULT_SOURCE@",
-        "Default microphone",
-    )
+    AudioSource::named(SourceKind::Device, "@DEFAULT_SOURCE@", "Default microphone")
 }
 
 pub struct Probe<T> {
@@ -51,25 +49,66 @@ impl<T> Probe<T> {
     }
 }
 
+/// Where the library lives, whether or not it opened. Shown to the user when
+/// it turns out to be read-only, since "the library is read-only" is only
+/// actionable if they know which file to look at.
+pub fn library_path() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("fastcription")
+        .join("library.db")
+}
+
+/// The library, as the app needs to talk about it: the handle when there is
+/// one, where it is, and whether it will accept writes.
+pub struct StoreProbe {
+    pub store: Option<SharedStore>,
+    pub path: PathBuf,
+    /// True when the library opened but refuses writes, so recording is off
+    /// while history and export still work.
+    pub read_only: bool,
+    pub problem: Option<String>,
+}
+
 /// Opens the library. A failure here disables recording but leaves the app
 /// usable, so it returns `None` rather than aborting startup.
-pub fn open_store() -> Probe<Option<SharedStore>> {
-    match Store::open_default() {
+pub fn open_store() -> StoreProbe {
+    let path = library_path();
+    match Store::open(&path) {
         Ok(store) => {
+            let read_only = store.is_read_only();
             // Any conversation still marked active belongs to a process that
             // died mid-recording. Its committed segments are intact.
-            match store.reap_active() {
-                Ok(0) => {}
-                Ok(n) => tracing::warn!(count = n, "marked interrupted conversations from a previous run"),
-                Err(err) => tracing::warn!(%err, "could not reap interrupted conversations"),
+            if !read_only {
+                match store.reap_active() {
+                    Ok(0) => {}
+                    Ok(n) => tracing::warn!(
+                        count = n,
+                        "marked interrupted conversations from a previous run"
+                    ),
+                    Err(err) => tracing::warn!(%err, "could not reap interrupted conversations"),
+                }
             }
-            Probe::ok(Some(Arc::new(Mutex::new(store))))
+            StoreProbe {
+                store: Some(Arc::new(Mutex::new(store))),
+                problem: read_only.then(|| {
+                    format!(
+                        "The conversation library at {} will not accept writes, so recording \
+                         is disabled. Past transcripts are still readable and exportable.",
+                        path.display()
+                    )
+                }),
+                path,
+                read_only,
+            }
         }
-        Err(err) => Probe {
-            value: None,
+        Err(err) => StoreProbe {
+            store: None,
             problem: Some(format!(
                 "The conversation library could not be opened, so recording is disabled: {err}"
             )),
+            path,
+            read_only: false,
         },
     }
 }
@@ -98,8 +137,12 @@ pub struct Catalog {
     pub models: Vec<String>,
 }
 
+/// Only the cheap half of voxtype's self-description: `--version`,
+/// `info engines`, `info models`, about 10 ms for the three. `info devices`
+/// alone costs 240 ms and nothing here needs it, which is why
+/// [`fc_voxtype::cli::probe`] is deliberately not used.
 pub fn probe_catalog() -> Catalog {
-    let probe = fc_voxtype::cli::probe();
+    let probe = fc_voxtype::cli::probe_catalog();
     let engines = probe
         .engines
         .map(|entries| {
@@ -205,22 +248,24 @@ pub struct Library {
 
 /// Reads the library for display.
 ///
-/// The views want whole [`Conversation`]s — source, engine and status included —
-/// which `list_conversations` does not carry, so each listed row is fetched in
-/// full. That is one query per row: fine for a page of 200, and the thing to
-/// revisit when the sidebar learns to render summaries directly.
-pub fn load_library(store: &SharedStore) -> Probe<Library> {
-    let guard = match store.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+/// Two queries for the whole page, through `list_conversations_full`: the views
+/// want the complete record — source, engine, status — and fetching each listed
+/// row on its own meant 201 queries for a page of 200, on every reload.
+///
+/// `recording` is the conversation this process is writing right now, which is
+/// the only `Active` row that may be listed. Every other one belongs to a
+/// process that died mid-recording; those are reaped to `Interrupted` at
+/// startup, and one that slipped through would offer the user a Delete button
+/// the store is bound to refuse.
+pub fn load_library(store: &SharedStore, recording: Option<ConversationId>) -> Probe<Library> {
+    let guard = crate::session::lock(store);
 
     let filter = ConversationFilter {
         limit: Some(LIBRARY_PAGE),
         ..Default::default()
     };
 
-    let summaries = match guard.list_conversations(&filter) {
+    let rows = match guard.list_conversations_full(&filter) {
         Ok(rows) => rows,
         Err(err) => {
             return Probe {
@@ -236,24 +281,45 @@ pub fn load_library(store: &SharedStore) -> Probe<Library> {
         ..Default::default()
     };
 
-    for summary in summaries {
+    // On a read-only library `reap_active` could not run, so an `Active` row
+    // left by a crash is permanent — and hiding it would hide a transcript the
+    // user cannot get back any other way. Delete is refused for every row
+    // there anyway, so there is nothing to protect them from.
+    let hide_active = !guard.is_read_only();
+
+    for (conversation, tags) in rows {
+        if hide_active
+            && conversation.status == ConversationStatus::Active
+            && Some(conversation.id) != recording
+        {
+            continue;
+        }
         library
             .conversation_tags
-            .insert(summary.id, summary.tags.iter().map(|t| t.id).collect());
-        match guard.get_conversation(summary.id) {
-            Ok(conversation) => library.conversations.push(conversation),
-            Err(err) => tracing::warn!(id = %summary.id, %err, "skipping unreadable conversation"),
-        }
+            .insert(conversation.id, tags.iter().map(|t| t.id).collect());
+        library.conversations.push(conversation);
     }
 
     Probe::ok(library)
 }
 
+/// One conversation that a search found outside the loaded page.
+///
+/// The sidebar lists [`LIBRARY_PAGE`] conversations; a full-text hit can be in
+/// any of them, so a search in a long-lived library would show excerpts with
+/// no rows to attach them to.
+pub fn load_conversation(store: &SharedStore, id: ConversationId) -> Option<Conversation> {
+    match crate::session::lock(store).get_conversation(id) {
+        Ok(conversation) => Some(conversation),
+        Err(err) => {
+            tracing::warn!(id = %id, %err, "a search hit named an unreadable conversation");
+            None
+        }
+    }
+}
+
 pub fn load_segments(store: &SharedStore, id: ConversationId) -> Vec<Segment> {
-    let guard = match store.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let guard = crate::session::lock(store);
     match guard.load_segments(id) {
         Ok(segments) => segments,
         Err(err) => {
@@ -262,7 +328,6 @@ pub fn load_segments(store: &SharedStore, id: ConversationId) -> Vec<Segment> {
         }
     }
 }
-
 
 /// Keeps the voxtype service indicator truthful without the user pressing
 /// anything.
@@ -278,7 +343,14 @@ pub struct ServiceMonitor {
 }
 
 impl ServiceMonitor {
-    const POLL: std::time::Duration = std::time::Duration::from_secs(3);
+    /// How long to wait between `systemctl` calls when the inotify watch is
+    /// working. The watch reports anything the daemon does within
+    /// milliseconds, so this only has to catch the unit being started or
+    /// stopped from outside fastcription — a spare poll per quarter minute,
+    /// rather than a subprocess every three seconds for the life of the app.
+    const WATCHED_POLL: std::time::Duration = std::time::Duration::from_secs(15);
+    /// Without a watch, the poll is the only signal there is.
+    const BLIND_POLL: std::time::Duration = std::time::Duration::from_secs(3);
 
     pub fn spawn() -> Self {
         let (tx, updates) = crossbeam_channel::bounded(8);
@@ -290,25 +362,33 @@ impl ServiceMonitor {
                 let watch = fc_voxtype::runtime::RuntimePaths::discover()
                     .ok()
                     .and_then(|paths| fc_voxtype::runtime::watch(paths).ok());
+                let poll = if watch.is_some() {
+                    Self::WATCHED_POLL
+                } else {
+                    Self::BLIND_POLL
+                };
 
-                let mut last = None;
                 loop {
-                    let current = service_status();
-                    if Some(current) != last {
-                        last = Some(current);
-                        if tx.send(current).is_err() {
-                            return;
-                        }
+                    // Sent whatever it was last time: the receiving end keeps
+                    // only the newest value, and skipping unchanged ones meant
+                    // a window opened after a change showed a stale pill until
+                    // the next one.
+                    match tx.try_send(service_status()) {
+                        Ok(()) | Err(crossbeam_channel::TrySendError::Full(_)) => {}
+                        // Nobody is listening any more: the app is gone, and
+                        // this thread spawning `systemctl` for ever after it
+                        // is pure waste.
+                        Err(crossbeam_channel::TrySendError::Disconnected(_)) => return,
                     }
                     match &watch {
                         // Any daemon activity is a reason to look again now.
-                        Some(rx) => match rx.recv_timeout(Self::POLL) {
+                        Some(rx) => match rx.recv_timeout(poll) {
                             Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                                std::thread::sleep(Self::POLL)
+                                std::thread::sleep(poll)
                             }
                         },
-                        None => std::thread::sleep(Self::POLL),
+                        None => std::thread::sleep(poll),
                     }
                 }
             })
@@ -317,10 +397,49 @@ impl ServiceMonitor {
         Self { updates }
     }
 
-    /// The newest status, if it changed since the last call.
+    /// The newest status, if one arrived since the last call.
     pub fn poll(&self) -> Option<crate::app::ServiceStatus> {
         self.updates.try_iter().last()
     }
+}
+
+/// What the app learns about the machine by running subprocesses, delivered
+/// once the answers are in.
+///
+/// Every one of these costs a `fork`/`exec`: `pactl` for the sources, `voxtype
+/// status` for the engine, three more `voxtype info` calls for the catalog.
+/// Together they took about half a second on this machine, and the window used
+/// to wait for all of them before its first frame — half a second of nothing
+/// on screen, to fill in controls the user cannot have touched yet.
+pub struct Startup {
+    pub sources: Probe<Vec<AudioSource>>,
+    pub engine: EngineInfo,
+    pub catalog: Catalog,
+}
+
+/// Runs the startup probes on a thread and wakes the window when they land.
+pub fn probe_startup(
+    voxtype: Option<PathBuf>,
+    waker: &fastframe_shell::Waker,
+) -> crossbeam_channel::Receiver<Startup> {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let waker = waker.clone();
+    let spawned = std::thread::Builder::new()
+        .name("fc-startup-probe".into())
+        .spawn(move || {
+            let startup = Startup {
+                sources: list_sources(),
+                engine: probe_engine(voxtype.as_ref()),
+                catalog: probe_catalog(),
+            };
+            if tx.send(startup).is_ok() {
+                waker.wake();
+            }
+        });
+    if let Err(err) = spawned {
+        tracing::error!(%err, "could not spawn the startup probe");
+    }
+    rx
 }
 
 /// What an import run did, for reporting back to the user.
@@ -336,7 +455,15 @@ pub struct Imported {
 /// never touched, only read through `voxtype meeting export` (architecture §7).
 /// Meetings already imported are skipped, so running this twice is safe, and a
 /// meeting still in progress is left alone — its transcript does not exist yet.
-pub fn import_meetings(store: &SharedStore, binary: &Path) -> Result<Imported, String> {
+/// `progress` counts meetings added so far, for a UI that is drawing while
+/// this runs on a thread of its own.
+pub fn import_meetings(
+    store: &SharedStore,
+    binary: &Path,
+    progress: &std::sync::atomic::AtomicUsize,
+) -> Result<Imported, String> {
+    use std::sync::atomic::Ordering;
+
     let meetings = fc_voxtype::meeting::list(binary, None)
         .map_err(|err| format!("Could not list voxtype meetings: {err}"))?;
 
@@ -357,7 +484,10 @@ pub fn import_meetings(store: &SharedStore, binary: &Path) -> Result<Imported, S
             continue;
         }
         match import_one(store, binary, &meeting) {
-            Ok(()) => outcome.added += 1,
+            Ok(()) => {
+                outcome.added += 1;
+                progress.store(outcome.added, Ordering::Relaxed);
+            }
             Err(err) => {
                 tracing::warn!(id = %meeting.id, %err, "could not import a voxtype meeting");
                 outcome.failed.push(format!("{}: {err}", meeting.title));
@@ -370,21 +500,16 @@ pub fn import_meetings(store: &SharedStore, binary: &Path) -> Result<Imported, S
 
 /// The voxtype meeting ids already in the library.
 ///
-/// Collected in one pass before importing rather than queried per meeting:
-/// `list_conversations` does not carry the imported id, so each row has to be
-/// read in full. That cost is paid once, for an action the user asked for, and
-/// it is what makes a second import a no-op instead of a duplicate library.
+/// One listing, not one query per row: this used to list the conversations and
+/// then read each one in full to reach `voxtype_meeting_id`, which was a
+/// query per conversation in the library before a single meeting was imported.
 fn imported_ids(store: &SharedStore) -> HashSet<String> {
-    let guard = match store.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    let Ok(rows) = guard.list_conversations(&ConversationFilter::default()) else {
+    let guard = crate::session::lock(store);
+    let Ok(rows) = guard.list_conversations_full(&ConversationFilter::default()) else {
         return HashSet::new();
     };
-    rows.iter()
-        .filter_map(|row| guard.get_conversation(row.id).ok())
-        .filter_map(|conversation| conversation.voxtype_meeting_id)
+    rows.into_iter()
+        .filter_map(|(conversation, _)| conversation.voxtype_meeting_id)
         .collect()
 }
 
@@ -415,7 +540,7 @@ fn import_one(
         .started_at
         .as_deref()
         .and_then(parse_rfc3339_millis)
-        .or_else(|| meeting.started_at.as_deref().and_then(parse_local_minute))
+        .or_else(|| meeting.started_at.as_deref().and_then(parse_utc_minute))
         .ok_or("the meeting has no readable start time")?;
 
     // Segment offsets are relative to the meeting's start, so the last one's
@@ -450,36 +575,36 @@ fn import_one(
         })
         .collect();
 
-    let guard = match store.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    let id = guard
-        .create_conversation(&fc_store::NewConversation {
-            title: transcript.title.clone().unwrap_or_else(|| meeting.title.clone()),
-            group: None,
-            started_at,
-            // voxtype does not record which source a meeting came from, and
-            // inventing one would put a claim in the library nothing backs.
-            source: AudioSource::named(SourceKind::Device, "", "Imported from voxtype"),
-            mic_track: false,
-            engine: EngineInfo {
-                engine: "voxtype".to_owned(),
-                // Not in the export either: metadata carries id, title, times,
-                // status and chunk count, and no model.
-                model: "unknown".to_owned(),
-                language: "unknown".to_owned(),
-                backend: None,
+    // One transaction, so a failure halfway cannot leave a half-empty `Active`
+    // row that the dedupe above then reads as "already imported" — which would
+    // make the meeting unimportable for ever and leave a fragment behind.
+    crate::session::lock(store)
+        .import_conversation(
+            &fc_store::NewConversation {
+                title: transcript
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| meeting.title.clone()),
+                group: None,
+                started_at,
+                // voxtype does not record which source a meeting came from, and
+                // inventing one would put a claim in the library nothing backs.
+                source: AudioSource::named(SourceKind::Device, "", "Imported from voxtype"),
+                mic_track: false,
+                engine: EngineInfo {
+                    engine: "voxtype".to_owned(),
+                    // Not in the export either: metadata carries id, title,
+                    // times, status and chunk count, and no model.
+                    model: "unknown".to_owned(),
+                    language: "unknown".to_owned(),
+                    backend: None,
+                },
+                voxtype_meeting_id: Some(meeting.id.clone()),
             },
-            voxtype_meeting_id: Some(meeting.id.clone()),
-        })
-        .map_err(|err| err.to_string())?;
-
-    guard
-        .append_segments(id, &segments)
-        .map_err(|err| err.to_string())?;
-    guard
-        .finish_conversation(id, ended_at, ConversationStatus::Completed)
+            &segments,
+            ended_at,
+            ConversationStatus::Completed,
+        )
         .map_err(|err| err.to_string())?;
     Ok(())
 }
@@ -491,19 +616,25 @@ fn parse_rfc3339_millis(text: &str) -> Option<UnixMillis> {
         .map(|stamp| (stamp.unix_timestamp_nanos() / 1_000_000) as i64)
 }
 
-/// The `Date:` line from `meeting list`, e.g. `2026-10-07 14:30`. It carries no
-/// timezone and no seconds, so it is read as local time and only used when the
-/// JSON export has no start time of its own.
-fn parse_local_minute(text: &str) -> Option<UnixMillis> {
+/// The `Date:` line from `meeting list`, e.g. `2026-10-07 14:30`.
+///
+/// Read as **UTC**, not as local time: upstream formats that line from the
+/// stored `started_at` without converting it, and that value is UTC — the same
+/// instant the JSON export writes with an explicit `+00:00`. Reading it as
+/// local time shifted every meeting imported through this fallback by the
+/// machine's offset, which on this one is an hour or two off, enough to make a
+/// morning standup land in the previous evening.
+///
+/// Only used when the JSON export has no start time of its own.
+fn parse_utc_minute(text: &str) -> Option<UnixMillis> {
     let format = time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]");
     let naive = time::PrimitiveDateTime::parse(text.trim(), &format).ok()?;
-    let offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
-    Some(naive.assume_offset(offset).unix_timestamp() * 1_000)
+    Some(naive.assume_utc().unix_timestamp() * 1_000)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_local_minute, parse_rfc3339_millis};
+    use super::{parse_rfc3339_millis, parse_utc_minute};
 
     /// The exact value voxtype writes in a JSON export's `metadata.startedAt`.
     /// A unit mistake here would shift every imported transcript by a factor
@@ -530,24 +661,26 @@ mod tests {
     fn unreadable_start_times_are_rejected_rather_than_guessed() {
         assert_eq!(parse_rfc3339_millis(""), None);
         assert_eq!(parse_rfc3339_millis("2026-10-07 14:30"), None);
-        assert_eq!(parse_local_minute("not a date"), None);
-        assert_eq!(parse_local_minute(""), None);
+        assert_eq!(parse_utc_minute("not a date"), None);
+        assert_eq!(parse_utc_minute(""), None);
     }
 
-    /// The `Date:` line from `meeting list` has no timezone, so it is read as
-    /// local time. Asserted against the same offset the function uses, since
-    /// the test machine's zone is not fixed.
+    /// The `Date:` line from `meeting list` has no timezone, and upstream
+    /// prints it straight from a UTC `started_at`. Asserted against a fixed
+    /// epoch rather than the machine's offset: the whole point is that the
+    /// answer does not depend on where the machine is.
     #[test]
-    fn a_meeting_list_date_reads_as_local_time() {
-        let parsed = parse_local_minute("2026-10-07 14:30").expect("parses");
-        let offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
-        let expected = time::macros::date!(2026 - 10 - 07)
-            .with_hms(14, 30, 0)
-            .unwrap()
-            .assume_offset(offset)
-            .unix_timestamp()
-            * 1_000;
-        assert_eq!(parsed, expected);
+    fn a_meeting_list_date_reads_as_utc() {
+        // Same wall clock as the JSON fixture above, which carries +00:00.
+        assert_eq!(
+            parse_utc_minute("2026-10-07 14:30"),
+            Some(1_791_383_400_000)
+        );
+        assert_eq!(
+            parse_utc_minute("2026-10-07 14:30"),
+            parse_rfc3339_millis("2026-10-07T14:30:00+00:00"),
+            "the two ways upstream prints one instant must agree"
+        );
     }
 }
 
@@ -555,6 +688,7 @@ mod tests {
 mod import_tests {
     use super::*;
     use std::io::Write;
+    use std::sync::atomic::AtomicUsize;
 
     /// A stand-in `voxtype` that prints the output the real one prints.
     ///
@@ -614,11 +748,8 @@ esac
         let mut file = std::fs::File::create(&path).expect("create stub");
         file.write_all(script.as_bytes()).expect("write stub");
         drop(file);
-        std::fs::set_permissions(
-            &path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .expect("chmod stub");
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod stub");
         path
     }
 
@@ -634,7 +765,7 @@ esac
         let binary = stub_voxtype(bin_dir.path(), "2026-10-07T14:30:22+00:00");
         let (_dir, store) = temp_store();
 
-        let outcome = import_meetings(&store, &binary).expect("import");
+        let outcome = import_meetings(&store, &binary, &AtomicUsize::new(0)).expect("import");
         // The meeting still in progress has no transcript yet, so it is skipped
         // rather than imported half-finished.
         assert_eq!(outcome.added, 1, "failures: {:?}", outcome.failed);
@@ -674,10 +805,10 @@ esac
         let binary = stub_voxtype(bin_dir.path(), "2026-10-07T14:30:22+00:00");
         let (_dir, store) = temp_store();
 
-        let first = import_meetings(&store, &binary).expect("first import");
+        let first = import_meetings(&store, &binary, &AtomicUsize::new(0)).expect("first import");
         assert_eq!(first.added, 1);
 
-        let second = import_meetings(&store, &binary).expect("second import");
+        let second = import_meetings(&store, &binary, &AtomicUsize::new(0)).expect("second import");
         assert_eq!(second.added, 0);
         assert_eq!(second.skipped, 2);
 
@@ -696,23 +827,16 @@ esac
         let binary = stub_voxtype(bin_dir.path(), "not a timestamp");
         let (_dir, store) = temp_store();
 
-        let outcome = import_meetings(&store, &binary).expect("import");
+        let outcome = import_meetings(&store, &binary, &AtomicUsize::new(0)).expect("import");
         // The `Date:` line from the listing is the documented fallback, so this
-        // still imports — from 2026-10-07 14:30 local rather than from nothing.
+        // still imports — from 2026-10-07 14:30 UTC rather than from nothing.
         assert_eq!(outcome.added, 1);
         let guard = store.lock().unwrap();
         let rows = guard
             .list_conversations(&ConversationFilter::default())
             .expect("list");
         let conversation = guard.get_conversation(rows[0].id).expect("conversation");
-        let offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
-        let expected = time::macros::date!(2026 - 10 - 07)
-            .with_hms(14, 30, 0)
-            .unwrap()
-            .assume_offset(offset)
-            .unix_timestamp()
-            * 1_000;
-        assert_eq!(conversation.started_at, expected);
+        assert_eq!(conversation.started_at, 1_791_383_400_000);
     }
 }
 
@@ -758,22 +882,149 @@ pub struct RemoteEngine {
 /// own and passes it explicitly. The user's file is read for defaults and never
 /// touched; this one is ours to overwrite, and says so in a comment for anyone
 /// who finds it.
-pub fn write_private_config(settings: &EngineSettings) -> Result<PathBuf, String> {
-    let dir = dirs::config_dir()
-        .ok_or("no configuration directory")?
-        .join("fastcription");
-    write_private_config_in(&dir, settings)
+/// Writes the config for one session, under a name that belongs to that
+/// session alone.
+///
+/// Every session and every connection test used to write the same
+/// `voxtype.toml`, and the running transcriber reads that file on every pass —
+/// so testing a new server address in the middle of a meeting silently
+/// retargeted the live transcript at it. The file name carries the session's
+/// start time, and [`remove_session_config`] takes it away again when the
+/// session ends.
+pub fn write_session_config(
+    settings: &EngineSettings,
+    started_at: UnixMillis,
+) -> Result<PathBuf, String> {
+    let dir = config_dir()?;
+    write_private_config_in(&dir, &format!("voxtype-{started_at}.toml"), settings)
 }
 
-/// The body of [`write_private_config`], with the directory given rather than
-/// discovered, so tests do not contend over one real path.
+/// Deletes a session's config. Best effort: a leftover file is tidied up by
+/// [`clear_stale_session_configs`] on the next launch, so a failure here is
+/// worth a log line and nothing more.
+pub fn remove_session_config(path: &Path) {
+    if let Err(err) = std::fs::remove_file(path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(path = %path.display(), %err, "could not remove the session config");
+        }
+    }
+}
+
+/// Removes session configs left behind by a process that did not exit
+/// cleanly. They hold nothing but settings — and possibly an API key, which is
+/// the reason not to leave them lying around.
+///
+/// `voxtype.toml` goes too: that is where every session used to write, and a
+/// build that wrote it may have left a bearer token in it. Nothing reads it
+/// any more, and it is fastcription's own file — its own first line says so.
+pub fn clear_stale_session_configs() {
+    let Ok(dir) = config_dir() else {
+        return;
+    };
+    for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let ours = name == "voxtype.toml"
+            || name == "voxtype.toml.tmp"
+            || (name.starts_with("voxtype-") && name.ends_with(".toml"));
+        if ours {
+            remove_session_config(&entry.path());
+        }
+    }
+}
+
+/// The config for a connection test, in a temporary file.
+///
+/// Never the live path: a test runs while a meeting may be recording, and the
+/// running transcriber re-reads its config on every pass. The returned handle
+/// owns the file and deletes it on drop, so the token it may contain does not
+/// outlive the test.
+pub fn write_probe_config(settings: &EngineSettings) -> Result<tempfile::NamedTempFile, String> {
+    use std::io::Write;
+
+    let file = tempfile::Builder::new()
+        .prefix("fastcription-probe")
+        .suffix(".toml")
+        // The body can carry a bearer token, so it is user-only from the
+        // moment it exists rather than chmod'ed after the fact.
+        .permissions(std::fs::Permissions::from_mode(0o600))
+        .tempfile()
+        .map_err(|err| format!("could not write a temporary config: {err}"))?;
+    let mut handle = file.reopen().map_err(|err| err.to_string())?;
+    handle
+        .write_all(config_body(settings).as_bytes())
+        .map_err(|err| format!("could not write a temporary config: {err}"))?;
+    handle.sync_all().map_err(|err| err.to_string())?;
+    Ok(file)
+}
+
+fn config_dir() -> Result<PathBuf, String> {
+    Ok(dirs::config_dir()
+        .ok_or("no configuration directory")?
+        .join("fastcription"))
+}
+
+/// Writes `name` in `dir` atomically and user-only.
+///
+/// `create_new` on a temporary name in the same directory, then `rename`: a
+/// reader — the transcriber, which opens this file on every pass — sees either
+/// the previous config or the new one, never a half-written file. The mode is
+/// set at creation rather than afterwards, so a bearer token is never briefly
+/// world-readable.
 pub fn write_private_config_in(
     dir: &Path,
+    name: &str,
     settings: &EngineSettings,
 ) -> Result<PathBuf, String> {
-    std::fs::create_dir_all(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
-    let path = dir.join("voxtype.toml");
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
 
+    std::fs::create_dir_all(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+    let path = dir.join(name);
+    let staging = dir.join(format!("{name}.tmp"));
+
+    let body = config_body(settings);
+    let mut file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&staging)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A crash between create and rename. The file is ours by name, and
+            // leaving it there would make every later write fail.
+            tracing::warn!(path = %staging.display(), "replacing a stale staging config");
+            std::fs::remove_file(&staging)
+                .map_err(|err| format!("{}: {err}", staging.display()))?;
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&staging)
+                .map_err(|err| format!("{}: {err}", staging.display()))?
+        }
+        Err(err) => return Err(format!("{}: {err}", staging.display())),
+    };
+
+    let written = file
+        .write_all(body.as_bytes())
+        .and_then(|()| file.sync_all());
+    if let Err(err) = written {
+        let _ = std::fs::remove_file(&staging);
+        return Err(format!("{}: {err}", staging.display()));
+    }
+    drop(file);
+
+    if let Err(err) = std::fs::rename(&staging, &path) {
+        let _ = std::fs::remove_file(&staging);
+        return Err(format!("{}: {err}", path.display()));
+    }
+    Ok(path)
+}
+
+/// The TOML voxtype reads, for whichever file it is about to land in.
+fn config_body(settings: &EngineSettings) -> String {
     let mut body = String::from(
         "# Written by fastcription. Edits are overwritten.\n\
          #\n\
@@ -807,10 +1058,7 @@ pub fn write_private_config_in(
                 remote.timeout_secs.max(1)
             ));
             if !settings.language.trim().is_empty() {
-                body.push_str(&format!(
-                    "language = {}\n",
-                    toml_string(&settings.language)
-                ));
+                body.push_str(&format!("language = {}\n", toml_string(&settings.language)));
             }
         }
         None => {
@@ -818,10 +1066,7 @@ pub fn write_private_config_in(
                 body.push_str(&format!("model = {}\n", toml_string(&settings.model)));
             }
             if !settings.language.trim().is_empty() {
-                body.push_str(&format!(
-                    "language = {}\n",
-                    toml_string(&settings.language)
-                ));
+                body.push_str(&format!("language = {}\n", toml_string(&settings.language)));
             }
             // The reason this file exists. Only meaningful for a local model.
             body.push_str(&format!(
@@ -832,23 +1077,7 @@ pub fn write_private_config_in(
         }
     }
 
-    std::fs::write(&path, body).map_err(|err| format!("{}: {err}", path.display()))?;
-
-    // A bearer token in a world-readable file would be a quiet mistake.
-    let has_secret = settings
-        .remote
-        .as_ref()
-        .is_some_and(|remote| !remote.api_key.trim().is_empty());
-    if has_secret {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(err) =
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-        {
-            tracing::warn!(%err, "could not restrict permissions on the config holding the API key");
-        }
-    }
-
-    Ok(path)
+    body
 }
 
 /// Quotes a value as a TOML basic string. The inputs are a model and a language
@@ -881,7 +1110,7 @@ pub fn default_threads() -> u32 {
 
 #[cfg(test)]
 mod config_tests {
-    use super::{toml_string, write_private_config_in, EngineSettings};
+    use super::{toml_string, write_private_config_in, EngineSettings, PermissionsExt};
 
     /// The model and language come from text fields, so a value containing a
     /// quote must not be able to close the string and inject another key.
@@ -907,7 +1136,7 @@ mod config_tests {
             remote: None,
         };
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = write_private_config_in(dir.path(), &settings).expect("write");
+        let path = write_private_config_in(dir.path(), "voxtype.toml", &settings).expect("write");
         let body = std::fs::read_to_string(&path).expect("read back");
         assert!(body.contains("context_window_optimization = true"));
         assert!(body.contains("threads = 8"));
@@ -915,9 +1144,63 @@ mod config_tests {
         let parsed: toml::Value = toml::from_str(&body).expect("valid TOML");
         let whisper = parsed.get("whisper").expect("a whisper table");
         assert_eq!(
-            whisper.get("context_window_optimization").and_then(|v| v.as_bool()),
+            whisper
+                .get("context_window_optimization")
+                .and_then(|v| v.as_bool()),
             Some(true)
         );
+    }
+
+    fn plain() -> EngineSettings {
+        EngineSettings {
+            model: "base.en".into(),
+            language: "en".into(),
+            threads: 8,
+            fast_mode: true,
+            remote: None,
+        }
+    }
+
+    /// The transcriber opens this file on every pass, so a reader must never
+    /// see it half written — and the staging file must not survive, or the
+    /// `create_new` on the next write would fail.
+    #[test]
+    fn the_write_is_atomic_and_leaves_no_staging_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_private_config_in(dir.path(), "voxtype-1.toml", &plain()).expect("write");
+        assert!(path.exists());
+        assert!(
+            !dir.path().join("voxtype-1.toml.tmp").exists(),
+            "the staging file must be renamed away, not left behind"
+        );
+
+        // Writing again over the same name has to work, which it does not if
+        // the first write left its staging file in place.
+        write_private_config_in(dir.path(), "voxtype-1.toml", &plain()).expect("rewrite");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// A stale staging file is what a crash between create and rename leaves.
+    /// Refusing to write for ever afterwards would mean no session could start
+    /// again until the user found and deleted a file they have never heard of.
+    #[test]
+    fn a_stale_staging_file_is_replaced_rather_than_fatal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("voxtype-2.toml.tmp"), b"half a config").expect("stale");
+        let path = write_private_config_in(dir.path(), "voxtype-2.toml", &plain()).expect("write");
+        let body = std::fs::read_to_string(&path).expect("read back");
+        assert!(body.contains("model = \"base.en\""));
+    }
+
+    /// Every config is user-only, not just the ones that happen to hold a
+    /// token: the mode is set when the file is created, so there is no window
+    /// in which a key is world-readable.
+    #[test]
+    fn a_config_is_user_only_from_the_moment_it_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_private_config_in(dir.path(), "voxtype-3.toml", &plain()).expect("write");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "mode was {mode:o}");
     }
 }
 
@@ -977,7 +1260,8 @@ mod remote_config_tests {
     #[test]
     fn remote_mode_writes_the_server_and_omits_the_local_model() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = write_private_config_in(dir.path(), &settings("")).expect("write");
+        let path =
+            write_private_config_in(dir.path(), "voxtype.toml", &settings("")).expect("write");
         let body = std::fs::read_to_string(&path).expect("read back");
         assert!(body.contains("mode = \"remote\""));
         assert!(body.contains("remote_endpoint = \"http://desktop.lan:8080\""));
@@ -999,15 +1283,15 @@ mod remote_config_tests {
     fn a_config_holding_an_api_key_is_readable_only_by_its_owner() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("tempdir");
-        let path =
-            write_private_config_in(dir.path(), &settings("secret-token")).expect("write");
+        let path = write_private_config_in(dir.path(), "voxtype.toml", &settings("secret-token"))
+            .expect("write");
         let body = std::fs::read_to_string(&path).expect("read back");
         assert!(body.contains("remote_api_key = \"secret-token\""));
         let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "config with a key must be user-only");
 
         // Writing again without a key must not leave the old one behind.
-        write_private_config_in(dir.path(), &settings("")).expect("rewrite");
+        write_private_config_in(dir.path(), "voxtype.toml", &settings("")).expect("rewrite");
         let body = std::fs::read_to_string(&path).expect("read back");
         assert!(!body.contains("secret-token"), "a removed key must be gone");
     }
@@ -1095,7 +1379,8 @@ mod remote_path_tests {
                 timeout_secs: 30,
             }),
         };
-        let config = write_private_config_in(dir.path(), &settings).expect("write config");
+        let config =
+            write_private_config_in(dir.path(), "voxtype.toml", &settings).expect("write config");
         let probe = super::write_probe_wav().expect("probe wav");
 
         let output = std::process::Command::new(&binary)
@@ -1123,7 +1408,10 @@ mod remote_path_tests {
             "the API key must be sent"
         );
         assert!(request.contains("multipart/form-data"));
-        assert!(request.contains("name=\"file\""), "the audio must be attached");
+        assert!(
+            request.contains("name=\"file\""),
+            "the audio must be attached"
+        );
         assert!(request.contains("RIFF"), "the attachment must be a WAV");
         assert!(request.contains("name=\"model\""));
 

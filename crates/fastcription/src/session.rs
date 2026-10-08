@@ -23,8 +23,8 @@
 //! the channel rather than being discarded — 16 kHz mono f32 costs 64 KB per
 //! second of lag, which is cheap next to losing part of a meeting.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
@@ -42,6 +42,21 @@ use fc_store::{NewConversation, Store};
 /// chunk, so contention is irrelevant and a second connection would only invite
 /// `SQLITE_BUSY`.
 pub type SharedStore = Arc<Mutex<Store>>;
+
+/// The one way anything in the app reaches the store.
+///
+/// A poisoned mutex is recovered rather than propagated: the panic that
+/// poisoned it happened in a caller, not inside SQLite, so the connection is
+/// still perfectly usable — and refusing to touch the library for the rest of
+/// the session would cost the user the meeting over someone else's bug. The
+/// alternative that was here, a mix of `expect("store mutex")` and
+/// `into_inner()`, meant whether a panic ended the recording depended on which
+/// call site noticed first.
+pub fn lock(store: &SharedStore) -> MutexGuard<'_, Store> {
+    store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// A running capture that can be told to stop.
 ///
@@ -114,6 +129,13 @@ pub struct Session {
     /// cannot cut the sentence itself: it leaves this flag, and the thread acts
     /// on it before dropping the next frame.
     cut_pending: Arc<AtomicBool>,
+    /// How many committed utterances the store refused.
+    ///
+    /// Counted rather than only reported, because a conversation whose rows
+    /// were partly rejected is not `Completed`: the transcript on disk is
+    /// shorter than the one the user watched, and labelling it complete makes
+    /// a truncated export look authoritative.
+    store_failures: Arc<AtomicUsize>,
     tracks: Vec<TrackRuntime>,
     store: SharedStore,
 }
@@ -138,23 +160,20 @@ impl Session {
             return Err(SessionError::UnusableSource(cfg.source.label()));
         }
 
-        let conversation =
-            store
-                .lock()
-                .expect("store mutex")
-                .create_conversation(&NewConversation {
-                    title: cfg.title.clone(),
-                    group: cfg.group,
-                    started_at: now,
-                    source: cfg.source.clone(),
-                    mic_track: cfg.mic_source.is_some(),
-                    engine: cfg.engine.clone(),
-                    voxtype_meeting_id: None,
-                })?;
+        let conversation = lock(&store).create_conversation(&NewConversation {
+            title: cfg.title.clone(),
+            group: cfg.group,
+            started_at: now,
+            source: cfg.source.clone(),
+            mic_track: cfg.mic_source.is_some(),
+            engine: cfg.engine.clone(),
+            voxtype_meeting_id: None,
+        })?;
 
         let (event_tx, events) = unbounded::<SessionEvent>();
         let paused = Arc::new(AtomicBool::new(false));
         let cut_pending = Arc::new(AtomicBool::new(false));
+        let store_failures = Arc::new(AtomicUsize::new(0));
         let transcriber = Arc::new(transcriber);
 
         let mut tracks = Vec::new();
@@ -167,6 +186,7 @@ impl Session {
             event_tx.clone(),
             Arc::clone(&paused),
             Arc::clone(&cut_pending),
+            Arc::clone(&store_failures),
             Arc::clone(&transcriber),
             captures,
             true,
@@ -181,6 +201,7 @@ impl Session {
                 event_tx.clone(),
                 Arc::clone(&paused),
                 Arc::clone(&cut_pending),
+                Arc::clone(&store_failures),
                 Arc::clone(&transcriber),
                 captures,
                 // Only the selected track reports levels: two tracks driving one
@@ -197,6 +218,7 @@ impl Session {
             event_tx,
             paused,
             cut_pending,
+            store_failures,
             tracks,
             store,
         })
@@ -246,6 +268,10 @@ impl Session {
     /// conversation is closed.
     pub fn stop_async(self, now: UnixMillis) {
         let events = self.event_tx.clone();
+        // A second handle, because a failed spawn consumes the closure and
+        // with it the session: the interface still has to be told, or it sits
+        // in `Finishing` with no session left to finish it.
+        let unspawned = self.event_tx.clone();
         let spawned = thread::Builder::new()
             .name("fc-session-stop".into())
             .spawn(move || {
@@ -254,10 +280,20 @@ impl Session {
                         stage: "finish",
                         message: err.to_string(),
                     });
+                    // `stop` reports `Idle` itself even when it fails, but a
+                    // panic-free failure path is not a guarantee of ordering:
+                    // sending it again is harmless and leaving the app stuck
+                    // in `Finishing` for ever is not.
+                    let _ = events.send(SessionEvent::StateChanged(SessionState::Idle));
                 }
             });
         if let Err(err) = spawned {
             tracing::error!(%err, "could not spawn the session shutdown thread");
+            let _ = unspawned.send(SessionEvent::Failed {
+                stage: "finish",
+                message: format!("could not finish the conversation: {err}"),
+            });
+            let _ = unspawned.send(SessionEvent::StateChanged(SessionState::Idle));
         }
     }
 
@@ -273,15 +309,34 @@ impl Session {
             let _ = track.worker.join();
         }
 
-        self.store
-            .lock()
-            .expect("store mutex")
-            .finish_conversation(self.conversation, now, ConversationStatus::Completed)?;
+        // A conversation the store partly refused is `Interrupted`: the rows
+        // on disk are fewer than the lines the user read, and only the status
+        // can say so after the fact.
+        let unsaved = self.store_failures.load(Ordering::SeqCst);
+        let status = if unsaved > 0 {
+            ConversationStatus::Interrupted
+        } else {
+            ConversationStatus::Completed
+        };
+        if unsaved > 0 {
+            let _ = self.event_tx.send(SessionEvent::Failed {
+                stage: "store",
+                message: format!(
+                    "{unsaved} line(s) of this conversation could not be saved, \
+                     so it is marked interrupted"
+                ),
+            });
+        }
+
+        // Captured before `Idle` is sent and propagated after: the interface
+        // must leave `Finishing` whether or not the row could be closed, or a
+        // read-only library strands the app with no way back to `Start`.
+        let closed = lock(&self.store).finish_conversation(self.conversation, now, status);
 
         let _ = self
             .event_tx
             .send(SessionEvent::StateChanged(SessionState::Idle));
-        Ok(())
+        closed.map_err(SessionError::from)
     }
 }
 
@@ -295,6 +350,7 @@ fn spawn_track(
     event_tx: Sender<SessionEvent>,
     paused: Arc<AtomicBool>,
     cut_pending: Arc<AtomicBool>,
+    store_failures: Arc<AtomicUsize>,
     transcriber: Arc<TranscriberFactory>,
     captures: &CaptureFactory,
     report_levels: bool,
@@ -324,6 +380,7 @@ fn spawn_track(
                 event_tx,
                 paused,
                 cut_pending,
+                store_failures,
                 stream,
             )
         })
@@ -376,9 +433,16 @@ fn run_stream(
     event_tx: Sender<SessionEvent>,
     paused: Arc<AtomicBool>,
     cut_pending: Arc<AtomicBool>,
+    store_failures: Arc<AtomicUsize>,
     mut stream: TranscriptStream<Boxed>,
 ) {
     let mut state = TrackState::default();
+    let sink = TrackSink {
+        track,
+        conversation,
+        event_tx,
+        store_failures,
+    };
 
     for frame in &pcm_rx {
         if cut_pending.swap(false, Ordering::SeqCst) {
@@ -387,7 +451,7 @@ fn run_stream(
             // below, so the utterance ends where the user paused rather than
             // absorbing the first words spoken after they resume.
             if let Some(update) = stream.cut() {
-                apply(&mut state, update, track, conversation, &store, &event_tx);
+                apply(&mut state, update, &sink, &store);
             }
         }
         if paused.load(Ordering::SeqCst) {
@@ -396,13 +460,29 @@ fn run_stream(
             continue;
         }
         if let Some(update) = stream.push(&frame) {
-            apply(&mut state, update, track, conversation, &store, &event_tx);
+            apply(&mut state, update, &sink, &store);
         }
     }
 
     // Capture has ended; whatever is mid-utterance is still the user's words.
     if let Some(update) = stream.finish() {
-        apply(&mut state, update, track, conversation, &store, &event_tx);
+        apply(&mut state, update, &sink, &store);
+    }
+}
+
+/// Where one track's results go: the interface, and the tally of rows the
+/// store refused. Bundled because every one of them travels together through
+/// `apply` and `persist`, and six positional arguments hid which was which.
+struct TrackSink {
+    track: Track,
+    conversation: ConversationId,
+    event_tx: Sender<SessionEvent>,
+    store_failures: Arc<AtomicUsize>,
+}
+
+impl TrackSink {
+    fn send(&self, event: SessionEvent) {
+        let _ = self.event_tx.send(event);
     }
 }
 
@@ -427,20 +507,13 @@ struct TrackState {
 /// flight. An earlier version checked the error first and returned, so a
 /// permanently broken engine threw away the only text it managed to salvage --
 /// it reached neither the interface nor the store.
-fn apply(
-    state: &mut TrackState,
-    update: Update,
-    track: Track,
-    conversation: ConversationId,
-    store: &SharedStore,
-    event_tx: &Sender<SessionEvent>,
-) {
+fn apply(state: &mut TrackState, update: Update, sink: &TrackSink, store: &SharedStore) {
     for message in update.errors {
         // A failing engine must be visible: silence from a broken transcriber
         // is indistinguishable from a quiet room, which is the worst way for
         // this app to fail. Unless it gave up, the utterance stays buffered and
         // the next pass retries it, so nothing is lost by carrying on.
-        let _ = event_tx.send(SessionEvent::Failed {
+        sink.send(SessionEvent::Failed {
             stage: "transcribe",
             message,
         });
@@ -453,7 +526,7 @@ fn apply(
         } else {
             Pressure::Keeping
         };
-        let _ = event_tx.send(SessionEvent::PressureChanged(pressure));
+        sink.send(SessionEvent::PressureChanged(pressure));
     }
 
     if !update.stable.is_empty() {
@@ -470,7 +543,7 @@ fn apply(
             continue;
         }
         let segment = Segment {
-            track,
+            track: sink.track,
             seq: state.next_seq,
             start_ms: finished.start_ms,
             end_ms: finished.end_ms,
@@ -483,8 +556,10 @@ fn apply(
         state.next_seq += 1;
         // Shown whether or not the write succeeded: a database failure is worth
         // reporting, but it is not a reason to hide words that were said.
-        persist(store, conversation, &segment, event_tx);
-        let _ = event_tx.send(SessionEvent::Committed(segment));
+        if !persist(store, &segment, sink) {
+            sink.store_failures.fetch_add(1, Ordering::SeqCst);
+        }
+        sink.send(SessionEvent::Committed(segment));
     }
 
     // The live line: what is agreed, plus the tail that is not yet. It is
@@ -499,8 +574,8 @@ fn apply(
     // to know: this used to be a flat zero, so every live row read `00:00`. A
     // line still being spoken has no end yet, so the span is a point.
     let start_ms = update.utterance_start_ms.unwrap_or(0);
-    let _ = event_tx.send(SessionEvent::Provisional(Segment {
-        track,
+    sink.send(SessionEvent::Provisional(Segment {
+        track: sink.track,
         seq: state.next_seq,
         start_ms,
         end_ms: start_ms,
@@ -515,20 +590,12 @@ fn apply(
 /// Writes one segment, reporting rather than panicking on failure: a database
 /// error must not cost the user the rest of the meeting. The caller shows the
 /// segment either way.
-fn persist(
-    store: &SharedStore,
-    conversation: ConversationId,
-    segment: &Segment,
-    event_tx: &Sender<SessionEvent>,
-) -> bool {
-    let result = store
-        .lock()
-        .expect("store mutex")
-        .append_segments(conversation, std::slice::from_ref(segment));
+fn persist(store: &SharedStore, segment: &Segment, sink: &TrackSink) -> bool {
+    let result = lock(store).append_segments(sink.conversation, std::slice::from_ref(segment));
     match result {
         Ok(()) => true,
         Err(err) => {
-            let _ = event_tx.send(SessionEvent::Failed {
+            sink.send(SessionEvent::Failed {
                 stage: "store",
                 message: err.to_string(),
             });
@@ -1126,6 +1193,121 @@ mod tests {
         assert!(
             stored.iter().any(|s| s.text == first.text),
             "the cut utterance must be persisted like any other: {stored:?}"
+        );
+    }
+
+    /// A session with no tracks and a conversation already in the store, so a
+    /// test can exercise `stop` on its own: the finishing path is what these
+    /// two tests are about, not the capture that preceded it.
+    fn finished_session(
+        store: &SharedStore,
+        conversation: ConversationId,
+        store_failures: usize,
+    ) -> Session {
+        let (event_tx, events) = unbounded::<SessionEvent>();
+        Session {
+            conversation,
+            events,
+            event_tx,
+            paused: Arc::new(AtomicBool::new(false)),
+            cut_pending: Arc::new(AtomicBool::new(false)),
+            store_failures: Arc::new(AtomicUsize::new(store_failures)),
+            tracks: Vec::new(),
+            store: Arc::clone(store),
+        }
+    }
+
+    /// A library whose file will not accept writes, so `finish_conversation`
+    /// fails for a reason the app cannot do anything about.
+    ///
+    /// `None` when the process ignores permission bits (root), where there is
+    /// no such thing as a read-only file.
+    fn read_only_library() -> Option<(tempfile::TempDir, SharedStore, ConversationId)> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("library.db");
+        let id = {
+            let store = Store::open(&path).expect("open writable");
+            store
+                .create_conversation(&NewConversation {
+                    title: "Recorded".into(),
+                    group: None,
+                    started_at: 1_700_000_000_000,
+                    source: AudioSource::named(SourceKind::SinkMonitor, "sink.monitor", "A sink"),
+                    mic_track: false,
+                    engine: engine_info(),
+                    voxtype_meeting_id: None,
+                })
+                .expect("conversation")
+        };
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).expect("chmod");
+        let store = Store::open(&path).expect("reopen");
+        if !store.is_read_only() {
+            return None;
+        }
+        Some((dir, Arc::new(Mutex::new(store)), id))
+    }
+
+    /// The window has to leave `Finishing` whatever the store says.
+    ///
+    /// `stop` used to propagate the failure before reporting a state, so a
+    /// library that had become unwritable left the app in `Finishing` with no
+    /// session left to finish it: Start, Pause and Stop all disabled, for ever,
+    /// with a restart the only way out.
+    #[test]
+    fn a_store_that_cannot_close_the_conversation_still_ends_idle() {
+        let Some((_dir, store, id)) = read_only_library() else {
+            eprintln!("skipped: this process ignores file permissions");
+            return;
+        };
+        let session = finished_session(&store, id, 0);
+        let events = session.events.clone();
+
+        let outcome = session.stop(1_700_000_060_000);
+        assert!(outcome.is_err(), "a read-only library cannot be written");
+
+        let seen: Vec<SessionEvent> = events.try_iter().collect();
+        assert!(
+            matches!(
+                seen.last(),
+                Some(SessionEvent::StateChanged(SessionState::Idle))
+            ),
+            "the last word must be Idle, saw {seen:?}"
+        );
+    }
+
+    /// Lines the store refused make the conversation `Interrupted`, not
+    /// `Completed`: the transcript on disk is shorter than the one the user
+    /// read, and an export from a row marked complete would look authoritative.
+    #[test]
+    fn refused_writes_leave_the_conversation_interrupted() {
+        let (_dir, store) = temp_store();
+        let id = lock(&store)
+            .create_conversation(&NewConversation {
+                title: "Partly saved".into(),
+                group: None,
+                started_at: 1_700_000_000_000,
+                source: AudioSource::named(SourceKind::SinkMonitor, "sink.monitor", "A sink"),
+                mic_track: false,
+                engine: engine_info(),
+                voxtype_meeting_id: None,
+            })
+            .expect("conversation");
+
+        let session = finished_session(&store, id, 2);
+        let events = session.events.clone();
+        session.stop(1_700_000_060_000).expect("stop");
+
+        let conversation = lock(&store).get_conversation(id).expect("conversation");
+        assert_eq!(conversation.status, ConversationStatus::Interrupted);
+
+        let seen: Vec<SessionEvent> = events.try_iter().collect();
+        let told = seen.iter().any(|event| {
+            matches!(event, SessionEvent::Failed { stage: "store", message } if message.contains('2'))
+        });
+        assert!(
+            told,
+            "the user has to be told how many lines went missing: {seen:?}"
         );
     }
 

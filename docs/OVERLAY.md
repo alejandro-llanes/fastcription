@@ -1,18 +1,36 @@
-# The caption overlay on Wayland
+# Compact mode: captions over a meeting window
 
-ARCHITECTURE.md decision D3 gives fastcription a second, undecorated,
-always-on-top window (`crates/fastcription/src/app/overlay.rs`) that shows the
-last few committed lines in a large font, independent of the main window.
+ARCHITECTURE.md decision D3 asks for captions that stay visible over a
+fullscreened meeting window. fastcription provides them as **compact mode**: the
+main window shrinks to a caption strip, drops its decorations, asks to be
+always on top, and renames itself to `fastcription — captions`. `Ctrl+Shift+C`
+toggles it, the top bar has a **Compact** button, and `Esc` or the strip's own
+**Restore** button bring the full window back.
 
-winit has no layer-shell backend: on Wayland, `with_always_on_top()` is a
-`xdg_toplevel` hint (`set_always_on_top`-equivalent state) the compositor is
-free to ignore, not a protocol guarantee the way `zwlr_layer_shell_v1` would
-be. On this machine (Hyprland/Omarchy) that means the overlay needs a window
-rule to actually float above a fullscreened meeting window; without one, a
-focused call can still cover it.
+> **Why not a second window.** This was built first as a second, undecorated,
+> always-on-top egui window — a *deferred viewport*. It never worked. The app's
+> repaint requests target the root viewport, so the captions froze after their
+> first frame; the sync only ran when a sentence was committed, so even
+> repainting it would have been a whole sentence behind; and a deferred viewport
+> is a child of the root, so hiding the main window to the tray destroyed it.
+> One window that changes shape has none of those problems.
+>
+> **The trade.** Compact mode *is* the main window. Hiding fastcription to the
+> tray hides the captions with it, by design — there is one window, and the tray
+> is how you put it away. Stop compact mode before hiding, or leave the window
+> up.
 
-The overlay sets its own Wayland `app_id`, `fastcription-overlay`, distinct
-from the main window's, specifically so a compositor rule can target it alone.
+winit has no layer-shell backend: on Wayland, "always on top" is an
+`xdg_toplevel` hint the compositor is free to ignore, not a protocol guarantee
+the way `zwlr_layer_shell_v1` would be. On this machine (Hyprland/Omarchy) that
+means compact mode needs a window rule to actually float above a fullscreened
+meeting window; without one, a focused call can still cover it.
+
+The rule matches on the **window title**, `fastcription — captions`, because
+that is what changes when compact mode is entered and reverts when it is left —
+the `app_id` stays `fastcription` for both shapes, so a rule on the app id
+would also apply to the full window. The em dash in the title is U+2014, with
+an ordinary space on each side.
 
 ## Hyprland
 
@@ -20,35 +38,36 @@ Add to `~/.config/hypr/hyprland.conf` (or a file it `source`s, as Omarchy's
 `~/.config/hypr/windowrules.conf`):
 
 ```
-windowrulev2 = float, class:^(fastcription-overlay)$
-windowrulev2 = pin, class:^(fastcription-overlay)$
-windowrulev2 = noborder, class:^(fastcription-overlay)$
-windowrulev2 = noshadow, class:^(fastcription-overlay)$
-windowrulev2 = stayfocused, class:^(fastcription-overlay)$, negative:true
+windowrulev2 = float, title:^(fastcription — captions)$
+windowrulev2 = pin, title:^(fastcription — captions)$
+windowrulev2 = noborder, title:^(fastcription — captions)$
+windowrulev2 = noshadow, title:^(fastcription — captions)$
+windowrulev2 = stayfocused, title:^(fastcription — captions)$, negative:true
 ```
 
-- `float` takes it out of tiling, so it keeps the size and position the app
-  requests.
+- `float` takes it out of tiling, so it keeps the size the app requests.
 - `pin` keeps it visible on every workspace, including over a fullscreened
-  window — this is what `with_always_on_top()` cannot get on its own.
-- `noborder`/`noshadow` match the overlay's own undecorated styling.
-- The `stayfocused ... negative:true` rule stops Hyprland from ever handing
-  the overlay keyboard focus, so a meeting app underneath keeps its own focus
-  while the overlay floats on top of it.
+  window — this is what the always-on-top hint cannot get on its own.
+- `noborder`/`noshadow` match compact mode's own undecorated styling.
+- The `stayfocused ... negative:true` rule stops Hyprland from ever handing the
+  captions keyboard focus, so a meeting app underneath keeps its own focus while
+  the captions float on top of it. Note the consequence: with focus never
+  arriving, `Esc` cannot reach fastcription, which is why compact mode draws its
+  own **Restore** button.
 
 Reload with `hyprctl reload`, or restart Hyprland.
 
 ## sway / river
 
-Neither has `pin`; the equivalent is marking the window for every workspace
-and keeping it floating:
+Neither has `pin`; the equivalent is marking the window for every workspace and
+keeping it floating.
 
-**sway** (`~/.config/sway/config`):
+**sway** (`~/.config/sway/config`) — sway matches titles with `title="…"`:
 
 ```
-for_window [app_id="fastcription-overlay"] floating enable
-for_window [app_id="fastcription-overlay"] sticky enable
-for_window [app_id="fastcription-overlay"] border none
+for_window [title="^fastcription — captions$"] floating enable
+for_window [title="^fastcription — captions$"] sticky enable
+for_window [title="^fastcription — captions$"] border none
 ```
 
 `sticky` is sway's per-output "show on every workspace of this output"
@@ -57,21 +76,22 @@ equivalent to Hyprland's `pin`; it does not cross outputs, and like Hyprland's
 Hyprland, leaves "always on top" as a hint a client makes, not a rule a
 compositor enforces, so a fullscreened meeting can still cover it.
 
-**river** has no declarative window-rule config file; the equivalent goes
-through `riverctl` in whatever script launches the session, floating and
-tagging the window so a layout never tiles it:
+**river** has no declarative window-rule config file, and its `rule-add` matches
+on app id and title:
 
 ```sh
-riverctl rule-add -app-id fastcription-overlay float
+riverctl rule-add -title 'fastcription — captions' float
 ```
 
-river has no sticky/pin equivalent at all: an overlay stays only on the tags
-it was mapped with. Put it on every tag the user actually uses, or accept that
-switching tags hides it.
+river has no sticky/pin equivalent at all: a window stays only on the tags it
+was mapped with. Since compact mode is the same window as the full one, it keeps
+whatever tags fastcription was opened on — which in practice is the tag the user
+is working on anyway.
 
 ## Fallback
 
-If no rule is installed, the overlay still opens as a normal floating,
-undecorated window — not pinned above a fullscreened call, but otherwise
-usable (moved and resized like any window, visible on its own workspace).
-Nothing in `overlay.rs` depends on the rule existing.
+With no rule installed, compact mode still works: a small, undecorated,
+floating window showing the captions, which most compositors will honour the
+always-on-top hint for against ordinary windows and will not against a
+fullscreened one. Nothing in the app depends on the rule existing — the rule
+only buys the fullscreen case.

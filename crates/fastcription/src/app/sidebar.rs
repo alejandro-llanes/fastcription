@@ -39,11 +39,20 @@ pub struct State {
     pub matches: Option<HashMap<ConversationId, String>>,
     /// The query `matches` was computed for, so a repaint does not re-run it.
     pub searched_for: String,
+    /// When the query last changed, for the debounce: the search is an FTS
+    /// query plus a fetch per hit outside the loaded page, and running it on
+    /// every keystroke meant a query per character.
+    pub typed_at: Option<std::time::Instant>,
 }
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     ui.heading(t("Conversations"));
-    ui.add(egui::TextEdit::singleline(&mut app.sidebar.search).hint_text(t("Search…")));
+    if ui
+        .add(egui::TextEdit::singleline(&mut app.sidebar.search).hint_text(t("Search…")))
+        .changed()
+    {
+        app.sidebar.typed_at = Some(std::time::Instant::now());
+    }
     ui.add_space(6.0);
 
     ui.label(
@@ -66,8 +75,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             }
             chip.context_menu(|ui| {
                 if ui.button(t("Rename")).clicked() {
-                    app.sidebar.renaming =
-                        Some((Renaming::Group(group.id), group.name.clone()));
+                    app.sidebar.renaming = Some((Renaming::Group(group.id), group.name.clone()));
                     ui.close();
                 }
                 if ui.button(t("Delete group")).clicked() {
@@ -129,8 +137,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     .desired_width(130.0),
             );
             field.request_focus();
-            let committed =
-                field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let committed = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if ui.small_button(t("Save")).clicked() || committed {
                 finish = Some(true);
             }
@@ -163,7 +170,14 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         .show(ui, |ui| {
             let search = app.sidebar.search.to_lowercase();
             let mut shown = 0usize;
-            for conversation in app.conversations.clone() {
+            // The loaded page, plus whatever the search found beyond it.
+            let listed: Vec<fc_core::Conversation> = app
+                .conversations
+                .iter()
+                .chain(app.search_extra.iter())
+                .cloned()
+                .collect();
+            for conversation in listed {
                 if let Some(filter) = app.sidebar.group_filter {
                     if conversation.group != Some(filter) {
                         continue;
@@ -209,6 +223,16 @@ fn row(app: &mut App, ui: &mut egui::Ui, conversation: &fc_core::Conversation) {
         selected,
         format!("{}\n{}", conversation.title, conversation.source.label()),
     );
+    // The conversation being recorded is the one row that is still growing,
+    // and the one the store will refuse to delete.
+    if app.is_recording(conversation.id) {
+        ui.label(
+            RichText::new(t("recording"))
+                .small()
+                .strong()
+                .color(app.palette.danger),
+        );
+    }
     // The excerpt is why this row matched; without it a transcript hit looks
     // like an unexplained result.
     if let Some(excerpt) = app
@@ -232,12 +256,7 @@ fn row(app: &mut App, ui: &mut egui::Ui, conversation: &fc_core::Conversation) {
 /// A one-line name field that commits on Enter or on the button, and returns
 /// the trimmed name once. Returns `None` while there is nothing to create, so
 /// a stray repaint cannot create the same group twice.
-fn creator(
-    ui: &mut egui::Ui,
-    draft: &mut String,
-    hint: &str,
-    id_salt: &str,
-) -> Option<String> {
+fn creator(ui: &mut egui::Ui, draft: &mut String, hint: &str, id_salt: &str) -> Option<String> {
     let mut submitted = false;
     ui.horizontal(|ui| {
         let field = ui.add(

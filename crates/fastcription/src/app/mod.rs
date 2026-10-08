@@ -1,32 +1,47 @@
-//! App state, the `SessionEvent` channel, and the frame that ties the chrome
-//! together. Everything lives in one `App`: the real pipeline, when it
-//! exists, replaces `crate::demo` and nothing else here changes.
+//! App state and the types the views share.
+//!
+//! `App` owns everything: the running session, the library, and the per-pane
+//! transient state. The behaviour is split by concern into sibling modules —
+//! `chrome` draws the window, `session_control` runs a recording, `library`
+//! talks to the store — so this file stays a description of the state rather
+//! than of all of it at once.
 
+mod chrome;
 mod export_ui;
 mod history;
+mod library;
 mod live;
-mod overlay;
+mod session_control;
 mod settings;
 mod sidebar;
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::Receiver;
 use fastframe_theme::Palette as ThemePalette;
 
 use fc_core::{
-    AudioSource, Conversation, ConversationId, EngineInfo, Group, GroupId,
-    Pressure, Segment, SessionEvent, SessionState, Tag, TagId, Track,
+    AudioSource, Conversation, ConversationId, EngineInfo, Group, GroupId, Pressure, Segment,
+    SessionEvent, SessionState, Tag, TagId, Track,
 };
 
-use crate::session::{self, Session, SessionConfig, SharedStore};
+use crate::session::{self, Session, SharedStore};
 
 /// How many transcript matches one search returns. Enough to cover any
 /// realistic library without rendering a list nobody scrolls.
 const SEARCH_LIMIT: u32 = 500;
+
+/// How many notices are kept. Older ones are dropped: the list is for reading
+/// what just went wrong, not for auditing a long session.
+const MAX_NOTICES: usize = 50;
+
+/// How long an `Info` notice stays before it dismisses itself. Long enough to
+/// read "Exported to …", short enough not to sit over the transcript.
+const INFO_LIFETIME: Duration = Duration::from_secs(6);
 
 use crate::i18n::t;
 
@@ -55,11 +70,152 @@ pub enum LabelEdit {
     DeleteTag(TagId),
 }
 
-/// A dismissible error banner, raised by `SessionEvent::Failed` or
-/// `SourceLost`.
-struct Banner {
-    message: String,
+/// How loudly a notice asks to be read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeKind {
+    /// Something worked. Dismisses itself.
+    Info,
+    /// Something is degraded but the app carries on.
+    Warning,
+    /// Something the user has to act on. Stays until dismissed.
+    Error,
 }
+
+/// Identifies one notice for as long as it is in the list, so an event that
+/// undoes another's cause can take exactly that one away.
+pub type NoticeId = u64;
+
+pub struct Notice {
+    pub id: NoticeId,
+    pub at: Instant,
+    pub kind: NoticeKind,
+    pub text: String,
+    /// How many times in a row this same text arrived. A transcriber failing
+    /// every pass used to replace the banner once a second, which read as one
+    /// problem flickering rather than as the same problem fifty times.
+    pub count: u32,
+}
+
+/// The app's notice list: newest last, capped, with consecutive repeats
+/// collapsed.
+///
+/// This replaced a single `Option<Banner>`, which could only ever show the
+/// most recent problem — so a startup with no sound server *and* no voxtype
+/// reported one of the two, and the next event erased whichever had been
+/// shown. Successes went through the same slot and were painted in the danger
+/// colour, which made "Exported to ~/Downloads/…" look like a failure.
+#[derive(Default)]
+pub struct Notices {
+    items: VecDeque<Notice>,
+    next_id: NoticeId,
+}
+
+impl Notices {
+    /// Adds a notice, or counts a repeat of the newest one.
+    pub fn push(&mut self, kind: NoticeKind, text: String) -> NoticeId {
+        if let Some(last) = self.items.back_mut() {
+            if last.text == text && last.kind == kind {
+                last.count += 1;
+                last.at = Instant::now();
+                return last.id;
+            }
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.items.push_back(Notice {
+            id,
+            at: Instant::now(),
+            kind,
+            text,
+            count: 1,
+        });
+        while self.items.len() > MAX_NOTICES {
+            self.items.pop_front();
+        }
+        id
+    }
+
+    pub fn newest(&self) -> Option<&Notice> {
+        self.items.back()
+    }
+
+    /// Newest first, which is the order the expanded list reads in.
+    pub fn iter_newest_first(&self) -> impl Iterator<Item = &Notice> {
+        self.items.iter().rev()
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn remove(&mut self, id: NoticeId) {
+        self.items.retain(|notice| notice.id != id);
+    }
+
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
+
+    /// Drops `Info` notices older than [`INFO_LIFETIME`] and returns when the
+    /// next one expires, so the frame can ask for a repaint then instead of
+    /// leaving a stale notice up until something else happens to repaint.
+    pub fn expire(&mut self, now: Instant) -> Option<Duration> {
+        // `saturating_duration_since`, not `-`: subtracting `Instant`s panics
+        // on underflow, and a panic in a repaint is a lost meeting.
+        self.items.retain(|notice| {
+            notice.kind != NoticeKind::Info
+                || now.saturating_duration_since(notice.at) < INFO_LIFETIME
+        });
+        self.items
+            .iter()
+            .filter(|notice| notice.kind == NoticeKind::Info)
+            .map(|notice| INFO_LIFETIME.saturating_sub(now.saturating_duration_since(notice.at)))
+            .min()
+    }
+}
+
+/// Everything that should still be true the next time fastcription opens.
+///
+/// Deliberately small, and deliberately not the whole of `App`: a stale
+/// conversation list or a half-finished session restored from disk would be
+/// worse than nothing. The chosen source is stored as the descriptor it
+/// already is (`fc_core::AudioSource` is serialisable precisely so this can be
+/// resolved again) and re-resolved against the live list on the next launch.
+///
+/// `#[serde(default)]` so a blob written by an older build, missing a field
+/// this one has, still restores the fields it does carry.
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+pub struct Persisted {
+    pub settings: settings::State,
+    /// The source being transcribed. Re-resolved by identity at startup; left
+    /// unselected, with a notice, when it is gone.
+    pub source: Option<AudioSource>,
+    pub mic_source: Option<AudioSource>,
+    pub mic_track: bool,
+}
+
+/// The write side of [`Persisted`], borrowing rather than cloning.
+///
+/// Two types rather than one because `settings::State` owns the channel of a
+/// connection test in flight, which cannot be cloned — and giving it a `Clone`
+/// that silently dropped a running test would be a trap. The field names and
+/// order match `Persisted`, which is what RON needs to read it back.
+#[derive(serde::Serialize)]
+struct Saving<'a> {
+    settings: &'a settings::State,
+    source: Option<&'a AudioSource>,
+    mic_source: Option<&'a AudioSource>,
+    mic_track: bool,
+}
+
+/// The egui storage key. Named rather than defaulted so a future second blob
+/// cannot silently collide with this one.
+const PERSISTED_KEY: &str = "fastcription";
 
 pub struct App {
     // Chrome: fastframe wiring that needs to run again on every reopened
@@ -77,6 +233,10 @@ pub struct App {
     tray: Option<fastframe_tray::Tray>,
     wants_show: bool,
     quit_requested: bool,
+    /// Set by the single-instance handler when a second launch asks for the
+    /// window. Shared with that handler's thread, which has no way to reach
+    /// `App` directly.
+    show_requested: Arc<AtomicBool>,
 
     // The pipeline. `App` only ever drains `SessionEvent`s off `events` and
     // calls pause/resume/stop on `session`; it knows nothing about capture or
@@ -84,11 +244,23 @@ pub struct App {
     // held separately so the tail of a finishing session still arrives after
     // `Session` itself has been consumed by `stop_async`.
     store: Option<SharedStore>,
+    /// Where the library is and whether it will take writes, for the messages
+    /// that have to name it.
+    library_path: PathBuf,
+    library_read_only: bool,
     captures: session::CaptureFactory,
     voxtype: Option<PathBuf>,
     engine: EngineInfo,
     session: Option<Session>,
     events: Option<Receiver<SessionEvent>>,
+    /// The conversation being recorded, kept after `Session` is consumed by
+    /// `stop_async` so the sidebar can mark it and the cached transcript can
+    /// be invalidated when it closes.
+    recording: Option<ConversationId>,
+    /// This session's voxtype config, removed when the session ends.
+    session_config: Option<PathBuf>,
+    /// The startup probes, still running on their own thread.
+    startup: Option<Receiver<crate::env::Startup>>,
 
     // Live session state
     state: SessionState,
@@ -102,18 +274,34 @@ pub struct App {
     /// `sources`/`selected_source`, which is the source being transcribed.
     mic_source: AudioSource,
     sources: Vec<AudioSource>,
-    selected_source: usize,
+    /// `None` means nothing is selected — a real state, not a placeholder:
+    /// falling back to the first entry is how an app records the wrong stream.
+    selected_source: Option<usize>,
+    /// A restored choice waiting for the source list to arrive from the
+    /// startup probe.
+    pending_source: Option<AudioSource>,
     /// What voxtype reports it can do; empty when `voxtype info` failed.
     engines: Vec<String>,
     models: Vec<String>,
-    banner: Option<Banner>,
+    notices: Notices,
+    notices_expanded: bool,
+    /// The notice raised by `SourceLost`, so `SourceRecovered` can retract
+    /// that one instead of everything the user has not read yet.
+    capture_notice: Option<NoticeId>,
     segments: Vec<Segment>,
     provisional: HashMap<Track, Segment>,
-    overlay: overlay::Shared,
-    overlay_open: bool,
+
+    /// Captions only, on an always-on-top window: the mode for watching a
+    /// meeting with the transcript over it.
+    compact: bool,
+    /// The window size to go back to when compact mode is left.
+    restore_size: Option<egui::Vec2>,
 
     // Library, read from `fc-store` at startup and after any change.
     conversations: Vec<Conversation>,
+    /// Conversations a search found outside the loaded page, listed alongside
+    /// it until the search is cleared.
+    search_extra: Vec<Conversation>,
     groups: Vec<Group>,
     tags: Vec<Tag>,
     conversation_tags: HashMap<ConversationId, Vec<TagId>>,
@@ -126,47 +314,66 @@ pub struct App {
     sidebar: sidebar::State,
     settings: settings::State,
     export: export_ui::State,
+    /// The import running on its own thread, and how many meetings it has
+    /// added so far.
+    import: Option<library::Running>,
 
     voxtype_service: ServiceStatus,
     service_monitor: crate::env::ServiceMonitor,
 }
 
 impl App {
-    pub fn new(shell_waker: &fastframe_shell::Waker) -> Self {
+    /// Builds the app without touching the sound server or the voxtype binary:
+    /// the window opens on defaults and [`crate::env::probe_startup`] fills
+    /// them in a moment later. Waiting for those subprocesses here cost about
+    /// half a second of blank screen at every launch.
+    pub fn new(shell_waker: &fastframe_shell::Waker, show_requested: Arc<AtomicBool>) -> Self {
         let store = crate::env::open_store();
-        let sources = crate::env::list_sources();
         let voxtype = fc_voxtype::cli::find_binary();
-        let engine = crate::env::probe_engine(voxtype.as_ref());
-        let catalog = crate::env::probe_catalog();
+        // A config left behind by a process that did not exit cleanly may hold
+        // an API key, so it goes before anything else happens.
+        crate::env::clear_stale_session_configs();
         let defaults = crate::env::voxtype_defaults();
         // Seeded from voxtype's own configuration, so the settings pane opens
         // showing what voxtype would do unprompted rather than a guess.
+        let blank = settings::State::default();
         let settings = settings::State {
-            engine: defaults
-                .engine
-                .unwrap_or_else(|| engine.engine.clone()),
-            model: defaults.model.unwrap_or_else(|| engine.model.clone()),
-            language: defaults
-                .language
-                .unwrap_or_else(|| engine.language.clone()),
+            engine: defaults.engine.unwrap_or(blank.engine),
+            model: defaults.model.unwrap_or(blank.model),
+            language: defaults.language.unwrap_or(blank.language),
             ..settings::State::default()
         };
         let library = store
-            .value
+            .store
             .as_ref()
-            .map(crate::env::load_library)
+            .map(|store| crate::env::load_library(store, None))
             .unwrap_or_else(|| crate::env::Probe {
                 value: crate::env::Library::default(),
                 problem: None,
             });
         if voxtype.is_none() {
-            tracing::warn!("voxtype was not found on PATH; recording will fail until it is installed");
+            tracing::warn!(
+                "voxtype was not found on PATH; recording will fail until it is installed"
+            );
         }
-        let banner = [store.problem, sources.problem, library.problem]
-            .into_iter()
-            .flatten()
-            .next()
-            .map(|message| Banner { message });
+
+        // Every startup problem, not the first one: a machine with no sound
+        // server and no voxtype has two things wrong with it, and reporting
+        // one of them left the user fixing the wrong thing.
+        let mut notices = Notices::default();
+        for problem in [store.problem, library.problem].into_iter().flatten() {
+            notices.push(NoticeKind::Error, problem);
+        }
+        if voxtype.is_none() {
+            notices.push(
+                NoticeKind::Error,
+                t(
+                    "voxtype was not found on PATH, so nothing can be transcribed. \
+                   Install it and run `voxtype setup --download` to fetch a model.",
+                )
+                .to_owned(),
+            );
+        }
 
         let themes_dir = dirs::config_dir()
             .unwrap_or_else(std::env::temp_dir)
@@ -186,7 +393,7 @@ impl App {
                 fastframe_tray::Config {
                     id: "fastcription",
                     title: "fastcription".to_owned(),
-                    icon: tray_icon_rgba,
+                    icon: chrome::tray_icon_rgba,
                     template_icon: None,
                     themed_icon: false,
                     menu_on_click: false,
@@ -210,12 +417,23 @@ impl App {
             tray,
             wants_show: false,
             quit_requested: false,
-            store: store.value,
+            show_requested,
+            store: store.store,
+            library_path: store.path,
+            library_read_only: store.read_only,
             captures: session::parec_captures(),
+            startup: Some(crate::env::probe_startup(voxtype.clone(), shell_waker)),
             voxtype,
-            engine,
+            engine: EngineInfo {
+                engine: settings.engine.clone(),
+                model: settings.model.clone(),
+                language: settings.language.clone(),
+                backend: None,
+            },
             session: None,
             events: None,
+            recording: None,
+            session_config: None,
             state: SessionState::Idle,
             session_start: None,
             accumulated: Duration::ZERO,
@@ -224,16 +442,20 @@ impl App {
             level_rms: 0.0,
             mic_track: false,
             mic_source: crate::env::default_microphone(),
-            sources: sources.value,
-            selected_source: 0,
-            engines: catalog.engines,
-            models: catalog.models,
-            banner,
+            sources: Vec::new(),
+            selected_source: None,
+            pending_source: None,
+            engines: Vec::new(),
+            models: Vec::new(),
+            notices,
+            notices_expanded: false,
+            capture_notice: None,
             segments: Vec::new(),
             provisional: HashMap::new(),
-            overlay: Arc::new(Mutex::new(overlay::State::default())),
-            overlay_open: false,
+            compact: false,
+            restore_size: None,
             conversations: library.value.conversations,
+            search_extra: Vec::new(),
             groups: library.value.groups,
             tags: library.value.tags,
             conversation_tags: library.value.conversation_tags,
@@ -243,1131 +465,76 @@ impl App {
             sidebar: sidebar::State::default(),
             settings,
             export: export_ui::State::default(),
-            voxtype_service: crate::env::service_status(),
+            import: None,
+            voxtype_service: ServiceStatus::Unknown,
             service_monitor: crate::env::ServiceMonitor::spawn(),
         }
     }
 
-    /// Re-applies everything tied to an `egui::Context`: fonts, text
-    /// rendering, icons, and the current palette. Called once per window —
-    /// including every reopen from the tray, since each gets its own context.
-    pub fn attach(&mut self, ctx: &egui::Context) {
-        let mut fonts = fastframe_fonts::FontSetup::default().definitions();
-        self.text_rendering.apply_to(&mut fonts);
-        ctx.set_fonts(fonts);
-        ctx.all_styles_mut(|style| self.text_rendering.apply_to_visuals(&mut style.visuals));
-
-        egui_extras::install_image_loaders(ctx);
-        fastframe_icons::install::<crate::icons::Icon>(ctx);
-
-        self.theme_waker = fastframe_theme::Waker::new({
-            let ctx = ctx.clone();
-            move || ctx.request_repaint()
-        });
-        self.theme_catalog
-            .start(self.themes_dir.clone(), None, &self.theme_waker);
-
-        self.palette.apply(ctx);
+    /// What survives a restart. Called by eframe on exit and every half
+    /// minute; the [`Persisted`] shape is what the next launch reads.
+    pub fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let saving = Saving {
+            settings: &self.settings,
+            // The live choice, or the one still waiting for the source list:
+            // quitting before the startup probe lands must not forget it.
+            source: self
+                .selected_source
+                .and_then(|index| self.sources.get(index))
+                .or(self.pending_source.as_ref()),
+            mic_source: Some(&self.mic_source),
+            mic_track: self.mic_track,
+        };
+        eframe::set_value(storage, PERSISTED_KEY, &saving);
     }
 
-    /// The whole window's content for one pass. `ui` is the viewport's root
-    /// `Ui` (see this eframe fork's `App::ui`, not the usual `update`).
-    pub fn frame(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.scrolling.apply(ui.ctx());
-        self.drain_events(ui.ctx());
-        if let Some(status) = self.service_monitor.poll() {
-            self.voxtype_service = status;
-        }
-        self.update_search();
-        self.poll_theme(ui.ctx());
-        self.drain_tray(ui.ctx(), false);
-        if self.quit_requested {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-        self.delete_confirmation(ui.ctx());
-
-        egui::Panel::top("top-bar").show(ui, |ui| self.top_bar(ui));
-
-        if let Some(message) = self.banner.as_ref().map(|banner| banner.message.clone()) {
-            let dismiss = egui::Panel::top("banner")
-                .show(ui, |ui| {
-                    let mut dismiss = false;
-                    ui.horizontal(|ui| {
-                        ui.colored_label(self.palette.danger, &message);
-                        if ui.small_button(t("Dismiss")).clicked() {
-                            dismiss = true;
-                        }
-                    });
-                    dismiss
-                })
-                .inner;
-            if dismiss {
-                self.banner = None;
-            }
-        }
-
-        egui::Panel::left("sidebar")
-            .resizable(true)
-            .default_size(260.0)
-            .size_range(200.0..=420.0)
-            .show(ui, |ui| sidebar::show(self, ui));
-
-        egui::CentralPanel::default().show(ui, |ui| match self.main_view {
-            MainView::Live => live::show(self, ui),
-            MainView::History(id) => history::show(self, ui, id),
-            MainView::Settings => settings::show(self, ui),
-        });
-
-        if self.overlay_open {
-            overlay::show(ui.ctx(), &self.overlay);
-        }
-    }
-
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if ui
-                .selectable_label(self.main_view == MainView::Live, t("Live"))
-                .clicked()
-            {
-                self.main_view = MainView::Live;
-            }
-            ui.separator();
-
-            source_combo(self, ui, "top-bar-source");
-
-            ui.separator();
-            ui.add(crate::icons::Icon::Mic.image(self.palette.secondary, 14.0));
-            ui.add(
-                egui::ProgressBar::new(self.level_peak.clamp(0.0, 1.0))
-                    .desired_width(90.0)
-                    .show_percentage(),
-            );
-
-            ui.separator();
-            let can_start = matches!(self.state, SessionState::Idle | SessionState::Paused);
-            let start_label = if self.state == SessionState::Paused {
-                t("Resume")
-            } else {
-                t("Start")
-            };
-            if ui
-                .add_enabled(can_start, egui::Button::new(start_label))
-                .clicked()
-            {
-                self.start_or_resume();
-            }
-            if ui
-                .add_enabled(
-                    self.state == SessionState::Recording,
-                    egui::Button::new(t("Pause")),
-                )
-                .clicked()
-            {
-                self.pause();
-            }
-            if ui
-                .add_enabled(
-                    matches!(self.state, SessionState::Recording | SessionState::Paused),
-                    egui::Button::new(t("Stop")),
-                )
-                .clicked()
-            {
-                self.stop();
-            }
-
-            ui.separator();
-            ui.label(format_elapsed(self.elapsed()));
-
-            ui.separator();
-            ui.checkbox(&mut self.mic_track, t("Mic"));
-
-            ui.separator();
-            service_pill(ui, self.voxtype_service);
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .selectable_label(self.main_view == MainView::Settings, t("Settings"))
-                    .clicked()
-                {
-                    self.main_view = MainView::Settings;
-                }
-                if ui
-                    .selectable_label(self.overlay_open, t("Overlay"))
-                    .clicked()
-                {
-                    self.overlay_open = !self.overlay_open;
-                }
-            });
-        });
-    }
-
-    fn set_state(&mut self, new: SessionState) {
-        match (self.state, new) {
-            (SessionState::Idle, SessionState::Recording)
-            | (SessionState::Paused, SessionState::Recording) => {
-                self.session_start = Some(Instant::now());
-            }
-            (SessionState::Recording, SessionState::Paused) => {
-                if let Some(start) = self.session_start.take() {
-                    self.accumulated += start.elapsed();
-                }
-            }
-            (SessionState::Finishing, SessionState::Idle) => {
-                self.session_start = None;
-                self.accumulated = Duration::ZERO;
-                self.level_peak = 0.0;
-                self.level_rms = 0.0;
-                self.provisional.clear();
-                self.state = new;
-                // The conversation row is closed by now, so the sidebar can
-                // show it with its real duration and segment count.
-                self.reload_library();
-                return;
-            }
-            (_, SessionState::Idle) => {
-                self.session_start = None;
-                self.accumulated = Duration::ZERO;
-                self.level_peak = 0.0;
-                self.level_rms = 0.0;
-                self.provisional.clear();
-            }
-            _ => {}
-        }
-        self.state = new;
-    }
-
-    /// Starts a new conversation, or resumes the paused one.
-    fn start_or_resume(&mut self) {
-        if let Some(session) = &self.session {
-            session.resume();
-            return;
-        }
-
-        let Some(store) = self.store.clone() else {
-            self.raise("Recording is disabled because the conversation library could not be opened.");
+    /// Reads back what [`App::save`] wrote. Runs once, in the first window's
+    /// creator: a window reopened from the tray must not have its live state
+    /// replaced by whatever was last written to disk.
+    pub fn restore(&mut self, storage: &dyn eframe::Storage) {
+        let Some(persisted) = eframe::get_value::<Persisted>(storage, PERSISTED_KEY) else {
             return;
         };
-        let Some(chosen) = self.sources.get(self.selected_source).cloned() else {
-            self.raise("Choose an audio source first.");
-            return;
-        };
-        // Refused up front rather than per chunk: without voxtype the session
-        // would record happily and fail every transcription, which looks like
-        // the app is working when nothing is being understood.
-        if self.voxtype.is_none() {
-            self.raise(
-                "voxtype was not found on PATH. Install it and run `voxtype setup --download`                  to fetch a model.",
-            );
-            return;
+        self.settings = persisted.settings;
+        self.mic_track = persisted.mic_track;
+        if let Some(mic) = persisted.mic_source {
+            self.mic_source = mic;
         }
-        if self.settings.model.trim().is_empty() && self.models.is_empty() {
-            self.raise(
-                "No transcription model is installed. Run `voxtype setup model` to download one.",
-            );
-            return;
-        }
-
-        // Re-resolved rather than trusted: a sink-input index goes stale when
-        // the application that owned it restarts, and recording the wrong
-        // stream is worse than refusing.
-        let source = match fc_audio::resolve(&chosen) {
-            Ok(source) => source,
-            Err(err) => {
-                self.raise(format!("{} is not available: {err}", chosen.label()));
-                return;
-            }
-        };
-
-        // Written per session so the engine always runs with what the settings
-        // pane currently says, including the optimisation realtime depends on.
-        let voxtype_config = match crate::env::write_private_config(&self.engine_settings()) {
-            Ok(path) => Some(path),
-            Err(err) => {
-                self.raise(format!(
-                    "Could not write fastcription's voxtype settings, so transcription \
-                     would be too slow to follow live: {err}"
-                ));
-                return;
-            }
-        };
-
-        let config = SessionConfig {
-            title: default_title(),
-            group: None,
-            source,
-            mic_source: self.mic_track.then(|| self.mic_source.clone()),
-            stream: self.stream_config(),
-            engine: self.chosen_engine(),
-        };
-
-        match Session::start(
-            store,
-            config,
-            self.transcriber_factory(voxtype_config),
-            &self.captures,
-            now_millis(),
-        ) {
-            Ok(session) => {
-                self.segments.clear();
-                self.provisional.clear();
-                overlay::sync(&self.overlay, &self.segments);
-                self.banner = None;
-                self.events = Some(session.events.clone());
-                self.session = Some(session);
-                self.set_state(SessionState::Recording);
-            }
-            Err(err) => self.raise(format!("Could not start recording: {err}")),
-        }
+        // Held rather than applied: the live source list has not arrived yet,
+        // and an index into a list that does not exist is meaningless.
+        self.pending_source = persisted.source;
     }
 
-    fn pause(&mut self) {
-        if let Some(session) = &self.session {
-            session.pause();
-        }
+    /// Tells the user something. Everything the user is told goes through here.
+    fn notify(&mut self, kind: NoticeKind, text: impl Into<String>) {
+        self.notify_id(kind, text);
     }
 
-    /// Hands the session off to finish on its own thread. `Finishing` shows
-    /// immediately; the session reports `Idle` once the backlog is transcribed
-    /// and the conversation is closed, and the library is reloaded then.
-    fn stop(&mut self) {
-        if let Some(session) = self.session.take() {
-            self.set_state(SessionState::Finishing);
-            session.stop_async(now_millis());
+    /// As [`App::notify`], returning the notice's id for the one caller that
+    /// needs to retract exactly what it raised (`SourceLost`/`SourceRecovered`).
+    fn notify_id(&mut self, kind: NoticeKind, text: impl Into<String>) -> NoticeId {
+        let text = text.into();
+        match kind {
+            NoticeKind::Info => tracing::info!(%text, "notice"),
+            NoticeKind::Warning => tracing::warn!(%text, "notice"),
+            NoticeKind::Error => tracing::error!(%text, "notice"),
         }
+        self.notices.push(kind, text)
     }
 
-    /// What the conversation will be transcribed with, as the settings pane
-    /// currently has it. Recorded with the conversation so an old transcript
-    /// can be read in the light of how it was made.
-    fn chosen_engine(&self) -> EngineInfo {
-        EngineInfo {
-            engine: self.settings.engine.clone(),
-            model: self.settings.model.clone(),
-            language: self.settings.language.clone(),
-            backend: self.engine.backend.clone(),
-        }
+    /// Takes the window-raise request left by a second launch.
+    fn take_show_request(&mut self) -> bool {
+        self.show_requested.swap(false, Ordering::SeqCst)
     }
-
-    /// Builds the per-track transcriber.
-    ///
-    /// Everything voxtype needs is in fastcription's own config file, so the
-    /// only argument is `-c`. Decision D6 still holds: the user's
-    /// `config.toml` is read for defaults and never written. Keeping one
-    /// source of truth matters here, because splitting model and language
-    /// across command-line flags while the optimisation realtime depends on
-    /// lives in a file is how the two drift apart.
-    fn transcriber_factory(&self, config: Option<PathBuf>) -> session::TranscriberFactory {
-        let binary = self.voxtype.clone();
-        let engine = self.settings.engine.clone();
-        // Passed explicitly even though the config file also carries it: the
-        // adapter supplies a thread count of its own by default, and a command
-        // line that disagrees with the config would silently win.
-        let threads = self.settings.threads.max(1);
-        Box::new(move |_track| {
-            let mut cli = fc_asr::VoxtypeCli::new().with_threads(threads);
-            if let Some(path) = &binary {
-                cli = cli.with_binary(path.display().to_string());
-            }
-            if let Some(path) = &config {
-                cli = cli.with_config(path.clone());
-            }
-            // The engine is the one knob with no equivalent in the config file
-            // fastcription writes, which only configures whisper.
-            if !engine.trim().is_empty() {
-                cli = cli.with_engine(engine.clone());
-            }
-            Box::new(cli)
-        })
-    }
-
-    /// Capture devices offered as the microphone for the second track.
-    fn microphones(&self) -> Vec<AudioSource> {
-        crate::env::microphones(&self.sources)
-    }
-
-    /// How the stream is tuned, from the settings pane.
-    fn stream_config(&self) -> fc_asr::StreamConfig {
-        fc_asr::StreamConfig {
-            step: Duration::from_secs_f32(self.settings.refresh_secs.clamp(0.3, 5.0)),
-            max_utterance: Duration::from_secs_f32(
-                self.settings.max_utterance_secs.clamp(4.0, 22.0),
-            ),
-            ..Default::default()
-        }
-    }
-
-    /// Writes an edited conversation back to the library.
-    ///
-    /// The history pane edits its own copy and hands it back; this is where
-    /// that copy becomes durable. A failure raises a banner rather than being
-    /// swallowed, because silently losing a rename is the kind of bug users
-    /// cannot diagnose.
-    fn persist_conversation(&mut self, conversation: &Conversation) {
-        let Some(store) = self.store.clone() else {
-            return;
-        };
-        let guard = match store.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Err(err) = guard.rename_conversation(conversation.id, &conversation.title) {
-            drop(guard);
-            self.raise(format!("Could not rename the conversation: {err}"));
-            return;
-        }
-        if let Err(err) = guard.set_group(conversation.id, conversation.group) {
-            drop(guard);
-            self.raise(format!("Could not change the group: {err}"));
-        }
-    }
-
-    /// Applies a tag change for one conversation.
-    fn persist_tags(&mut self, id: ConversationId, tags: &[TagId]) {
-        let Some(store) = self.store.clone() else {
-            return;
-        };
-        let existing: Vec<TagId> = self
-            .conversation_tags
-            .get(&id)
-            .cloned()
-            .unwrap_or_default();
-        let guard = match store.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let mut failure = None;
-        for added in tags.iter().filter(|t| !existing.contains(t)) {
-            if let Err(err) = guard.add_tag(id, *added) {
-                failure = Some(err.to_string());
-            }
-        }
-        for removed in existing.iter().filter(|t| !tags.contains(t)) {
-            if let Err(err) = guard.remove_tag(id, *removed) {
-                failure = Some(err.to_string());
-            }
-        }
-        drop(guard);
-        if let Some(message) = failure {
-            self.raise(format!("Could not update tags: {message}"));
-        }
-    }
-
-    /// Writes a transcript to a file next to the user's other downloads.
-    ///
-    /// There is no file dialog: pulling in a portal dependency for this is not
-    /// worth it yet, so the path is chosen here and reported back so the user
-    /// knows exactly where it went.
-    /// Where a transcript is suggested to go: the user's downloads directory,
-    /// named after the conversation.
-    fn default_export_path(
-        &self,
-        conversation: &Conversation,
-        format: fc_export::ExportFormat,
-    ) -> PathBuf {
-        let dir = dirs::download_dir()
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(std::env::temp_dir);
-        dir.join(format!(
-            "{}.{}",
-            sanitise_filename(&conversation.title),
-            format.extension()
-        ))
-    }
-
-    fn export_conversation(
-        &mut self,
-        conversation: &Conversation,
-        format: fc_export::ExportFormat,
-        options: fc_export::ExportOptions,
-        destination: &Path,
-    ) {
-        let segments = self.segments_for(conversation.id).to_vec();
-        if segments.is_empty() {
-            self.raise("That conversation has no transcript to export.");
-            return;
-        }
-        if destination.as_os_str().is_empty() {
-            self.raise("Choose where to save the transcript.");
-            return;
-        }
-
-        if let Some(parent) = destination.parent() {
-            if !parent.as_os_str().is_empty() {
-                if let Err(err) = std::fs::create_dir_all(parent) {
-                    self.raise(format!("Could not create {}: {err}", parent.display()));
-                    return;
-                }
-            }
-        }
-
-        let rendered = fc_export::export(conversation, &segments, format, &options);
-        match std::fs::write(destination, rendered) {
-            Ok(()) => self.raise(format!("Exported to {}", destination.display())),
-            Err(err) => self.raise(format!(
-                "Could not write {}: {err}",
-                destination.display()
-            )),
-        }
-    }
-
-    /// Starts or stops the voxtype user service, then re-reads its real state
-    /// rather than assuming the action worked.
-    fn set_service_running(&mut self, running: bool) {
-        let outcome = if running {
-            fc_voxtype::service::start()
-        } else {
-            fc_voxtype::service::stop()
-        };
-        if let Err(err) = outcome {
-            let verb = if running { "start" } else { "stop" };
-            self.raise(format!("Could not {verb} voxtype.service: {err}"));
-        }
-        self.voxtype_service = crate::env::service_status();
-    }
-
-    /// Re-reads the capture sources, keeping the user's choice selected if it
-    /// is still there. An index into a list that has changed underneath is how
-    /// a picker crashes, so the selection is matched by identity and only
-    /// falls back to the first entry when the chosen source is really gone.
-    fn refresh_sources(&mut self) {
-        let chosen = self.sources.get(self.selected_source).cloned();
-        let probe = crate::env::list_sources();
-        if let Some(problem) = probe.problem {
-            self.raise(problem);
-        }
-        self.sources = probe.value;
-        self.selected_source = reselect(chosen.as_ref(), &self.sources);
-    }
-
-    /// Creates a group and reloads the library so it appears everywhere at
-    /// once: the sidebar filter and the history pane's assignment list.
-    fn create_group(&mut self, name: &str) {
-        let Some(store) = self.store.clone() else {
-            return;
-        };
-        let outcome = {
-            let guard = match store.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            guard.create_group(name, now_millis())
-        };
-        match outcome {
-            Ok(_) => self.reload_library(),
-            Err(err) => self.raise(format!("Could not create the group: {err}")),
-        }
-    }
-
-    /// Tag names are unique without regard to case in the store, so creating
-    /// one that already exists returns the existing tag rather than failing.
-    fn create_tag(&mut self, name: &str) {
-        let Some(store) = self.store.clone() else {
-            return;
-        };
-        let outcome = {
-            let guard = match store.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            guard.create_tag(name, None)
-        };
-        match outcome {
-            Ok(_) => self.reload_library(),
-            Err(err) => self.raise(format!("Could not create the tag: {err}")),
-        }
-    }
-
-    /// Runs the transcript search when the query changes.
-    ///
-    /// The sidebar's box searches two things: conversation titles, matched in
-    /// memory, and the words that were actually said, matched by SQLite's
-    /// full-text index. Finding a meeting by something said in it is the whole
-    /// point of keeping the transcripts.
-    fn update_search(&mut self) {
-        if self.sidebar.search == self.sidebar.searched_for {
-            return;
-        }
-        self.sidebar.searched_for = self.sidebar.search.clone();
-
-        let query = self.sidebar.search.trim().to_owned();
-        if query.is_empty() {
-            self.sidebar.matches = None;
-            return;
-        }
-        let Some(store) = self.store.clone() else {
-            self.sidebar.matches = None;
-            return;
-        };
-
-        let hits = {
-            let guard = match store.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            guard.search(&query, SEARCH_LIMIT)
-        };
-        match hits {
-            Ok(hits) => {
-                let mut by_conversation = HashMap::new();
-                for hit in hits {
-                    // The first hit in rank order is the best excerpt for that
-                    // conversation, so later ones do not overwrite it.
-                    by_conversation
-                        .entry(hit.conversation_id)
-                        .or_insert(hit.snippet);
-                }
-                self.sidebar.matches = Some(by_conversation);
-            }
-            Err(err) => {
-                self.sidebar.matches = Some(HashMap::new());
-                self.raise(format!("Search failed: {err}"));
-            }
-        }
-    }
-
-    /// Renames a group or a tag, or deletes one.
-    ///
-    /// Grouped under one method because each is a single statement plus a
-    /// library reload, and the reload is the part that must not be forgotten:
-    /// a renamed group that still shows its old name in the filter looks like
-    /// the rename failed.
-    fn edit_label(&mut self, edit: LabelEdit) {
-        let Some(store) = self.store.clone() else {
-            return;
-        };
-        let outcome = {
-            let guard = match store.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            match &edit {
-                LabelEdit::RenameGroup(id, name) => guard.rename_group(*id, name),
-                LabelEdit::DeleteGroup(id) => guard.delete_group(*id),
-                LabelEdit::RenameTag(id, name) => guard.rename_tag(*id, name),
-                LabelEdit::DeleteTag(id) => guard.delete_tag(*id),
-            }
-        };
-        match outcome {
-            Ok(()) => {
-                // A deleted group may be the one being filtered on, and a
-                // deleted tag may be in the tag filter; leaving either behind
-                // would filter the list down to nothing with no visible cause.
-                match edit {
-                    LabelEdit::DeleteGroup(id) => {
-                        if self.sidebar.group_filter == Some(id) {
-                            self.sidebar.group_filter = None;
-                        }
-                    }
-                    LabelEdit::DeleteTag(id) => {
-                        self.sidebar.tag_filter.remove(&id);
-                        for tags in self.conversation_tags.values_mut() {
-                            tags.retain(|tag| *tag != id);
-                        }
-                    }
-                    _ => {}
-                }
-                self.reload_library();
-            }
-            Err(err) => self.raise(format!("Could not apply that change: {err}")),
-        }
-    }
-
-    /// Deletes a conversation and its transcript. Confirmed in the UI first:
-    /// this is the one irreversible thing the app can do to a user's data.
-    fn delete_conversation(&mut self, id: ConversationId) {
-        let Some(store) = self.store.clone() else {
-            return;
-        };
-        let outcome = {
-            let guard = match store.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            guard.delete_conversation(id)
-        };
-        match outcome {
-            Ok(()) => {
-                self.history_segments.remove(&id);
-                if matches!(self.main_view, MainView::History(open) if open == id) {
-                    self.main_view = MainView::Live;
-                }
-                self.reload_library();
-            }
-            Err(err) => self.raise(format!("Could not delete the conversation: {err}")),
-        }
-    }
-
-    fn ask_to_delete(&mut self, id: ConversationId) {
-        self.pending_delete = Some(id);
-    }
-
-    /// The confirmation for the one irreversible action in the app. Shown as a
-    /// modal window rather than an inline button so a mis-click on a list that
-    /// has just reordered cannot destroy a transcript.
-    fn delete_confirmation(&mut self, ctx: &egui::Context) {
-        let Some(id) = self.pending_delete else {
-            return;
-        };
-        let title = self
-            .conversations
-            .iter()
-            .find(|c| c.id == id)
-            .map(|c| c.title.clone())
-            .unwrap_or_else(|| id.to_string());
-
-        let mut decision = None;
-        egui::Window::new(t("Delete conversation"))
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.label(format!("{} \u{201c}{title}\u{201d}?", t("Permanently delete")));
-                ui.label(
-                    egui::RichText::new(t("The transcript cannot be recovered."))
-                        .small()
-                        .color(self.palette.secondary),
-                );
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button(t("Delete")).clicked() {
-                        decision = Some(true);
-                    }
-                    if ui.button(t("Cancel")).clicked() {
-                        decision = Some(false);
-                    }
-                });
-            });
-
-        match decision {
-            Some(true) => {
-                self.pending_delete = None;
-                self.delete_conversation(id);
-            }
-            Some(false) => self.pending_delete = None,
-            None => {}
-        }
-    }
-
-    /// Imports past voxtype meetings into the library.
-    ///
-    /// Blocking: an import reads and re-exports each meeting through the
-    /// voxtype CLI, which is fast for a handful and is a deliberate,
-    /// user-initiated action rather than something happening in the
-    /// background. The result is reported as a banner.
-    fn import_voxtype_meetings(&mut self) {
-        let Some(store) = self.store.clone() else {
-            self.raise("Importing needs the conversation library, which could not be opened.");
-            return;
-        };
-        let Some(binary) = self.voxtype.clone() else {
-            self.raise("voxtype was not found, so there is nothing to import from.");
-            return;
-        };
-
-        match crate::env::import_meetings(&store, &binary) {
-            Ok(outcome) => {
-                self.reload_library();
-                let mut message = format!(
-                    "Imported {} meeting(s), skipped {}.",
-                    outcome.added, outcome.skipped
-                );
-                if !outcome.failed.is_empty() {
-                    message.push_str(&format!(
-                        " {} could not be imported: {}",
-                        outcome.failed.len(),
-                        outcome.failed.join("; ")
-                    ));
-                }
-                self.raise(message);
-            }
-            Err(err) => self.raise(err),
-        }
-    }
-
-    /// Where transcription should run, as the settings pane has it.
-    fn engine_settings(&self) -> crate::env::EngineSettings {
-        crate::env::EngineSettings {
-            model: self.settings.model.clone(),
-            language: self.settings.language.clone(),
-            threads: self.settings.threads.max(1),
-            fast_mode: self.settings.fast_mode,
-            remote: (self.settings.remote_enabled
-                && !self.settings.remote_endpoint.trim().is_empty())
-            .then(|| crate::env::RemoteEngine {
-                endpoint: self.settings.remote_endpoint.clone(),
-                model: self.settings.remote_model.clone(),
-                api_key: self.settings.remote_api_key.clone(),
-                timeout_secs: self.settings.remote_timeout_secs,
-            }),
-        }
-    }
-
-    /// Transcribes a moment of silence through the configured server, so a
-    /// wrong address or a missing key is found now rather than during a
-    /// meeting. Goes through voxtype rather than a bare HTTP request, so it
-    /// exercises the real path: the endpoint, the multipart body and the token.
-    fn probe_transcription_server(&mut self) {
-        self.settings.remote_probe = Some(self.probe_server_inner());
-    }
-
-    fn probe_server_inner(&self) -> Result<String, String> {
-        let Some(binary) = self.voxtype.clone() else {
-            return Err("voxtype was not found on PATH".to_owned());
-        };
-        if self.settings.remote_endpoint.trim().is_empty() {
-            return Err("Enter the server's address first".to_owned());
-        }
-
-        let config = crate::env::write_private_config(&self.engine_settings())
-            .map_err(|err| format!("Could not write the settings: {err}"))?;
-        let probe = crate::env::write_probe_wav().map_err(|err| err.to_string())?;
-
-        let started = std::time::Instant::now();
-        let output = std::process::Command::new(&binary)
-            .arg("-c")
-            .arg(&config)
-            .arg("-q")
-            .arg("transcribe")
-            .arg(probe.path())
-            .output()
-            .map_err(|err| format!("Could not run voxtype: {err}"))?;
-
-        if output.status.success() {
-            Ok(format!("Reached the server in {:?}", started.elapsed()))
-        } else {
-            // voxtype puts the reason on stderr; the last line is the useful one.
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let reason = stderr
-                .lines()
-                .rev()
-                .find(|line| !line.trim().is_empty())
-                .unwrap_or("no reason given")
-                .trim()
-                .to_owned();
-            Err(reason)
-        }
-    }
-
-    fn raise(&mut self, message: impl Into<String>) {
-        let message = message.into();
-        tracing::warn!(%message, "raising a banner");
-        self.banner = Some(Banner { message });
-    }
-
-    /// Re-reads the library after it changes on disk.
-    fn reload_library(&mut self) {
-        let Some(store) = self.store.clone() else {
-            return;
-        };
-        let library = crate::env::load_library(&store);
-        if let Some(problem) = library.problem {
-            self.raise(problem);
-            return;
-        }
-        self.conversations = library.value.conversations;
-        self.groups = library.value.groups;
-        self.tags = library.value.tags;
-        self.conversation_tags = library.value.conversation_tags;
-    }
-
-    fn elapsed(&self) -> Duration {
-        self.accumulated
-            + self
-                .session_start
-                .map(|start| start.elapsed())
-                .unwrap_or_default()
-    }
-
-    fn open_history(&mut self, id: ConversationId) {
-        self.main_view = MainView::History(id);
-        if let (Some(store), false) = (self.store.as_ref(), self.history_segments.contains_key(&id))
-        {
-            let segments = crate::env::load_segments(store, id);
-            self.history_segments.insert(id, segments);
-        }
-    }
-
-    fn segments_for(&self, id: ConversationId) -> &[Segment] {
-        self.history_segments
-            .get(&id)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
-    }
-
-    fn drain_events(&mut self, ctx: &egui::Context) {
-        // Collected first so the match below can take `&mut self` freely.
-        let mut batch = Vec::new();
-        if let Some(events) = &self.events {
-            while let Ok(event) = events.try_recv() {
-                batch.push(event);
-            }
-        }
-        for event in batch {
-            match event {
-                SessionEvent::Level { peak, rms } => {
-                    if self.state == SessionState::Recording {
-                        self.level_peak = peak;
-                        self.level_rms = rms;
-                    }
-                }
-                SessionEvent::Provisional(segment) => {
-                    if self.state == SessionState::Recording {
-                        self.provisional.insert(segment.track, segment);
-                    }
-                }
-                SessionEvent::Committed(segment) => {
-                    if matches!(
-                        self.state,
-                        SessionState::Recording | SessionState::Finishing
-                    ) {
-                        self.provisional.remove(&segment.track);
-                        self.segments.push(segment);
-                        overlay::sync(&self.overlay, &self.segments);
-                    }
-                }
-                // Routed through `set_state` so the elapsed-time bookkeeping
-                // happens for transitions the session reports, not only for
-                // the ones a button starts.
-                SessionEvent::StateChanged(state) => self.set_state(state),
-                SessionEvent::PressureChanged(pressure) => self.pressure = pressure,
-                SessionEvent::SourceLost { reason } => {
-                    self.banner = Some(Banner {
-                        message: format!("Audio source lost: {reason}"),
-                    });
-                }
-                SessionEvent::SourceRecovered => self.banner = None,
-                SessionEvent::Failed { stage, message } => {
-                    self.banner = Some(Banner {
-                        message: format!("{stage}: {message}"),
-                    });
-                }
-            }
-        }
-        if matches!(
-            self.state,
-            SessionState::Recording | SessionState::Finishing
-        ) {
-            ctx.request_repaint_after(Duration::from_millis(60));
-        }
-    }
-
-    fn poll_theme(&mut self, ctx: &egui::Context) {
-        if self.theme_catalog.needs_reload() {
-            self.theme_catalog
-                .start(self.themes_dir.clone(), None, &self.theme_waker);
-        }
-        if self.theme_catalog.poll() {
-            let next = self
-                .theme_catalog
-                .system_theme()
-                .or_else(|| self.theme_catalog.themes().first())
-                .map(|theme| theme.palette.clone());
-            if let Some(palette) = next {
-                self.palette = palette;
-                self.palette.apply(ctx);
-            }
-        }
-    }
-
-    /// Drains tray events. `headless` is true while no window exists
-    /// ([`fastframe_shell::Resident::headless_frame`]), when the only thing
-    /// to do is remember that a window was asked for; with a window open,
-    /// `Toggle`/`quit` act on it directly.
-    fn drain_tray(&mut self, ctx: &egui::Context, headless: bool) {
-        let Some(tray) = &mut self.tray else {
-            return;
-        };
-        for event in tray.events() {
-            match event {
-                fastframe_tray::Event::Toggle | fastframe_tray::Event::Menu("show") => {
-                    if headless {
-                        self.wants_show = true;
-                    } else {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                }
-                fastframe_tray::Event::Show => {
-                    if headless {
-                        self.wants_show = true;
-                    } else {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    }
-                }
-                fastframe_tray::Event::Menu("quit") => {
-                    self.quit_requested = true;
-                    if !headless {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                }
-                fastframe_tray::Event::Menu(_) => {}
-            }
-        }
-    }
-}
-
-impl fastframe_shell::Resident for App {
-    fn closed(&self) -> fastframe_shell::Closed {
-        if self.quit_requested || self.tray.is_none() {
-            fastframe_shell::Closed::Quit
-        } else {
-            fastframe_shell::Closed::Hide
-        }
-    }
-
-    fn window_gone(&mut self) {
-        self.overlay_open = false;
-    }
-
-    fn headless_frame(&mut self, ctx: &egui::Context) -> fastframe_shell::Headless {
-        self.drain_tray(ctx, true);
-        if self.quit_requested {
-            fastframe_shell::Headless::Quit
-        } else if std::mem::take(&mut self.wants_show) {
-            fastframe_shell::Headless::Show
-        } else {
-            fastframe_shell::Headless::Wait
-        }
-    }
-
-    fn shutdown(&mut self) {
-        tracing::info!("fastcription shutting down");
-    }
-}
-
-/// The source picker, plus the refresh that keeps it honest.
-///
-/// The list can legitimately be empty — no sound server running, `pactl`
-/// missing, every device suspended — so nothing here indexes into it without
-/// checking. Refresh matters because sink inputs come and go: the application
-/// whose audio the user wants to transcribe may not have started playing when
-/// fastcription launched.
-fn source_combo(app: &mut App, ui: &mut egui::Ui, id_salt: &str) {
-    let current = match app.sources.get(app.selected_source) {
-        Some(source) => source.label(),
-        None => t("No audio source").to_owned(),
-    };
-    egui::ComboBox::from_id_salt(id_salt)
-        .selected_text(current)
-        .show_ui(ui, |ui| {
-            if app.sources.is_empty() {
-                ui.label(t("Nothing to record"));
-            }
-            for index in 0..app.sources.len() {
-                let label = app.sources[index].label();
-                ui.selectable_value(&mut app.selected_source, index, label);
-            }
-        });
-    if ui
-        .small_button(t("↻"))
-        .on_hover_text(t("Look for audio sources again"))
-        .clicked()
-    {
-        app.refresh_sources();
-    }
-}
-
-fn service_pill(ui: &mut egui::Ui, status: ServiceStatus) {
-    let (icon, text, color) = match status {
-        ServiceStatus::Running => (
-            crate::icons::Icon::StatusOk,
-            t("voxtype: running"),
-            egui::Color32::from_rgb(0x4c, 0xaf, 0x50),
-        ),
-        ServiceStatus::Stopped => (
-            crate::icons::Icon::StatusWarn,
-            t("voxtype: stopped"),
-            egui::Color32::from_rgb(0xe0, 0x6c, 0x75),
-        ),
-        ServiceStatus::Unknown => (
-            crate::icons::Icon::StatusWarn,
-            t("voxtype: unknown"),
-            egui::Color32::GRAY,
-        ),
-    };
-    ui.add(icon.image(color, 14.0));
-    ui.colored_label(color, text);
-}
-
-fn format_elapsed(elapsed: Duration) -> String {
-    let total_secs = elapsed.as_secs();
-    format!(
-        "{:02}:{:02}:{:02}",
-        total_secs / 3600,
-        (total_secs / 60) % 60,
-        total_secs % 60
-    )
-}
-
-/// A flat purple disc: fastcription has no app icon yet, so the tray draws
-/// one procedurally rather than shipping a placeholder asset.
-fn tray_icon_rgba(size: usize) -> Vec<u8> {
-    let mut pixels = vec![0u8; size * size * 4];
-    let radius = size as f32 / 2.0;
-    for y in 0..size {
-        for x in 0..size {
-            let dx = x as f32 + 0.5 - radius;
-            let dy = y as f32 + 0.5 - radius;
-            if (dx * dx + dy * dy).sqrt() <= radius * 0.9 {
-                let index = (y * size + x) * 4;
-                pixels[index] = 0x8a;
-                pixels[index + 1] = 0x7a;
-                pixels[index + 2] = 0xe8;
-                pixels[index + 3] = 0xff;
-            }
-        }
-    }
-    pixels
 }
 
 /// The name a conversation gets until the user renames it.
 fn default_title() -> String {
-    let now = time::OffsetDateTime::now_local()
-        .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
-    let format = time::macros::format_description!(
-        "[year]-[month]-[day] [hour]:[minute]"
-    );
+    let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    let format = time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]");
     now.format(&format)
         .map(|stamp| format!("Conversation {stamp}"))
         .unwrap_or_else(|_| "Conversation".to_owned())
-}
-
-/// Finds the user's previously chosen source in a freshly enumerated list.
-///
-/// Matched on identity rather than position: a source that disappears shifts
-/// every index after it, and quietly recording a different stream than the one
-/// the user picked is the worst failure this app has. Falls back to the first
-/// entry only when the previous choice is genuinely gone.
-fn reselect(previous: Option<&AudioSource>, sources: &[AudioSource]) -> usize {
-    previous
-        .and_then(|previous| {
-            sources.iter().position(|source| {
-                source.kind == previous.kind
-                    && source.name == previous.name
-                    && source.application == previous.application
-            })
-        })
-        .unwrap_or(0)
-}
-
-/// Keeps a user-chosen title usable as a filename without surprising them with
-/// a mangled name: separators and control characters go, everything else stays.
-fn sanitise_filename(title: &str) -> String {
-    let cleaned: String = title
-        .chars()
-        .map(|c| {
-            if c.is_control() || matches!(c, '/' | '\\' | ':' | '\0') {
-                '-'
-            } else {
-                c
-            }
-        })
-        .collect();
-    let trimmed = cleaned.trim().trim_matches('.').to_owned();
-    if trimmed.is_empty() {
-        "conversation".to_owned()
-    } else {
-        trimmed
-    }
 }
 
 fn now_millis() -> i64 {
@@ -1377,60 +544,182 @@ fn now_millis() -> i64 {
         .unwrap_or_default()
 }
 
-
-
-
-
-
-
 #[cfg(test)]
 mod tests {
-    use super::{reselect, sanitise_filename};
-    use fc_core::{AudioSource, SourceKind};
+    use super::{
+        settings, AudioSource, NoticeKind, Notices, Persisted, Saving, INFO_LIFETIME, MAX_NOTICES,
+        PERSISTED_KEY,
+    };
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
 
-    fn monitor(name: &str) -> AudioSource {
-        AudioSource::named(SourceKind::SinkMonitor, name, name)
+    /// eframe's `Storage` over a map, so the persistence tests go through the
+    /// same `set_value`/`get_value` — and the same RON — the real one does.
+    #[derive(Default)]
+    struct MemoryStorage(HashMap<String, String>);
+
+    impl eframe::Storage for MemoryStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+        fn set_string(&mut self, key: &str, value: String) {
+            self.0.insert(key.to_owned(), value);
+        }
+        fn remove_string(&mut self, key: &str) {
+            self.0.remove(key);
+        }
+        fn flush(&mut self) {}
+    }
+
+    fn sample_settings() -> settings::State {
+        settings::State {
+            engine: "parakeet".into(),
+            model: "parakeet-tdt-0.6b".into(),
+            language: "es".into(),
+            threads: 6,
+            remote_enabled: true,
+            remote_endpoint: "http://desktop.lan:8080".into(),
+            remote_api_key: "super-secret-token".into(),
+            transcript_pt: 30.0,
+            ..settings::State::default()
+        }
+    }
+
+    /// The write and read sides are two types, which only works while their
+    /// fields agree. A rename on one of them would silently stop restoring
+    /// everything after it — exactly the kind of bug that reads as "settings
+    /// sometimes do not stick".
+    #[test]
+    fn settings_and_the_chosen_source_survive_a_round_trip() {
+        let settings = sample_settings();
+        let source = AudioSource::sink_input(42, "Zoom", "Zoom meeting audio");
+        let mic = crate::env::default_microphone();
+
+        let mut storage = MemoryStorage::default();
+        eframe::set_value(
+            &mut storage,
+            PERSISTED_KEY,
+            &Saving {
+                settings: &settings,
+                source: Some(&source),
+                mic_source: Some(&mic),
+                mic_track: true,
+            },
+        );
+
+        let read: Persisted = eframe::get_value(&storage, PERSISTED_KEY).expect("stored blob");
+        assert_eq!(read.settings.engine, "parakeet");
+        assert_eq!(read.settings.model, "parakeet-tdt-0.6b");
+        assert_eq!(read.settings.language, "es");
+        assert_eq!(read.settings.threads, 6);
+        assert!(read.settings.remote_enabled);
+        assert_eq!(read.settings.remote_endpoint, "http://desktop.lan:8080");
+        assert_eq!(read.settings.transcript_pt, 30.0);
+        assert!(read.mic_track);
+        assert_eq!(read.mic_source.as_ref(), Some(&mic));
+        // The descriptor, not the index: a sink-input index is stale by the
+        // next launch, which is why `reselect` matches on identity.
+        let restored = read.source.expect("a stored source");
+        assert_eq!(restored.application.as_deref(), Some("Zoom"));
+        assert_eq!(restored.kind, source.kind);
+    }
+
+    /// egui's storage is a plaintext file in the user's data directory. The
+    /// bearer token belongs in the per-session voxtype config, which is created
+    /// 0600, and nowhere else.
+    #[test]
+    fn the_api_key_never_reaches_the_settings_file() {
+        let settings = sample_settings();
+        let mut storage = MemoryStorage::default();
+        eframe::set_value(
+            &mut storage,
+            PERSISTED_KEY,
+            &Saving {
+                settings: &settings,
+                source: None,
+                mic_source: None,
+                mic_track: false,
+            },
+        );
+
+        let stored = eframe::Storage::get_string(&storage, PERSISTED_KEY).expect("stored blob");
+        assert!(
+            !stored.contains("super-secret-token"),
+            "the API key must not be written to disk: {stored}"
+        );
+        let read: Persisted = eframe::get_value(&storage, PERSISTED_KEY).expect("stored blob");
+        assert!(read.settings.remote_api_key.is_empty());
+        // Everything else still came back, so the key is skipped rather than
+        // the whole blob being refused.
+        assert_eq!(read.settings.remote_endpoint, "http://desktop.lan:8080");
+    }
+
+    /// A transcriber that fails every pass raises the same text once a second.
+    /// Fifty separate entries say nothing a count does not.
+    #[test]
+    fn the_same_text_in_a_row_collapses_into_a_count() {
+        let mut notices = Notices::default();
+        let first = notices.push(NoticeKind::Error, "transcribe: engine gone".into());
+        let again = notices.push(NoticeKind::Error, "transcribe: engine gone".into());
+        assert_eq!(first, again, "a repeat is the same notice, counted up");
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices.newest().map(|n| n.count), Some(2));
+
+        notices.push(NoticeKind::Error, "store: disk full".into());
+        assert_eq!(notices.len(), 2);
+        // Only *consecutive* repeats collapse: the engine failing again after
+        // something else went wrong is a new event in the sequence.
+        notices.push(NoticeKind::Error, "transcribe: engine gone".into());
+        assert_eq!(notices.len(), 3);
     }
 
     #[test]
-    fn a_refresh_keeps_the_chosen_source_when_the_list_shifts() {
-        let previous = monitor("b.monitor");
-        let after = vec![monitor("new.monitor"), monitor("a.monitor"), monitor("b.monitor")];
-        assert_eq!(reselect(Some(&previous), &after), 2);
+    fn the_list_is_capped_and_keeps_the_newest() {
+        let mut notices = Notices::default();
+        for i in 0..MAX_NOTICES + 10 {
+            notices.push(NoticeKind::Warning, format!("problem {i}"));
+        }
+        assert_eq!(notices.len(), MAX_NOTICES);
+        assert_eq!(
+            notices.newest().map(|n| n.text.as_str()),
+            Some(format!("problem {}", MAX_NOTICES + 9).as_str())
+        );
     }
 
+    /// A success dismisses itself; something the user has to act on does not.
     #[test]
-    fn a_vanished_source_falls_back_to_the_first() {
-        let previous = monitor("gone.monitor");
-        let after = vec![monitor("a.monitor")];
-        assert_eq!(reselect(Some(&previous), &after), 0);
+    fn info_expires_and_errors_stay() {
+        let mut notices = Notices::default();
+        notices.push(NoticeKind::Info, "Exported to /tmp/x.txt".into());
+        notices.push(NoticeKind::Error, "The library is read-only".into());
+
+        let later = Instant::now() + INFO_LIFETIME + Duration::from_secs(1);
+        assert_eq!(notices.expire(later), None, "nothing left to expire");
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices.newest().map(|n| n.kind), Some(NoticeKind::Error));
     }
 
+    /// The expiry has to say when to look again, or an auto-dismissing notice
+    /// sits on screen until something unrelated causes a repaint.
     #[test]
-    fn an_empty_list_selects_index_zero_without_panicking() {
-        let previous = monitor("a.monitor");
-        assert_eq!(reselect(Some(&previous), &[]), 0);
-        assert_eq!(reselect(None, &[]), 0);
+    fn expiry_reports_when_the_next_one_is_due() {
+        let mut notices = Notices::default();
+        notices.push(NoticeKind::Info, "Imported 3 meetings".into());
+        let due = notices.expire(Instant::now()).expect("one info notice");
+        assert!(
+            due <= INFO_LIFETIME && due > Duration::ZERO,
+            "due in {due:?}"
+        );
     }
 
-    /// Two streams of the same application are told apart by index, which the
-    /// identity match deliberately ignores — so the application name has to be
-    /// part of what is compared, or the wrong one gets picked.
+    /// `SourceRecovered` means the capture came back, and nothing else.
     #[test]
-    fn sink_inputs_match_on_application_not_position() {
-        let firefox = AudioSource::sink_input(12, "Firefox", "Firefox playback");
-        let after = vec![
-            AudioSource::sink_input(30, "Spotify", "Spotify playback"),
-            AudioSource::sink_input(31, "Firefox", "Firefox playback"),
-        ];
-        assert_eq!(reselect(Some(&firefox), &after), 1);
-    }
-
-    #[test]
-    fn filenames_survive_a_title_with_separators() {
-        assert_eq!(sanitise_filename("1:1 with Alice"), "1-1 with Alice");
-        assert_eq!(sanitise_filename("a/b\\c"), "a-b-c");
-        assert_eq!(sanitise_filename("   "), "conversation");
-        assert_eq!(sanitise_filename("..."), "conversation");
+    fn retracting_one_notice_leaves_the_others() {
+        let mut notices = Notices::default();
+        let kept = notices.push(NoticeKind::Error, "voxtype was not found".into());
+        let lost = notices.push(NoticeKind::Warning, "Audio source lost: gone".into());
+        notices.remove(lost);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices.newest().map(|n| n.id), Some(kept));
     }
 }

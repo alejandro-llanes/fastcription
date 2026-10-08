@@ -1012,6 +1012,7 @@ dependencies = [
  "fc-export",
  "fc-store",
  "fc-voxtype",
+ "serde",
  "tempfile",
  "thiserror 2.0.21",
  "time",

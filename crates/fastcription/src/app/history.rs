@@ -18,13 +18,25 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: ConversationId) {
     let mut conversation = app.conversations[index].clone();
     let mut changed = false;
 
+    let recording = app.is_recording(conversation.id);
     ui.horizontal(|ui| {
         ui.heading(t("Conversation"));
+        if recording {
+            ui.label(
+                RichText::new(t("recording"))
+                    .strong()
+                    .color(app.palette.danger),
+            );
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .button(t("Delete"))
-                .on_hover_text(t("Deletes this conversation and its transcript."))
-                .clicked()
+            // No Delete while this is the row the session is appending to: the
+            // store refuses it, and offering a button that cannot work is
+            // worse than not offering one.
+            if !recording
+                && ui
+                    .button(t("Delete"))
+                    .on_hover_text(t("Deletes this conversation and its transcript."))
+                    .clicked()
             {
                 app.ask_to_delete(conversation.id);
             }

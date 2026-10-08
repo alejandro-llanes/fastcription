@@ -52,6 +52,10 @@ pub struct State {
     /// dependency is not worth it to pick one directory, but a path the user
     /// cannot see or change is worse than no dialog at all.
     pub destination: String,
+    /// A destination that already holds a file, waiting for the second click
+    /// that says to replace it. Cleared when the path changes, so confirming
+    /// one path cannot authorise overwriting another.
+    pub confirming: Option<std::path::PathBuf>,
 }
 
 impl Default for State {
@@ -63,6 +67,7 @@ impl Default for State {
             speakers: true,
             metadata: true,
             destination: String::new(),
+            confirming: None,
         }
     }
 }
@@ -77,6 +82,7 @@ pub fn button(app: &mut App, ui: &mut egui::Ui, conversation: &fc_core::Conversa
         .inner;
     if clicked {
         app.export.open = !app.export.open;
+        app.export.confirming = None;
         if app.export.open {
             app.export.destination = app
                 .default_export_path(conversation, app.export.format.to_export())
@@ -109,35 +115,61 @@ pub fn button(app: &mut App, ui: &mut egui::Ui, conversation: &fc_core::Conversa
                 }
                 ui.separator();
                 ui.label(t("Save to"));
-                ui.add(
-                    egui::TextEdit::singleline(&mut app.export.destination)
-                        .desired_width(380.0),
-                );
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut app.export.destination)
+                            .desired_width(380.0),
+                    )
+                    .changed()
+                {
+                    // A confirmation belongs to the path it was given for.
+                    app.export.confirming = None;
+                }
                 ui.separator();
                 ui.checkbox(&mut app.export.timestamps, t("Timestamps"));
                 ui.checkbox(&mut app.export.speakers, t("Speaker labels"));
                 ui.checkbox(&mut app.export.metadata, t("Metadata header"));
                 ui.separator();
+                let destination =
+                    std::path::PathBuf::from(shellexpand_home(&app.export.destination));
+                let replacing = app.export.confirming.as_deref() == Some(destination.as_path());
+                if replacing {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} {}",
+                            t("A file is already there:"),
+                            destination.display()
+                        ))
+                        .small()
+                        .color(app.palette.warning),
+                    );
+                }
                 ui.horizontal(|ui| {
-                    if ui.button(t("Export")).clicked() {
+                    let label = if replacing {
+                        t("Replace?")
+                    } else {
+                        t("Export")
+                    };
+                    if ui.button(label).clicked() {
                         let options = fc_export::ExportOptions {
                             timestamps: app.export.timestamps,
                             speakers: app.export.speakers,
                             metadata: app.export.metadata,
                         };
-                        let destination = std::path::PathBuf::from(
-                            shellexpand_home(&app.export.destination),
-                        );
-                        app.export_conversation(
+                        // Left open when the destination needs confirming, so
+                        // the second click lands on the same dialog.
+                        if app.export_conversation(
                             conversation,
                             app.export.format.to_export(),
                             options,
                             &destination,
-                        );
-                        app.export.open = false;
+                        ) {
+                            app.export.open = false;
+                        }
                     }
                     if ui.button(t("Cancel")).clicked() {
                         app.export.open = false;
+                        app.export.confirming = None;
                     }
                 });
             });

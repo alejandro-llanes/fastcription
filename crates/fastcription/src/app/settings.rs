@@ -9,6 +9,8 @@
 use crate::app::{App, ServiceStatus};
 use crate::i18n::t;
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct State {
     /// Engine, model and language as they will be passed to voxtype. Seeded
     /// from voxtype's own configuration at startup, so leaving them alone
@@ -31,10 +33,25 @@ pub struct State {
     pub remote_enabled: bool,
     pub remote_endpoint: String,
     pub remote_model: String,
+    /// Never persisted: egui's storage is a plaintext JSON file in the user's
+    /// config directory, and this is a bearer token. It reaches voxtype
+    /// through the per-session config, which is created 0600.
+    #[serde(skip)]
     pub remote_api_key: String,
     pub remote_timeout_secs: u32,
+    /// How large the transcript is drawn in compact mode. Someone who reads a
+    /// language better than they hear it is reading this across a room from a
+    /// laptop, so it is a setting rather than a constant.
+    pub transcript_pt: f32,
     /// The result of the last connection test, shown next to the button.
+    ///
+    /// Not persisted: "reached the server in 240 ms" said nothing about the
+    /// network the app was restarted onto.
+    #[serde(skip)]
     pub remote_probe: Option<Result<String, String>>,
+    /// A connection test in flight on its own thread.
+    #[serde(skip)]
+    pub remote_probe_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
 }
 
 impl Default for State {
@@ -52,7 +69,9 @@ impl Default for State {
             remote_model: "whisper-1".to_owned(),
             remote_api_key: String::new(),
             remote_timeout_secs: 30,
+            transcript_pt: 22.0,
             remote_probe: None,
+            remote_probe_rx: None,
         }
     }
 }
@@ -62,14 +81,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     ui.separator();
 
     ui.label(t("Audio source"));
-    crate::app::source_combo(app, ui, "settings-source");
+    crate::app::chrome::source_combo(app, ui, "settings-source");
 
     ui.add_space(8.0);
-    ui.checkbox(
-        &mut app.mic_track,
-        t("Capture my microphone as a second track"),
-    );
-    ui.add_enabled_ui(app.mic_track, |ui| {
+    crate::app::chrome::mic_checkbox(app, ui, t("Capture my microphone as a second track"));
+    ui.add_enabled_ui(app.mic_track && !app.source_locked(), |ui| {
         ui.horizontal(|ui| {
             ui.label(t("Microphone"));
             mic_combo(app, ui);
@@ -79,32 +95,32 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(8.0);
     ui.label(t("Transcription"));
     ui.add_enabled_ui(!app.settings.remote_enabled, |ui| {
-    ui.horizontal(|ui| {
-        ui.label(t("Engine"));
-        combo(ui, "engine", &mut app.settings.engine, &app.engines);
-        ui.label(t("Model"));
-        combo(ui, "model", &mut app.settings.model, &app.models);
-        ui.label(t("Language"));
-        ui.add(
-            egui::TextEdit::singleline(&mut app.settings.language)
-                .desired_width(60.0)
-                .hint_text("en"),
-        )
-        .on_hover_text(t(
-            "A language code such as en or es, a comma-separated list, or auto.",
-        ));
-    });
-    ui.checkbox(&mut app.settings.fast_mode, t("Fast mode"))
-        .on_hover_text(t(
-            "Uses voxtype's context-window optimisation: two to nearly three \
+        ui.horizontal(|ui| {
+            ui.label(t("Engine"));
+            combo(ui, "engine", &mut app.settings.engine, &app.engines);
+            ui.label(t("Model"));
+            combo(ui, "model", &mut app.settings.model, &app.models);
+            ui.label(t("Language"));
+            ui.add(
+                egui::TextEdit::singleline(&mut app.settings.language)
+                    .desired_width(60.0)
+                    .hint_text("en"),
+            )
+            .on_hover_text(t(
+                "A language code such as en or es, a comma-separated list, or auto.",
+            ));
+        });
+        ui.checkbox(&mut app.settings.fast_mode, t("Fast mode"))
+            .on_hover_text(t(
+                "Uses voxtype's context-window optimisation: two to nearly three \
              times faster for the short passes realtime needs. Turn it off if \
              you see words repeating.",
-        ));
-    ui.add(egui::Slider::new(&mut app.settings.threads, 1..=32).text(t("inference threads")))
-        .on_hover_text(t(
-            "whisper.cpp stops getting faster past about eight threads for the \
+            ));
+        ui.add(egui::Slider::new(&mut app.settings.threads, 1..=32).text(t("inference threads")))
+            .on_hover_text(t(
+                "whisper.cpp stops getting faster past about eight threads for the \
              small English models.",
-        ));
+            ));
     });
 
     ui.add_space(8.0);
@@ -140,15 +156,36 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     .desired_width(240.0)
                     .password(true)
                     .hint_text(t("optional")),
-            );
+            )
+            .on_hover_text(t(
+                "Kept for this session only. It is written to fastcription's own \
+                 voxtype config, which is created readable by you alone, and never \
+                 to the settings file that remembers everything else here.",
+            ));
             ui.add(
                 egui::Slider::new(&mut app.settings.remote_timeout_secs, 5..=120)
                     .text(t("timeout s")),
             );
         });
         ui.horizontal(|ui| {
-            if ui.button(t("Test connection")).clicked() {
+            let testing = app.settings.remote_probe_rx.is_some();
+            if ui
+                .add_enabled(!testing, egui::Button::new(t("Test connection")))
+                .clicked()
+            {
                 app.probe_transcription_server();
+            }
+            if testing {
+                // The only interesting failure is an address nothing answers
+                // at, which takes the configured timeout to discover. The
+                // spinner is what says the window is still alive.
+                ui.add(egui::Spinner::new().size(14.0));
+                ui.label(
+                    egui::RichText::new(t("asking the server…"))
+                        .small()
+                        .color(app.palette.secondary),
+                );
+                return;
             }
             match &app.settings.remote_probe {
                 Some(Ok(text)) => ui.colored_label(app.palette.accent, text.clone()),
@@ -213,6 +250,16 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     );
 
     ui.add_space(8.0);
+    ui.label(t("Captions"));
+    ui.add(
+        egui::Slider::new(&mut app.settings.transcript_pt, 14.0..=48.0)
+            .text(t("caption text size")),
+    )
+    .on_hover_text(t(
+        "How large compact mode draws the transcript. Ctrl+Shift+C switches to it.",
+    ));
+
+    ui.add_space(8.0);
     ui.label(t("voxtype service"));
     ui.horizontal(|ui| {
         ui.label(service_label(app.voxtype_service));
@@ -232,19 +279,32 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         .color(app.palette.secondary),
     );
 
-
     ui.add_space(8.0);
     ui.label(t("Import"));
-    if ui
-        .button(t("Import past voxtype meetings"))
-        .on_hover_text(t(
-            "Copies meetings recorded by voxtype's own meeting mode into this \
-             library. Already imported meetings are skipped.",
-        ))
-        .clicked()
-    {
-        app.import_voxtype_meetings();
-    }
+    ui.horizontal(|ui| {
+        let running = app.import_running();
+        if ui
+            .add_enabled(
+                running.is_none(),
+                egui::Button::new(t("Import past voxtype meetings")),
+            )
+            .on_hover_text(t(
+                "Copies meetings recorded by voxtype's own meeting mode into this \
+                 library. Already imported meetings are skipped.",
+            ))
+            .clicked()
+        {
+            app.import_voxtype_meetings();
+        }
+        if let Some(added) = running {
+            ui.add(egui::Spinner::new().size(14.0));
+            ui.label(
+                egui::RichText::new(format!("{added} {}", t("imported so far")))
+                    .small()
+                    .color(app.palette.secondary),
+            );
+        }
+    });
 }
 
 /// An editable choice: a dropdown of what voxtype reports, which still accepts
