@@ -10,15 +10,22 @@ use fc_core::{Conversation, Segment};
 use crate::format::ExportOptions;
 use crate::timestamp;
 
-pub(crate) fn render(conversation: &Conversation, segments: &[Segment], options: &ExportOptions) -> String {
+pub(crate) fn render(
+    conversation: &Conversation,
+    segments: &[Segment],
+    options: &ExportOptions,
+) -> String {
     let mut out = String::new();
 
     if options.metadata {
         out.push_str(&conversation.title);
         out.push('\n');
-        out.push_str(&format!("Started: {}\n", timestamp::epoch_millis(conversation.started_at)));
+        out.push_str(&format!(
+            "Started: {}\n",
+            fc_core::time::rfc3339(conversation.started_at)
+        ));
         if let Some(ended) = conversation.ended_at {
-            out.push_str(&format!("Ended: {}\n", timestamp::epoch_millis(ended)));
+            out.push_str(&format!("Ended: {}\n", fc_core::time::rfc3339(ended)));
         }
         out.push_str(&format!("Source: {}\n", conversation.source.label()));
         out.push_str(&format!(
@@ -39,7 +46,9 @@ pub(crate) fn render(conversation: &Conversation, segments: &[Segment], options:
             out.push_str(seg.speaker_label());
             out.push_str(": ");
         }
-        out.push_str(seg.text.trim());
+        // One segment per line is the format's whole promise, so the
+        // one-line invariant is applied here too rather than assumed.
+        out.push_str(&fc_core::single_line(&seg.text));
         out.push('\n');
     }
 

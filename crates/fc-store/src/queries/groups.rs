@@ -10,6 +10,7 @@ use crate::Store;
 
 impl Store {
     pub fn create_group(&self, name: &str, created_at: UnixMillis) -> Result<GroupId> {
+        self.writable("creating a group")?;
         self.conn.execute(
             "INSERT INTO groups (name, created_at) VALUES (?1, ?2)",
             params![name, created_at],
@@ -18,6 +19,7 @@ impl Store {
     }
 
     pub fn rename_group(&self, id: GroupId, new_name: &str) -> Result<()> {
+        self.writable("renaming a group")?;
         let changed = self.conn.execute(
             "UPDATE groups SET name = ?1 WHERE id = ?2",
             params![new_name, id.get()],
@@ -33,6 +35,7 @@ impl Store {
     /// `ON DELETE SET NULL` on `conversations.group_id` is what keeps the
     /// group's conversations alive, ungrouped, rather than cascading.
     pub fn delete_group(&self, id: GroupId) -> Result<()> {
+        self.writable("deleting a group")?;
         let changed = self
             .conn
             .execute("DELETE FROM groups WHERE id = ?1", params![id.get()])?;

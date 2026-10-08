@@ -1,13 +1,24 @@
 {
   "metadata": {
+    "id": 1,
     "title": "Design sync",
     "started_at": 1760000000000,
+    "started_at_iso": "2025-10-09T08:53:20Z",
     "ended_at": 1760005404000,
+    "ended_at_iso": "2025-10-09T10:23:24Z",
     "status": "completed",
-    "source": "System audio",
+    "source": {
+      "kind": "sink-monitor",
+      "name": "alsa_output.monitor",
+      "description": "System audio",
+      "application": null
+    },
+    "mic_track": true,
     "engine": "whisper",
     "model": "base.en",
-    "language": "en"
+    "language": "en",
+    "backend": "CPU (AVX2)",
+    "voxtype_meeting_id": null
   },
   "segments": [
     {

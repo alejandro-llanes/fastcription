@@ -5,6 +5,7 @@ use fc_core::{ConversationId, Segment, Track};
 use rusqlite::params;
 
 use crate::error::{Result, StoreError};
+use crate::queries::conversations::{insert_segments, reject_provisional};
 use crate::Store;
 
 /// A stored column is declared `INTEGER NOT NULL` but the domain type is
@@ -50,35 +51,11 @@ impl Store {
         if segments.is_empty() {
             return Ok(());
         }
-        if let Some(bad) = segments.iter().find(|s| s.provisional) {
-            return Err(StoreError::ProvisionalSegment {
-                track: bad.track,
-                seq: bad.seq,
-            });
-        }
+        self.writable("appending to a transcript")?;
+        reject_provisional(segments)?;
 
         let tx = self.conn.unchecked_transaction()?;
-        {
-            let mut stmt = tx.prepare_cached(
-                "INSERT INTO segments (
-                    conversation_id, seq, track, start_ms, end_ms, text, translation, speaker, confidence
-                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            )?;
-            for s in segments {
-                stmt.execute(params![
-                    conversation.get(),
-                    s.seq as i64,
-                    s.track.as_str(),
-                    s.start_ms as i64,
-                    s.end_ms as i64,
-                    s.text,
-                    s.translation,
-                    s.speaker,
-                    s.confidence,
-                ])
-                .map_err(|e| foreign_key_violation_as_not_found(e, conversation))?;
-            }
-        }
+        insert_segments(&tx, conversation, segments)?;
         tx.commit()?;
         Ok(())
     }
@@ -86,7 +63,7 @@ impl Store {
     /// Ordered by `(start_ms, seq)`: the natural reading order even when a
     /// microphone track interleaves with the selected source.
     pub fn load_segments(&self, conversation: ConversationId) -> Result<Vec<Segment>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT seq, track, start_ms, end_ms, text, translation, speaker, confidence
              FROM segments WHERE conversation_id = ?1
              ORDER BY start_ms, seq",
@@ -118,7 +95,7 @@ impl Store {
 /// existence check used to return, so callers see no difference. Any other
 /// error (including a different constraint, e.g. the `idx_segments_identity`
 /// duplicate-append guard) passes through unchanged.
-fn foreign_key_violation_as_not_found(
+pub(crate) fn foreign_key_violation_as_not_found(
     err: rusqlite::Error,
     conversation: ConversationId,
 ) -> StoreError {

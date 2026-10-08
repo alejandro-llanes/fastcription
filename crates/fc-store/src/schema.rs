@@ -127,3 +127,27 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 
     Ok(())
 }
+
+/// Checks the schema of a database that cannot be migrated because it was
+/// opened read-only (`Store::open_read_only`).
+///
+/// Only "exactly current" is acceptable here. A newer schema may hold rows
+/// this build would misread, and an older one needs a migration — which is a
+/// write, which is the thing this connection cannot do. Doubles as the probe
+/// that tells a readable database from a WAL database whose wal-index cannot
+/// be created, since both answers come from the same first page read.
+pub fn verify(conn: &Connection) -> Result<()> {
+    let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let current = current as usize;
+    match current.cmp(&MIGRATIONS.len()) {
+        std::cmp::Ordering::Equal => Ok(()),
+        std::cmp::Ordering::Greater => Err(StoreError::SchemaTooNew {
+            found: current,
+            known: MIGRATIONS.len(),
+        }),
+        std::cmp::Ordering::Less => Err(StoreError::SchemaNeedsUpgrade {
+            found: current,
+            known: MIGRATIONS.len(),
+        }),
+    }
+}

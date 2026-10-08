@@ -19,7 +19,11 @@ pub fn conversation() -> Conversation {
         started_at: 1_760_000_000_000,
         ended_at: Some(1_760_005_404_000),
         status: ConversationStatus::Completed,
-        source: AudioSource::named(SourceKind::SinkMonitor, "alsa_output.monitor", "System audio"),
+        source: AudioSource::named(
+            SourceKind::SinkMonitor,
+            "alsa_output.monitor",
+            "System audio",
+        ),
         mic_track: true,
         engine: EngineInfo {
             engine: "whisper".to_string(),

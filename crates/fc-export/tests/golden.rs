@@ -21,53 +21,112 @@ fn fixture(name: &str) -> String {
 
 #[test]
 fn text_plain() {
-    let out = export(&common::conversation(), &common::segments(), ExportFormat::Text, &ExportOptions::default());
+    let out = export(
+        &common::conversation(),
+        &common::segments(),
+        ExportFormat::Text,
+        &ExportOptions::default(),
+    );
     assert_eq!(out, fixture("text_plain.txt"));
 }
 
 #[test]
 fn text_full_options() {
-    let options = ExportOptions { timestamps: true, speakers: true, metadata: true };
-    let out = export(&common::conversation(), &common::segments(), ExportFormat::Text, &options);
+    let options = ExportOptions {
+        timestamps: true,
+        speakers: true,
+        metadata: true,
+    };
+    let out = export(
+        &common::conversation(),
+        &common::segments(),
+        ExportFormat::Text,
+        &options,
+    );
     assert_eq!(out, fixture("text_full.txt"));
 }
 
 #[test]
 fn markdown_full_options() {
-    let options = ExportOptions { timestamps: true, speakers: true, metadata: true };
-    let out = export(&common::conversation(), &common::segments(), ExportFormat::Markdown, &options);
+    let options = ExportOptions {
+        timestamps: true,
+        speakers: true,
+        metadata: true,
+    };
+    let out = export(
+        &common::conversation(),
+        &common::segments(),
+        ExportFormat::Markdown,
+        &options,
+    );
     assert_eq!(out, fixture("markdown_full.md"));
 }
 
 #[test]
 fn json_plain() {
-    let out = export(&common::conversation(), &common::segments(), ExportFormat::Json, &ExportOptions::default());
+    let out = export(
+        &common::conversation(),
+        &common::segments(),
+        ExportFormat::Json,
+        &ExportOptions::default(),
+    );
     assert_eq!(out, fixture("json_plain.json"));
 }
 
 #[test]
 fn json_full_options() {
-    let options = ExportOptions { timestamps: true, speakers: true, metadata: true };
-    let out = export(&common::conversation(), &common::segments(), ExportFormat::Json, &options);
+    let options = ExportOptions {
+        timestamps: true,
+        speakers: true,
+        metadata: true,
+    };
+    let out = export(
+        &common::conversation(),
+        &common::segments(),
+        ExportFormat::Json,
+        &options,
+    );
     assert_eq!(out, fixture("json_full.json"));
 }
 
 #[test]
 fn srt_plain() {
-    let out = export(&common::conversation(), &common::segments(), ExportFormat::Srt, &ExportOptions::default());
+    let out = export(
+        &common::conversation(),
+        &common::segments(),
+        ExportFormat::Srt,
+        &ExportOptions::default(),
+    );
     assert_eq!(out, fixture("srt_plain.srt"));
 }
 
 #[test]
 fn srt_with_speakers() {
-    let options = ExportOptions { speakers: true, ..Default::default() };
-    let out = export(&common::conversation(), &common::segments(), ExportFormat::Srt, &options);
+    let options = ExportOptions {
+        speakers: true,
+        ..Default::default()
+    };
+    let out = export(
+        &common::conversation(),
+        &common::segments(),
+        ExportFormat::Srt,
+        &options,
+    );
     assert_eq!(out, fixture("srt_speakers.srt"));
 }
 
 #[test]
 fn vtt_full_options() {
-    let options = ExportOptions { timestamps: true, speakers: true, metadata: true };
-    let out = export(&common::conversation(), &common::segments(), ExportFormat::Vtt, &options);
+    let options = ExportOptions {
+        timestamps: true,
+        speakers: true,
+        metadata: true,
+    };
+    let out = export(
+        &common::conversation(),
+        &common::segments(),
+        ExportFormat::Vtt,
+        &options,
+    );
     assert_eq!(out, fixture("vtt_full.vtt"));
 }

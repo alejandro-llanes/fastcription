@@ -29,20 +29,6 @@ pub(crate) fn vtt(ms: u64) -> String {
     format!("{h:02}:{m:02}:{s:02}.{ms:03}")
 }
 
-/// A conversation-level instant (absolute Unix milliseconds) as RFC 3339 UTC,
-/// for metadata headers. Falls back to the raw integer on the
-/// (practically unreachable, but still handled rather than panicking) chance
-/// the value is out of `time`'s representable range.
-pub(crate) fn epoch_millis(ms: i64) -> String {
-    use time::OffsetDateTime;
-    use time::format_description::well_known::Rfc3339;
-
-    match OffsetDateTime::from_unix_timestamp(ms.div_euclid(1000)) {
-        Ok(dt) => dt.format(&Rfc3339).unwrap_or_else(|_| ms.to_string()),
-        Err(_) => ms.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

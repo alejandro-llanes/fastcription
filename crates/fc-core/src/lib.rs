@@ -9,11 +9,12 @@ use serde::{Deserialize, Serialize};
 
 pub mod ids;
 pub mod source;
+pub mod time;
 pub mod transcript;
 
 pub use ids::{ConversationId, GroupId, TagId};
 pub use source::{AudioSource, SourceKind};
-pub use transcript::{Segment, Track};
+pub use transcript::{single_line, Segment, Track};
 
 /// Milliseconds since the Unix epoch. The app stores every instant this way:
 /// SQLite has no date type, and a single integer sorts, compares and exports
@@ -84,6 +85,21 @@ pub struct Conversation {
     pub engine: EngineInfo,
     /// Set only on conversations imported from `voxtype meeting`.
     pub voxtype_meeting_id: Option<String>,
+}
+
+impl Conversation {
+    /// How long the conversation ran, or `None` while it is still recording.
+    ///
+    /// Both instants are signed, and `ended_at` can legitimately precede
+    /// `started_at` — a backwards clock step mid-recording, or an imported
+    /// meeting whose metadata disagrees with itself. A plain subtraction cast
+    /// to `u64` turns that into ~1.8e19 ms, which renders as a duration of
+    /// half a billion years; saturating to zero at least reads as "no time at
+    /// all", which is what the row actually claims.
+    pub fn duration_ms(&self) -> Option<u64> {
+        self.ended_at
+            .map(|ended| ended.saturating_sub(self.started_at).max(0) as u64)
+    }
 }
 
 /// A user-defined grouping of conversations. Flat for now; `Conversation::group`
@@ -164,4 +180,54 @@ pub enum SessionEvent {
 pub enum CoreError {
     #[error("audio source {0} is no longer available")]
     SourceGone(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conversation(started_at: UnixMillis, ended_at: Option<UnixMillis>) -> Conversation {
+        Conversation {
+            id: ConversationId(1),
+            title: "sample".into(),
+            group: None,
+            started_at,
+            ended_at,
+            status: ConversationStatus::Completed,
+            source: AudioSource::named(SourceKind::Device, "src", "A source"),
+            mic_track: false,
+            engine: EngineInfo {
+                engine: "whisper".into(),
+                model: "base.en".into(),
+                language: "en".into(),
+                backend: None,
+            },
+            voxtype_meeting_id: None,
+        }
+    }
+
+    #[test]
+    fn duration_is_none_while_recording() {
+        assert_eq!(conversation(1_000, None).duration_ms(), None);
+    }
+
+    #[test]
+    fn duration_is_the_difference() {
+        assert_eq!(
+            conversation(1_000, Some(91_000)).duration_ms(),
+            Some(90_000)
+        );
+    }
+
+    /// A clock that stepped backwards mid-recording, or an import whose
+    /// metadata disagrees with itself. `(ended - started) as u64` would give
+    /// ~1.8e19 ms here — half a billion years of meeting.
+    #[test]
+    fn an_end_before_the_start_is_zero_not_eighteen_quintillion() {
+        assert_eq!(conversation(91_000, Some(1_000)).duration_ms(), Some(0));
+        assert_eq!(
+            conversation(i64::MAX, Some(i64::MIN)).duration_ms(),
+            Some(0)
+        );
+    }
 }

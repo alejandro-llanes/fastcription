@@ -8,3 +8,6 @@ license.workspace = true
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }
+# Only for `time`: formatting a stored instant is shared by the views and the
+# exporters, so it cannot live in either of them.
+time = { workspace = true }

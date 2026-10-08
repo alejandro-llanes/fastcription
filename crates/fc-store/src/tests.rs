@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use fc_core::{AudioSource, ConversationStatus, EngineInfo, Segment, SourceKind, Track};
 use tempfile::TempDir;
 
@@ -194,6 +196,9 @@ fn deleting_a_conversation_cascades_segments_and_tags() {
         .unwrap();
     let tag = store.create_tag("ephemeral", None).unwrap();
     store.add_tag(id, tag).unwrap();
+    store
+        .finish_conversation(id, 100, ConversationStatus::Completed)
+        .unwrap();
 
     store.delete_conversation(id).unwrap();
 
@@ -367,6 +372,9 @@ fn deleting_a_conversation_removes_its_text_from_search_too() {
         )
         .unwrap();
     assert_eq!(store.search("giraffe", 10).unwrap().len(), 1);
+    store
+        .finish_conversation(id, 1_000, ConversationStatus::Completed)
+        .unwrap();
 
     store.delete_conversation(id).unwrap();
 
@@ -507,4 +515,441 @@ fn a_newer_schema_is_refused() {
         matches!(err, StoreError::SchemaTooNew { found: 999, .. }),
         "expected SchemaTooNew, got {err:?}"
     );
+}
+
+/// The conversation being recorded right now is reachable from the sidebar
+/// like any other, and deleting it cascades the live transcript away and
+/// leaves the session appending to a row that is gone — every later append
+/// and the closing `finish_conversation` fail.
+#[test]
+fn the_conversation_being_recorded_cannot_be_deleted() {
+    let (_dir, store) = open_temp();
+    let active = store
+        .create_conversation(&sample_conversation("recording now", 0))
+        .unwrap();
+    store
+        .append_segments(active, &[sample_segment(0, 0, 1_000, "live")])
+        .unwrap();
+
+    let err = store.delete_conversation(active).unwrap_err();
+    assert!(
+        matches!(err, StoreError::ConversationActive { id } if id == active),
+        "expected ConversationActive, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("stop recording"),
+        "the message has to say what to do: {err}"
+    );
+
+    // The transcript is intact and the session can keep writing to it.
+    assert_eq!(store.load_segments(active).unwrap().len(), 1);
+    store
+        .append_segments(active, &[sample_segment(1, 1_000, 2_000, "and more")])
+        .unwrap();
+
+    // Once it is no longer recording it deletes like anything else.
+    store
+        .finish_conversation(active, 2_000, ConversationStatus::Completed)
+        .unwrap();
+    store.delete_conversation(active).unwrap();
+}
+
+/// "There is no such row" and "the row is the one you are recording into" are
+/// different problems with different answers, so they cannot share an error.
+#[test]
+fn deleting_a_missing_conversation_is_still_not_found() {
+    let (_dir, store) = open_temp();
+    let err = store
+        .delete_conversation(fc_core::ConversationId(999))
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::NotFound(_)),
+        "expected NotFound, got {err:?}"
+    );
+}
+
+#[test]
+fn import_writes_the_conversation_and_its_segments_at_once() {
+    let (_dir, store) = open_temp();
+    let mut new = sample_conversation("imported meeting", 1_000);
+    new.voxtype_meeting_id = Some("meeting-1".into());
+
+    let id = store
+        .import_conversation(
+            &new,
+            &[
+                sample_segment(0, 0, 1_000, "hello"),
+                sample_segment(1, 1_000, 2_000, "there"),
+            ],
+            3_000,
+            ConversationStatus::Completed,
+        )
+        .unwrap();
+
+    let conv = store.get_conversation(id).unwrap();
+    assert_eq!(conv.status, ConversationStatus::Completed);
+    assert_eq!(conv.ended_at, Some(3_000));
+    assert_eq!(conv.voxtype_meeting_id.as_deref(), Some("meeting-1"));
+    assert_eq!(store.load_segments(id).unwrap().len(), 2);
+}
+
+/// The old three-transaction sequence committed `voxtype_meeting_id` first,
+/// so a failure while appending left a half-empty `Active` row that the
+/// importer's dedupe reads as "already imported" — permanently blocking a
+/// retry while holding a fragment of the meeting.
+#[test]
+fn a_failed_import_leaves_no_row_to_block_a_retry() {
+    let (_dir, store) = open_temp();
+    let mut new = sample_conversation("imported meeting", 1_000);
+    new.voxtype_meeting_id = Some("meeting-1".into());
+
+    let err = store
+        .import_conversation(
+            &new,
+            &[
+                sample_segment(0, 0, 1_000, "first"),
+                // Same (track, seq): `idx_segments_identity` rejects it.
+                sample_segment(0, 1_000, 2_000, "duplicate identity"),
+            ],
+            3_000,
+            ConversationStatus::Completed,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Sqlite(_)),
+        "a duplicate seq must surface, got {err:?}"
+    );
+
+    assert!(store
+        .list_conversations(&ConversationFilter::default())
+        .unwrap()
+        .is_empty());
+    let segments: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM segments", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(segments, 0);
+
+    // And the meeting can now be imported again.
+    store
+        .import_conversation(
+            &new,
+            &[sample_segment(0, 0, 1_000, "first")],
+            3_000,
+            ConversationStatus::Completed,
+        )
+        .unwrap();
+}
+
+#[test]
+fn import_rejects_a_provisional_segment_without_writing_anything() {
+    let (_dir, store) = open_temp();
+    let mut provisional = sample_segment(0, 0, 500, "partial");
+    provisional.provisional = true;
+
+    let err = store
+        .import_conversation(
+            &sample_conversation("imported", 0),
+            &[provisional],
+            500,
+            ConversationStatus::Completed,
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ProvisionalSegment { .. }));
+    assert!(store
+        .list_conversations(&ConversationFilter::default())
+        .unwrap()
+        .is_empty());
+}
+
+/// A reaped conversation with no `ended_at` is indistinguishable from a
+/// running one to anything reading the row. The furthest committed segment is
+/// the best evidence of when the recording actually stopped.
+#[test]
+fn reaping_dates_a_conversation_from_its_last_committed_segment() {
+    let (_dir, store) = open_temp();
+    let crashed = store
+        .create_conversation(&sample_conversation("crashed", 1_000))
+        .unwrap();
+    store
+        .append_segments(
+            crashed,
+            &[
+                sample_segment(0, 0, 4_000, "first"),
+                sample_segment(1, 4_000, 9_500, "last"),
+            ],
+        )
+        .unwrap();
+    let empty = store
+        .create_conversation(&sample_conversation(
+            "crashed before anything committed",
+            2_000,
+        ))
+        .unwrap();
+
+    assert_eq!(store.reap_active().unwrap(), 2);
+
+    assert_eq!(
+        store.get_conversation(crashed).unwrap().ended_at,
+        Some(10_500),
+        "started_at plus the furthest end_ms that reached disk"
+    );
+    assert_eq!(
+        store.get_conversation(empty).unwrap().ended_at,
+        Some(2_000),
+        "nothing committed, so it ended when it started"
+    );
+}
+
+#[test]
+fn list_conversations_full_carries_whole_rows_and_honors_every_filter() {
+    let (_dir, store) = open_temp();
+    let group = store.create_group("Work", 0).unwrap();
+    let tag = store.create_tag("urgent", None).unwrap();
+
+    let mut grouped = sample_conversation("Sprint planning", 10);
+    grouped.group = Some(group);
+    grouped.mic_track = true;
+    grouped.voxtype_meeting_id = Some("vx-7".into());
+    let grouped_id = store.create_conversation(&grouped).unwrap();
+    store.add_tag(grouped_id, tag).unwrap();
+    let casual_id = store
+        .create_conversation(&sample_conversation("Casual chat", 20))
+        .unwrap();
+    let standup_id = store
+        .create_conversation(&sample_conversation("Standup", 30))
+        .unwrap();
+
+    // The whole record, not a summary: source, engine, mic track, imported id.
+    let by_group = store
+        .list_conversations_full(&ConversationFilter {
+            group: Some(group),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(by_group.len(), 1);
+    let (conversation, tags) = &by_group[0];
+    assert_eq!(conversation.id, grouped_id);
+    assert_eq!(conversation.source, sample_source());
+    assert_eq!(conversation.engine, sample_engine());
+    assert!(conversation.mic_track);
+    assert_eq!(conversation.voxtype_meeting_id.as_deref(), Some("vx-7"));
+    assert_eq!(conversation.status, ConversationStatus::Active);
+    assert_eq!(tags.len(), 1);
+    assert_eq!(tags[0].name, "urgent");
+
+    let by_tag = store
+        .list_conversations_full(&ConversationFilter {
+            tag: Some(tag),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(by_tag.len(), 1);
+    assert_eq!(by_tag[0].0.id, grouped_id);
+
+    let by_query = store
+        .list_conversations_full(&ConversationFilter {
+            query: Some("Casual".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(by_query.len(), 1);
+    assert_eq!(by_query[0].0.id, casual_id);
+
+    // Newest first, so offset 1 skips the standup.
+    let paged = store
+        .list_conversations_full(&ConversationFilter {
+            limit: Some(1),
+            offset: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(paged.len(), 1);
+    assert_eq!(paged[0].0.id, casual_id);
+
+    let all = store
+        .list_conversations_full(&ConversationFilter::default())
+        .unwrap();
+    let ids: Vec<_> = all.iter().map(|(c, _)| c.id).collect();
+    assert_eq!(ids, vec![standup_id, casual_id, grouped_id]);
+    // Only the tagged conversation has tags; the others get an empty list, not
+    // a missing entry.
+    assert!(all
+        .iter()
+        .all(|(c, tags)| (c.id == grouped_id) == !tags.is_empty()));
+}
+
+/// `Segment::text` is documented as one line. A newline survives to
+/// terminate an SRT/VTT cue early and to break the text export's
+/// one-line-per-segment promise, so the store is where it is normalised.
+#[test]
+fn a_multiline_segment_is_stored_as_a_single_line() {
+    let (_dir, store) = open_temp();
+    let id = store
+        .create_conversation(&sample_conversation("multiline", 0))
+        .unwrap();
+    store
+        .append_segments(
+            id,
+            &[sample_segment(
+                0,
+                0,
+                1_000,
+                "  first part\r\n\r\nsecond part\tthird\n",
+            )],
+        )
+        .unwrap();
+
+    let loaded = store.load_segments(id).unwrap();
+    assert_eq!(loaded[0].text, "first part second part third");
+
+    // The import path carries the same text from voxtype's own exports.
+    let imported = store
+        .import_conversation(
+            &sample_conversation("imported multiline", 0),
+            &[sample_segment(0, 0, 1_000, "line one\nline two")],
+            1_000,
+            ConversationStatus::Completed,
+        )
+        .unwrap();
+    assert_eq!(
+        store.load_segments(imported).unwrap()[0].text,
+        "line one line two"
+    );
+}
+
+/// `source_index` is an `INTEGER` column and a `u32` in the domain. `as u32`
+/// truncates an out-of-range value into a plausible-looking index, and
+/// `parec --monitor-stream=<that>` would record a different application than
+/// the row names.
+#[test]
+fn an_out_of_range_source_index_is_dropped_not_truncated() {
+    let (_dir, store) = open_temp();
+    let id = store
+        .create_conversation(&sample_conversation("sink input", 0))
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE conversations SET source_index = ?1 WHERE id = ?2",
+            rusqlite::params![i64::from(u32::MAX) + 1, id.get()],
+        )
+        .unwrap();
+
+    assert_eq!(
+        store.get_conversation(id).unwrap().source.index,
+        None,
+        "4294967296 must not read back as index 0"
+    );
+}
+
+/// A library whose file or directory lost write permission still holds every
+/// past transcript. Refusing to open it reports a problem that only affects
+/// recording by throwing the archive away.
+struct ReadOnlyLibrary {
+    dir: TempDir,
+    path: PathBuf,
+}
+
+impl ReadOnlyLibrary {
+    /// `None` when the test cannot be run as this user — a process that
+    /// ignores permission bits (root) would see a perfectly writable library.
+    fn new() -> Option<Self> {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("library.db");
+        {
+            let store = Store::open(&path).unwrap();
+            let id = store
+                .create_conversation(&sample_conversation("archived", 1_000))
+                .unwrap();
+            store
+                .append_segments(id, &[sample_segment(0, 0, 2_000, "still readable")])
+                .unwrap();
+            store
+                .finish_conversation(id, 3_000, ConversationStatus::Completed)
+                .unwrap();
+        }
+        set_mode(&path, 0o444);
+        set_mode(dir.path(), 0o555);
+
+        let library = Self { dir, path };
+        if std::fs::File::create(library.dir.path().join("probe")).is_ok() {
+            return None;
+        }
+        Some(library)
+    }
+}
+
+impl Drop for ReadOnlyLibrary {
+    /// Restored so `TempDir`'s own cleanup can still remove the directory.
+    fn drop(&mut self) {
+        set_mode(self.dir.path(), 0o755);
+        for entry in std::fs::read_dir(self.dir.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            set_mode(&entry.path(), 0o644);
+        }
+    }
+}
+
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[test]
+fn a_read_only_library_still_opens_and_reads() {
+    let Some(library) = ReadOnlyLibrary::new() else {
+        eprintln!("skipped: this process ignores file permissions");
+        return;
+    };
+
+    let store = Store::open(&library.path).expect("a read-only library must still open");
+    assert!(store.is_read_only());
+
+    let rows = store
+        .list_conversations_full(&ConversationFilter::default())
+        .unwrap();
+    assert_eq!(rows.len(), 1, "every past transcript is still there");
+    assert_eq!(rows[0].0.title, "archived");
+    assert_eq!(store.load_segments(rows[0].0.id).unwrap().len(), 1);
+    assert_eq!(store.search("readable", 10).unwrap().len(), 1);
+}
+
+#[test]
+fn a_read_only_library_refuses_writes_by_name() {
+    let Some(library) = ReadOnlyLibrary::new() else {
+        eprintln!("skipped: this process ignores file permissions");
+        return;
+    };
+    let store = Store::open(&library.path).unwrap();
+    let existing = store
+        .list_conversations(&ConversationFilter::default())
+        .unwrap()[0]
+        .id;
+
+    for err in [
+        store
+            .create_conversation(&sample_conversation("new", 0))
+            .unwrap_err(),
+        store
+            .append_segments(existing, &[sample_segment(9, 0, 1, "x")])
+            .unwrap_err(),
+        store.rename_conversation(existing, "renamed").unwrap_err(),
+        store.delete_conversation(existing).unwrap_err(),
+        store.reap_active().unwrap_err(),
+        store.create_group("Work", 0).unwrap_err(),
+        store.create_tag("urgent", None).unwrap_err(),
+    ] {
+        assert!(
+            matches!(err, StoreError::ReadOnly { .. }),
+            "expected ReadOnly, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("read-only"),
+            "the message has to name the cause: {err}"
+        );
+    }
 }

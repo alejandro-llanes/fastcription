@@ -38,17 +38,20 @@ pub struct ConversationFilter {
     pub offset: Option<u32>,
 }
 
-/// One row of a conversation list: enough to render without re-fetching the
-/// conversation or its segments.
+/// One row of a conversation list, for a caller that needs no more than a
+/// label and a group.
+///
+/// Deliberately thin. It once carried a duration, a segment count and a
+/// source label; nothing ever read them, and the segment count cost a
+/// correlated `COUNT(*)` over every listed row. A caller that wants the whole
+/// record — source, engine, status, the imported voxtype id — asks
+/// `Store::list_conversations_full` for it instead of paying for aggregates
+/// twice.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConversationSummary {
     pub id: ConversationId,
     pub title: String,
     pub started_at: UnixMillis,
-    /// `None` while the conversation is still active and has no `ended_at`.
-    pub duration_ms: Option<u64>,
-    pub segment_count: u64,
-    pub source_label: String,
     pub group_name: Option<String>,
     pub tags: Vec<fc_core::Tag>,
 }

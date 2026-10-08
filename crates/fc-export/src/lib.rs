@@ -21,6 +21,7 @@ mod timestamp;
 mod vtt;
 
 pub use format::{ExportFormat, ExportOptions};
+pub use json::{ExportError, ImportedExport};
 
 use std::io::{self, Write};
 
@@ -42,6 +43,17 @@ pub fn export(
         ExportFormat::Srt => srt::render(segments, options),
         ExportFormat::Vtt => vtt::render(conversation, segments, options),
     }
+}
+
+/// Reads back a transcript rendered as [`ExportFormat::Json`] with
+/// `metadata` on.
+///
+/// The JSON exporter is the only one of the five whose output is lossless, so
+/// it is the only one that can be parsed. Having it means a transcript file
+/// is a backup and not only a document: a library that was lost, or one on
+/// another machine, can be rebuilt from what the user already exported.
+pub fn parse_json(text: &str) -> Result<ImportedExport, ExportError> {
+    json::parse(text)
 }
 
 /// As [`export`], written straight to `out` instead of returned as a

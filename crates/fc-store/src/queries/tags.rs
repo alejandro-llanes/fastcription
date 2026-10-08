@@ -13,6 +13,7 @@ impl Store {
     /// yet, otherwise returns the existing one. Safe to call every time a user
     /// types a tag name into a picker.
     pub fn create_tag(&self, name: &str, color: Option<&str>) -> Result<TagId> {
+        self.writable("creating a tag")?;
         self.conn.execute(
             "INSERT INTO tags (name, color) VALUES (?1, ?2) ON CONFLICT(name) DO NOTHING",
             params![name, color],
@@ -28,6 +29,7 @@ impl Store {
     }
 
     pub fn rename_tag(&self, id: TagId, new_name: &str) -> Result<()> {
+        self.writable("renaming a tag")?;
         let changed = self.conn.execute(
             "UPDATE tags SET name = ?1 WHERE id = ?2",
             params![new_name, id.get()],
@@ -43,6 +45,7 @@ impl Store {
     /// Cascades to `conversation_tags` via `ON DELETE CASCADE`; conversations
     /// themselves are untouched.
     pub fn delete_tag(&self, id: TagId) -> Result<()> {
+        self.writable("deleting a tag")?;
         let changed = self
             .conn
             .execute("DELETE FROM tags WHERE id = ?1", params![id.get()])?;
@@ -71,6 +74,7 @@ impl Store {
     /// Idempotent: tagging an already-tagged conversation is a no-op, not an
     /// error.
     pub fn add_tag(&self, conversation: ConversationId, tag: TagId) -> Result<()> {
+        self.writable("tagging a conversation")?;
         self.conn.execute(
             "INSERT OR IGNORE INTO conversation_tags (conversation_id, tag_id) VALUES (?1, ?2)",
             params![conversation.get(), tag.get()],
@@ -81,6 +85,7 @@ impl Store {
     /// Idempotent: removing a tag that was not applied is a no-op, not an
     /// error.
     pub fn remove_tag(&self, conversation: ConversationId, tag: TagId) -> Result<()> {
+        self.writable("untagging a conversation")?;
         self.conn.execute(
             "DELETE FROM conversation_tags WHERE conversation_id = ?1 AND tag_id = ?2",
             params![conversation.get(), tag.get()],
