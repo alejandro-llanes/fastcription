@@ -33,9 +33,10 @@ pub struct State {
     pub remote_enabled: bool,
     pub remote_endpoint: String,
     pub remote_model: String,
-    /// Never persisted: egui's storage is a plaintext JSON file in the user's
-    /// config directory, and this is a bearer token. It reaches voxtype
-    /// through the per-session config, which is created 0600.
+    /// Never persisted: egui's storage is a plain-text RON file in the user's
+    /// data directory (`~/.local/share/fastcription/app.ron`), and this is a
+    /// bearer token. It reaches voxtype through the per-session config, which
+    /// is created 0600.
     #[serde(skip)]
     pub remote_api_key: String,
     pub remote_timeout_secs: u32,
@@ -230,6 +231,17 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             .small()
             .color(app.palette.secondary),
         );
+    }
+
+    if ui
+        .small_button(t("Use voxtype's defaults"))
+        .on_hover_text(t(
+            "Reads the engine, model and language from ~/.config/voxtype/config.toml \
+             again. Saved settings otherwise win over that file on every launch.",
+        ))
+        .clicked()
+    {
+        app.reset_engine_to_voxtype();
     }
 
     ui.add_space(8.0);

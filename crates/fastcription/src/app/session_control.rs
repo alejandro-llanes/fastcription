@@ -16,6 +16,29 @@ use crate::i18n::{t, tf};
 use crate::session::{self, Session, SessionConfig};
 
 impl App {
+    /// Re-seeds engine, model and language from voxtype's own configuration.
+    ///
+    /// Those three are seeded from `~/.config/voxtype/config.toml` only on the
+    /// very first launch; after that the saved settings win, which is right
+    /// for a user who changed them here and wrong for one who changed them
+    /// there. This is the way back without deleting the saved settings.
+    pub(super) fn reset_engine_to_voxtype(&mut self) {
+        let defaults = crate::env::voxtype_defaults();
+        let blank = super::settings::State::default();
+        self.settings.engine = defaults.engine.unwrap_or(blank.engine);
+        self.settings.model = defaults.model.unwrap_or(blank.model);
+        self.settings.language = defaults.language.unwrap_or(blank.language);
+        let message = crate::i18n::tf(
+            "Engine set to {} / {} / {} from voxtype's configuration.",
+            &[
+                self.settings.engine.as_str(),
+                self.settings.model.as_str(),
+                self.settings.language.as_str(),
+            ],
+        );
+        self.notify(super::NoticeKind::Info, message);
+    }
+
     pub(super) fn set_state(&mut self, new: SessionState) {
         match (self.state, new) {
             (SessionState::Idle, SessionState::Recording)

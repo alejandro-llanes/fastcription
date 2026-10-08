@@ -316,7 +316,7 @@ impl App {
 
     /// Imports past voxtype meetings into the library, on a thread.
     ///
-    /// Each meeting costs two `voxtype` subprocesses, so a history of fifty is
+    /// Each meeting costs a `voxtype meeting export` subprocess, so fifty is
     /// tens of seconds. Running that inline froze the window for all of it,
     /// which during a meeting also froze the live transcript.
     pub(super) fn import_voxtype_meetings(&mut self) {

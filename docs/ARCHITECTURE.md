@@ -93,10 +93,10 @@ contract — it lives behind one adapter with a test (§7).
 | --- | --- | --- |
 | D1 | **Own the capture, use `voxtype transcribe` per chunk.** Ship this; pursue a live feed upstream in parallel. | Works against the stock package today, puts latency and source selection fully under our control. Measured at 0.78 s per 7 s chunk, so the per-chunk spawn cost that worried us is a non-issue. |
 | D2 | **One selected source by default; the microphone is an opt-in second track.** | `CLAUDE.md` asks for the selected source only. The mic toggle, labelled `You` vs `Remote`, is what makes a transcript a record of a conversation rather than half of one. |
-| D3 | **One window, with a compact mode.** The main window shrinks to a borderless, always-on-top caption bar showing the last few lines and the one being spoken, and restores on a click, Escape or Ctrl+Shift+C. | The first design used a second always-on-top window, an egui *deferred viewport*. Review found it had never worked: the app's repaint requests reach only the root viewport, so after its first frame the overlay never repainted; it synced only on finished utterances, a sentence behind the speaker; and hiding the main window to the tray destroyed it, because a deferred viewport is a child of the root — so the one arrangement a user wants, main window out of the way and captions over the call, was the one that could not exist. Making the main window *be* the caption bar needs no second viewport, repaints correctly for free, and still works with a compositor rule, now matched on the window title. The trade is that hiding to the tray hides the captions too, which is what hiding means. |
+| D3 | **One window, with a compact mode.** The main window shrinks to a borderless, always-on-top caption bar showing the last four committed lines and the one being spoken, and restores on its own **Restore** button, Escape or Ctrl+Shift+C. | The first design used a second always-on-top window, an egui *deferred viewport*. Review found it had never worked: the app's repaint requests reach only the root viewport, so after its first frame the overlay never repainted; it synced only on finished utterances, a sentence behind the speaker; and hiding the main window to the tray destroyed it, because a deferred viewport is a child of the root — so the one arrangement a user wants, main window out of the way and captions over the call, was the one that could not exist. Making the main window *be* the caption bar needs no second viewport, repaints correctly for free, and still works with a compositor rule, now matched on the window title. The trade is that hiding to the tray hides the captions too, which is what hiding means. |
 | D4 | **English transcript now; a second text slot per segment from day one.** | Translation is wired in once the realtime path is proven, without a schema migration. voxtype's `--translate` only goes *into* English, so this is ours to build. The interface shows no control for it: advertising a feature that does nothing is worse than its absence, so the slot and the column exist and nothing in the UI mentions them. |
 | D5 | **Our own SQLite library.** | voxtype's `index.db` has no groups and no tags, and fastcription does not write into another application's database. Past voxtype meetings are imported read-only. |
-| D6 | **Never rewrite `~/.config/voxtype/config.toml`; keep our own config and pass `voxtype -c`.** | The user's file is read for defaults and never modified — they keep ownership of their dictation setup. But voxtype's most valuable knob for this app, `context_window_optimization`, has no command-line flag, and realtime depends on it. `voxtype -c <file>` accepts an arbitrary config, so fastcription writes `~/.config/fastcription/voxtype.toml` and passes it explicitly. That file says in a comment that it is ours and gets overwritten. |
+| D6 | **Never rewrite `~/.config/voxtype/config.toml`; keep our own config and pass `voxtype -c`.** | The user's file is read for defaults and never modified — they keep ownership of their dictation setup. But voxtype's most valuable knob for this app, `context_window_optimization`, has no command-line flag, and realtime depends on it. `voxtype -c <file>` accepts an arbitrary config, so fastcription writes one of its own and passes it explicitly. **One per session**, at `~/.config/fastcription/voxtype-<started_at>.toml`: the running transcriber re-reads its config on every pass, so a single shared file meant that testing a server address mid-meeting silently retargeted the live transcript at it. Written atomically through a `.tmp` sibling and created `0600`, since it can hold a bearer token; removed when the session ends, and stale ones (including the old shared `voxtype.toml`) are swept at startup. The file says in a comment that it is ours and gets overwritten. |
 | D7 | **Segments are persisted as they are committed.** | A crash mid-meeting costs one chunk, not the meeting. This is a deliberate improvement over voxtype's save-on-stop. |
 | D10 | **Transcription may run on another machine, through voxtype's remote mode.** | The model stays resident on a box with a GPU, so a laptop with none gets a large model's accuracy and pays no per-pass load. It needs no new code in the transcription path: voxtype's remote mode speaks the OpenAI audio API, and fastcription already writes the config that selects it. Verified against upstream's `remote.rs` and exercised end to end against a mock server in the test suite. The cost is that audio leaves the machine, which the settings pane warns about, and that each pass uploads the utterance so far — about 32 KB per second of speech. See `docs/SERVER.md`. |
 | D9 | **Re-transcribe the current utterance about once a second and commit words once two consecutive passes agree** (LocalAgreement-2), instead of transcribing disjoint chunks once each. | Chunking meant reading a sentence roughly eight seconds after it was spoken — chunk length plus inference — which is useless for following a live conversation, and it was the first thing testing exposed. Because Whisper pads to 30 s anyway, re-transcribing a growing utterance costs little more than transcribing it once, and the optimisation above pays for the repetition. Measured: 100% of 66 words correct across a 30.4 s six-utterance sample at 23% of one CPU's time, with words appearing ~1.5–2 s behind the speaker. Every pass sees the utterance from its start, so there are no chunk boundaries to lose context across and no overlap to reconcile — this deleted the segmenter and the dedup pass outright. The trade is that a committed word is never revised, so an occasional word commits early and wrong. |
@@ -109,7 +109,7 @@ contract — it lives behind one adapter with a test (§7).
 
 ```
                     ┌──────────────── UI thread (eframe/egui) ────────────────┐
-                    │  live view · history · overlay · settings · export      │
+                    │  live view · history · compact mode · settings · export │
                     └───▲───────────────────────────────┬─────────────────────┘
       Event channel     │                               │  start / pause / stop
    (stable text, the    │                               ▼
@@ -130,7 +130,7 @@ contract — it lives behind one adapter with a test (§7).
           │   speech discarded)              its start               │
           │                                        │                 │
           │  longest common prefix of the last two passes = stable   │
-          │  remainder = unstable tail, shown dimmed, replaced       │
+          │  remainder = unstable tail, shown italic, replaced       │
           │                                                          │
           │  silence ≥ 0.4 s, or 20 s elapsed ──► finalise utterance │
           └─────────────┬────────────────────────────────────────────┘
@@ -187,10 +187,12 @@ pipeline that cannot keep up. The first version of this test measured its own
 drift and read as 1.9 s climbing to 8.7 s. Pace the producer independently.
 
 **What the user sees.** Stable words are append-only and never revised, so the
-transcript does not flicker. The tail of the current pass is shown dimmed and
-replaced on each pass, which is where a word that has not settled yet lives. On
-finalise the whole utterance becomes one committed row and one line in the
-transcript.
+transcript does not flicker. The tail of the current pass is drawn in italics,
+in the palette's `secondary`, and replaced on each pass — that is where a word
+that has not settled yet lives. Italics rather than `dim`, which measured 3:1
+against the panel on a light palette and made the newest words on screen the
+hardest ones to read. On finalise the whole utterance becomes one committed row
+and one line in the transcript.
 
 **What this replaced.** A segmenter that cut disjoint chunks on silence, a
 bounded chunk queue with a growth ladder for backpressure, a separate shorter
@@ -242,7 +244,7 @@ Inside the binary crate:
 ```
 src/
   main.rs            eframe bootstrap; fastframe wiring (log, instance, shell,
-                     tray, update); the single-instance "show" request
+                     tray); the single-instance "show" request
   env.rs             what the app reads from and writes to the machine: the
                      library, capture sources, voxtype's catalog and service
                      state (probed on a thread so the window opens at once),
@@ -251,6 +253,8 @@ src/
                      track, the store handle; the only place that knows how
                      the crates fit together
   theme.rs           the palette, following the Omarchy desktop theme
+  i18n.rs            the seam every user-facing string passes through
+  icons.rs           the Lucide icons the chrome draws, and nothing else
   app/
     mod.rs           the App struct, notices (a short levelled log), what is
                      persisted across launches (settings and the chosen
@@ -261,6 +265,9 @@ src/
                      engine settings, the threaded server probe
     library.rs       conversations, groups, tags, search, export, import
     live.rs          the live transcript
+    readiness.rs     the four things recording needs, and their remedies
+    transcript.rs    one transcript row, shared by the live and history views,
+                     and the clipboard text that goes with it
     sidebar.rs       groups, tags, search box, conversation list
     history.rs       one conversation: rename, group, tags, transcript
     settings.rs      source, microphone, engine, responsiveness, server,
@@ -289,8 +296,10 @@ pub trait Transcriber: Send {
 }
 ```
 
-Implementations: `VoxtypeCli` (ships), `VoxtypeMeeting` (delegation, no live text),
-`VoxtypeLive` (once §8 lands upstream).
+Implementations: `VoxtypeCli`, and only that one. A `VoxtypeMeeting` that
+delegated to meeting mode was removed along with the rest of the meeting-mode
+wrappers (§4) — it could not produce live text, and shipping unreachable code
+is a liability. `VoxtypeLive` arrives if §8 lands upstream.
 
 ---
 
@@ -311,9 +320,15 @@ Enumerated from `pactl -f json list`:
 
 Handling: a sink-input index is not stable across restarts of the producing
 application, so the chosen source is persisted as `(kind, name, description,
-app-binary)` and re-resolved at session start; if it cannot be resolved the UI
-asks rather than silently falling back. Device removal mid-session triggers
-reconnect with a banner, and the session keeps its transcript.
+application)` — the application name taken from `application.name`, falling
+back to `application.process.binary` and then `media.name` — and re-resolved at
+session start; if it cannot be resolved the UI asks rather than silently
+falling back. The picker's own re-selection matches on `(kind, name,
+application)`; resolving a sink input matches on application *and* description
+first, since `media.name` is what tells two streams of one application apart,
+and a tier matching several streams is reported as ambiguous rather than
+resolved by picking one. Device removal mid-session triggers reconnect with a
+banner, and the session keeps its transcript.
 
 > **This machine, right now:** PipeWire exposes only `auto_null` /
 > `auto_null.monitor` despite two HDA cards being present in `/proc/asound/cards`.
@@ -328,28 +343,48 @@ reconnect with a banner, and the session keeps its transcript.
 
 ```sql
 conversations(
-  id INTEGER PRIMARY KEY, title TEXT, group_id INTEGER REFERENCES groups(id),
+  id INTEGER PRIMARY KEY, title TEXT NOT NULL,
+  group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL,
   started_at INTEGER NOT NULL, ended_at INTEGER, status TEXT NOT NULL,
-  source_kind TEXT, source_name TEXT, source_desc TEXT,
-  engine TEXT, model TEXT, language TEXT,
+  source_kind TEXT NOT NULL, source_name TEXT NOT NULL, source_desc TEXT NOT NULL,
+  source_application TEXT, source_index INTEGER,
+  mic_track INTEGER NOT NULL,
+  engine TEXT NOT NULL, model TEXT NOT NULL, language TEXT NOT NULL, backend TEXT,
   voxtype_meeting_id TEXT    -- set only on imported meetings
 )
 segments(
   id INTEGER PRIMARY KEY, conversation_id INTEGER NOT NULL REFERENCES conversations(id)
     ON DELETE CASCADE,
-  seq INTEGER NOT NULL, track TEXT NOT NULL, start_ms INTEGER, end_ms INTEGER,
+  seq INTEGER NOT NULL, track TEXT NOT NULL,
+  start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL,
   text TEXT NOT NULL, translation TEXT, speaker TEXT, confidence REAL
 )
-groups(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_at INTEGER)
-tags(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, color TEXT)
-conversation_tags(conversation_id, tag_id, PRIMARY KEY(conversation_id, tag_id))
-segments_fts  -- FTS5 external-content over segments.text, for search
-schema_version(version INTEGER NOT NULL)
+groups(id INTEGER PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+       created_at INTEGER NOT NULL)
+tags(id INTEGER PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE, color TEXT)
+conversation_tags(conversation_id REFERENCES conversations(id) ON DELETE CASCADE,
+                  tag_id REFERENCES tags(id) ON DELETE CASCADE,
+                  PRIMARY KEY(conversation_id, tag_id))
+segments_fts  -- FTS5 external-content over segments.text, kept in step by triggers
+-- UNIQUE(conversation_id, track, seq): an utterance is appended exactly once,
+-- so a retried append after an ambiguous commit fails loudly instead of
+-- silently duplicating a line in the user's transcript.
 ```
+
+The schema version is SQLite's own `PRAGMA user_version`, not a table. Steps
+are append-only and each runs in its own transaction, so a crash mid-migration
+cannot leave the version ahead of what was applied; a version this build does
+not know is refused rather than opened.
 
 Committed segments are inserted as they arrive (D7). Groups are flat for now; the
 `group_id` column is nullable so nesting can be added later without touching
 `segments`.
+
+A library whose file or directory refuses writes is opened read-only rather
+than reported as a failure: every past transcript stays readable, searchable
+and exportable, and only recording and importing are disabled. Read-only
+*storage* needs a second attempt with SQLite's `immutable=1`, because reading a
+WAL database otherwise means writing a wal-index beside it.
 
 **Export** covers `txt`, `md`, `json`, `srt` and `vtt`. The first three match
 what `voxtype meeting export` produces, so those transcripts are interchangeable
@@ -378,8 +413,12 @@ speaker labels and a metadata header, mirroring voxtype's flags.
   on the runtime `state` file. Note that the live path does *not* need the daemon —
   service control exists for the user's dictation workflow and for meeting-mode
   delegation, as `CLAUDE.md` requires.
-- **Reuse `voxtype-audio-bridge`** for the level meter when the daemon is running;
-  fall back to our own capture-thread peak/RMS otherwise.
+- **The level meter is our own**, peak and RMS computed on the capture thread
+  twenty times a second from the audio already being captured. Reusing
+  `voxtype-audio-bridge` was considered and not done: it reports what the
+  *daemon* hears, which on this design is a different stream from the one
+  fastcription is transcribing, and it needs the daemon running when the live
+  path deliberately does not. Nothing in the app reads `audio.sock`.
 
 ---
 
@@ -404,30 +443,42 @@ about the UI, the store or the export layer depends on which one is active.
 
 ## 9. Dependencies
 
-```toml
-[dependencies]
-eframe      = "…"   # egui + winit, via the fastframe-pinned fork
-egui        = "…"
-rusqlite    = { version = "…", features = ["bundled", "functions"] }
-crossbeam-channel = "…"
-notify      = "…"   # inotify on the voxtype runtime dir
-serde / serde_json
-hound       = "…"   # WAV out for chunk handoff
-anyhow / thiserror
-chrono
+Workspace-wide, by the crate that uses it:
 
-fastframe-theme  = { git = "https://github.com/crmne/fastframe", rev = "bb79dbd" }
-fastframe-fonts  = { git = "…", rev = "bb79dbd" }
-fastframe-text   = { git = "…", rev = "bb79dbd" }
-fastframe-icons  = { git = "…", rev = "bb79dbd" }
-fastframe-log    = { git = "…", rev = "bb79dbd" }
-fastframe-tray   = { git = "…", rev = "bb79dbd" }
-fastframe-shell  = { git = "…", rev = "bb79dbd" }
-fastframe-instance = { git = "…", rev = "bb79dbd" }
-fastframe-scroll = { git = "…", rev = "bb79dbd" }
-fastframe-i18n   = { git = "…", rev = "bb79dbd" }
-fastframe-update = { git = "…", rev = "bb79dbd" }
+```toml
+rusqlite    = { version = "0.40", features = ["bundled"] }   # fc-store
+hound       = "3"      # fc-asr: the WAV each pass hands to voxtype
+notify      = "8"      # fc-voxtype: inotify on the voxtype runtime dir
+toml        = "0.9"    # fc-voxtype read, fastcription write
+time        = "0.3"    # every instant; not chrono
+crossbeam-channel = "0.5"
+serde / serde_json / anyhow / thiserror / tracing / tracing-subscriber
+dirs / tempfile
 ```
+
+The binary, on top of those:
+
+```toml
+eframe      = { version = "0.36.1", features = ["glow", "wayland", "x11", "persistence"] }
+egui        = "0.36.1"   # both via the fastframe-pinned fork
+egui_extras = { version = "0.36.1", features = ["svg"] }
+
+fastframe-log      = { git = "https://github.com/crmne/fastframe", rev = "bb79dbd" }
+fastframe-instance = { git = "…", rev = "bb79dbd" }
+fastframe-fonts    = { git = "…", rev = "bb79dbd" }
+fastframe-text     = { git = "…", rev = "bb79dbd" }
+fastframe-scroll   = { git = "…", rev = "bb79dbd" }
+fastframe-icons    = { git = "…", rev = "bb79dbd" }
+fastframe-theme    = { git = "…", rev = "bb79dbd" }
+fastframe-shell    = { git = "…", rev = "bb79dbd" }
+fastframe-tray     = { git = "…", rev = "bb79dbd" }
+```
+
+`fastframe-i18n` is deliberately absent: it compiles PO catalogs at build time
+and expects `.po` files per locale, which is real localisation work with
+nothing to translate yet. `src/i18n.rs` is the seam for it — every user-facing
+string already passes through one function — not a replacement for it. So is
+`fastframe-update`: there is no release channel to check against.
 
 Nothing in fastframe is published on crates.io yet — pin a revision, not a
 branch, and move it deliberately. The app's root `Cargo.toml` must also carry the
@@ -447,9 +498,9 @@ desktop for free.
 | Risk | Mitigation |
 | --- | --- |
 | voxtype CLI output changes | One adapter, golden test, version check at startup, parse failure is an error |
-| Chunk boundaries cut words | 0.5 s overlap + word-level tail/head dedup; provisional/committed two-tier display |
+| Chunk boundaries cut words | No longer reachable: D9 deleted the chunks. Every pass transcribes the utterance from its start, so there is no boundary to lose context across. The residual risk is the opposite one — a word committed early and never revised — which the settled/unsettled display at least makes visible as it happens |
 | Always-on-top on Wayland | winit gives no layer-shell, so compact mode asks for `WindowLevel::AlwaysOnTop` and relies on a compositor rule matched on the compact title (`docs/OVERLAY.md` has Hyprland, sway and river). Without the rule it is an ordinary window the user keeps in front by hand. |
-| Transcription falls behind on a slow machine or a large model | Bounded queue, growing chunk length, visible indicator; recommend `base.en` or Parakeet; never drop audio |
+| Transcription falls behind on a slow machine or a large model | Unbounded PCM channel on which `push` blocks, so audio waits instead of being dropped; the pass interval stretches to at least the last pass's duration; "transcription behind — words arrive late" in the status bar; `base.en` and `context_window_optimization` on by default; the model can move to another machine (D10) |
 | fastframe API churn ("early, APIs will change") | Pinned revisions; fastframe crates are confined to `main.rs` and the view layer |
 | No usable PipeWire devices on the dev machine | Fix wireplumber before the first capture test (§5) |
 | Sink-input indices are unstable | Persist a resolvable descriptor, re-resolve at start, ask rather than guess |

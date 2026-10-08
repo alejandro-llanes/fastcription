@@ -76,16 +76,20 @@ utterance is about 640 KB per pass. On a wired or decent wireless network that
 is unremarkable; over a slow link, raise **seconds between passes** to trade
 latency for bandwidth.
 
-If an API key is set, it is written into
-`~/.config/fastcription/voxtype.toml`, and that file is then readable only by
-you.
+If an API key is set, it is written into the voxtype config fastcription
+creates for that one session,
+`~/.config/fastcription/voxtype-<session start in ms>.toml`, which is created
+readable only by you and removed when the session ends. It is never written to
+the settings file that remembers the address, the model and the timeout, so the
+key is kept for the session and re-entered next time.
 
 ## When the server is unreachable
 
 The utterance being spoken stays buffered and the pass is retried, so a brief
 outage — a server restart, a moment of bad wireless — costs nothing but a pause
-in the transcript. After three consecutive failures fastcription gives up on
-that utterance, keeps whatever words had already been agreed, reports the error,
-and starts the next one clean. That bound exists so a server that has gone away
-for good cannot hold audio in memory or make every retry upload a larger
-recording.
+in the transcript. After three failed attempts to finish that utterance,
+fastcription gives up on it, keeps whatever words had already been agreed,
+reports the error, and starts the next one clean. That bound exists so a server
+that has gone away for good cannot hold audio in memory; the buffer is also
+capped at **longest utterance in seconds** between attempts, so no retry
+uploads a larger recording than the one before it.

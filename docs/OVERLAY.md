@@ -22,12 +22,16 @@ toggles it, the top bar has a **Compact** button, and `Esc` or the strip's own
 
 ## What the strip shows
 
-The last four committed lines, then the line being spoken. The line being
-spoken is drawn in italics, in the palette's `secondary`, because its tail is
-replaced on every transcription pass and the reader has to be able to tell
-settled words from unsettled ones. It used to be drawn in `dim`, which on a
-light palette measured 3:1 against the panel — below WCAG AA for text, for the
-one audience this application has.
+The last four committed lines, then the line being spoken, in a window 760 ×
+170 points. The line being spoken is drawn in italics, in the palette's
+`secondary`, because its tail is replaced on every transcription pass and the
+reader has to be able to tell settled words from unsettled ones. It used to be
+drawn in `dim`, which on a light palette measured 3:1 against the panel — below
+WCAG AA for text, for the one audience this application has. Before anything
+has been said the strip reads "Waiting for speech…".
+
+Along the foot: the recording clock on the left, the **Restore** button on the
+right.
 
 The size is the **transcript text size** setting, shared with the main
 window's live transcript rather than being compact mode's own. It ranges from
@@ -45,8 +49,10 @@ controls. Nothing else in the strip is a control.
 ## The title is compact mode's, while it is on
 
 The main window retitles itself as the session changes state: `● REC 12:34 —
-fastcription` while recording, `⏸ Paused — fastcription` when paused, plain
-`fastcription` when idle. **None of that happens while compact mode is on.** The
+fastcription` while recording, `⏸ Paused — fastcription` when paused,
+`Finishing — fastcription` while the last of the audio is being transcribed,
+plain `fastcription` when idle. **None of that happens while compact mode is
+on.** The
 title is the compositor rule's only handle on this window, and a title that
 gained a `REC` prefix would float the captions for exactly as long as it took
 the clock to tick over. Leaving compact mode restores whichever state title is

@@ -115,10 +115,32 @@ impl AudioSource {
     /// when that is what distinguishes it.
     pub fn label(&self) -> String {
         match (&self.application, self.description.is_empty()) {
+            // The enumerator already builds a sink input's description as
+            // "App — media title", so prefixing the application again would
+            // read "Zoom — Zoom — ZOOM VoiceIP".
+            (Some(app), false) if self.description.starts_with(app.as_str()) => {
+                self.description.clone()
+            }
             (Some(app), false) => format!("{app} — {}", self.description),
             (Some(app), true) => app.clone(),
             (None, false) => self.description.clone(),
             (None, true) => self.name.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sink_input_label_does_not_repeat_the_application() {
+        let stream = AudioSource::sink_input(41, "Zoom", "Zoom — ZOOM VoiceIP");
+        assert_eq!(stream.label(), "Zoom — ZOOM VoiceIP");
+        let bare = AudioSource::sink_input(42, "Firefox", "Google Meet");
+        assert_eq!(bare.label(), "Firefox — Google Meet");
+        let monitor =
+            AudioSource::named(SourceKind::SinkMonitor, "x.monitor", "Monitor of Speakers");
+        assert_eq!(monitor.label(), "Monitor of Speakers");
     }
 }
