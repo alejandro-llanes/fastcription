@@ -122,6 +122,12 @@ struct UtteranceState {
     /// Set once finalisation has been attempted and failed, so the retry waits
     /// a full interval instead of firing on the very next frame.
     finalize_failed: bool,
+    /// Failed finalisation attempts so far, so a permanently unavailable engine
+    /// cannot keep an utterance buffered for ever.
+    finalize_attempts: u32,
+    /// Everything reported stable for this utterance, kept so that giving up on
+    /// finalisation can still surface the words that were already agreed.
+    stable_text: Vec<String>,
     /// The previous pass's full hypothesis (original casing), for
     /// LocalAgreement-2 comparison against the next one.
     prev_words: Vec<String>,
@@ -138,6 +144,8 @@ impl UtteranceState {
             silence_run_ms: 0,
             samples_since_pass: 0,
             finalize_failed: false,
+            finalize_attempts: 0,
+            stable_text: Vec::new(),
             prev_words: Vec::new(),
             stable_count: 0,
         }
@@ -359,9 +367,9 @@ impl<T: Transcriber> TranscriptStream<T> {
         // a later hypothesis disagrees (the module doc's deliberate trade).
         let agreed = lcp.max(utt.stable_count).min(new_words.len());
         if agreed > utt.stable_count {
-            merge
-                .stable_parts
-                .push(new_words[utt.stable_count..agreed].join(" "));
+            let words = new_words[utt.stable_count..agreed].join(" ");
+            utt.stable_text.push(words.clone());
+            merge.stable_parts.push(words);
             utt.stable_count = agreed;
         }
         let tail_start = utt.stable_count.min(new_words.len());
@@ -402,6 +410,29 @@ impl<T: Transcriber> TranscriptStream<T> {
             Err(err) => {
                 merge.error = Some(err.to_string());
                 let mut utt = utt;
+                utt.finalize_attempts += 1;
+
+                if utt.finalize_attempts >= MAX_FINALIZE_ATTEMPTS {
+                    // Giving up matters most when the engine is a server on
+                    // another machine: keeping the utterance buffered would grow
+                    // memory and make every retry upload a larger recording,
+                    // for ever. Surface the words already agreed, drop the rest,
+                    // and start the next utterance clean. The error goes with it,
+                    // so this is never silent.
+                    let text = utt.stable_text.join(" ").trim().to_string();
+                    if !text.is_empty() {
+                        let start_ms = samples_to_ms(utt.start_samples);
+                        let end_ms = samples_to_ms(utt.start_samples + utt.buf.len() as u64);
+                        merge.finished = Some(Utterance {
+                            text,
+                            start_ms,
+                            end_ms,
+                        });
+                    }
+                    merge.unstable = Some(String::new());
+                    return None;
+                }
+
                 // Wait an interval before trying again: a persistently broken
                 // engine would otherwise be re-invoked on every frame.
                 utt.finalize_failed = true;
@@ -429,6 +460,11 @@ impl<T: Transcriber> TranscriptStream<T> {
         None
     }
 }
+
+/// How many times finalising an utterance may fail before the stream gives up
+/// on it. Three is enough to ride out a transient failure — a server restart, a
+/// momentary network drop — without letting a lasting one pin audio in memory.
+const MAX_FINALIZE_ATTEMPTS: u32 = 3;
 
 /// Joins every returned segment's text into one hypothesis string. Real
 /// adapters return at most one segment today, but a `Transcriber` is free to
@@ -970,6 +1006,64 @@ mod tests {
         let ok = stream.push(&silence(200)).expect("a retried finalisation");
         assert!(ok.error.is_none(), "the retry should have succeeded");
         assert!(ok.finished.is_some(), "the utterance should now finalise");
+    }
+
+    /// An engine that never recovers — a transcription server that has gone
+    /// away — must not pin audio in memory for the rest of the meeting, and
+    /// must not make every retry upload a bigger recording.
+    #[test]
+    fn a_permanently_broken_engine_gives_up_and_keeps_what_was_agreed() {
+        let cfg = StreamConfig {
+            step: Duration::from_millis(40),
+            silence_hold: Duration::from_millis(40),
+            max_utterance: Duration::from_millis(10_000),
+            min_utterance: Duration::from_millis(20),
+            silence_rms: 0.01,
+        };
+        // Two agreeing passes make "hello world" stable, then the engine dies.
+        let engine = ScriptedTranscriber::new(vec![
+            Script::Hyp("hello world"),
+            Script::Hyp("hello world"),
+            Script::Err("server gone"),
+            Script::Err("server gone"),
+            Script::Err("server gone"),
+            Script::Err("server gone"),
+        ]);
+        let invocations = engine.counter();
+        let mut stream = TranscriptStream::new(engine, cfg);
+
+        stream.push(&tone(0.5, 40));
+        stream.push(&tone(0.5, 40));
+
+        // Now silence, so it tries to finalise, and keeps failing.
+        let mut finished = None;
+        for _ in 0..60 {
+            if let Some(update) = stream.push(&silence(40)) {
+                if update.finished.is_some() {
+                    finished = update.finished;
+                    break;
+                }
+            }
+        }
+
+        let finished = finished.expect("the stream must give up rather than retry for ever");
+        assert_eq!(
+            finished.text, "hello world",
+            "the words already agreed must survive giving up"
+        );
+        assert!(
+            invocations.load(Ordering::SeqCst) <= 6,
+            "giving up must bound the attempts, saw {}",
+            invocations.load(Ordering::SeqCst)
+        );
+
+        // The buffer was reset, so the next utterance starts clean rather than
+        // carrying the abandoned audio.
+        let next = stream.push(&tone(0.5, 40));
+        assert!(
+            next.is_none() || next.unwrap().finished.is_none(),
+            "a fresh utterance must not immediately finalise the old audio"
+        );
     }
 
     #[test]

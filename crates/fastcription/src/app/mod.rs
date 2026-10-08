@@ -480,12 +480,7 @@ impl App {
 
         // Written per session so the engine always runs with what the settings
         // pane currently says, including the optimisation realtime depends on.
-        let voxtype_config = match crate::env::write_private_config(
-            &self.settings.model,
-            &self.settings.language,
-            self.settings.threads,
-            self.settings.fast_mode,
-        ) {
+        let voxtype_config = match crate::env::write_private_config(&self.engine_settings()) {
             Ok(path) => Some(path),
             Err(err) => {
                 self.raise(format!(
@@ -986,6 +981,70 @@ impl App {
                 self.raise(message);
             }
             Err(err) => self.raise(err),
+        }
+    }
+
+    /// Where transcription should run, as the settings pane has it.
+    fn engine_settings(&self) -> crate::env::EngineSettings {
+        crate::env::EngineSettings {
+            model: self.settings.model.clone(),
+            language: self.settings.language.clone(),
+            threads: self.settings.threads.max(1),
+            fast_mode: self.settings.fast_mode,
+            remote: (self.settings.remote_enabled
+                && !self.settings.remote_endpoint.trim().is_empty())
+            .then(|| crate::env::RemoteEngine {
+                endpoint: self.settings.remote_endpoint.clone(),
+                model: self.settings.remote_model.clone(),
+                api_key: self.settings.remote_api_key.clone(),
+                timeout_secs: self.settings.remote_timeout_secs,
+            }),
+        }
+    }
+
+    /// Transcribes a moment of silence through the configured server, so a
+    /// wrong address or a missing key is found now rather than during a
+    /// meeting. Goes through voxtype rather than a bare HTTP request, so it
+    /// exercises the real path: the endpoint, the multipart body and the token.
+    fn probe_transcription_server(&mut self) {
+        self.settings.remote_probe = Some(self.probe_server_inner());
+    }
+
+    fn probe_server_inner(&self) -> Result<String, String> {
+        let Some(binary) = self.voxtype.clone() else {
+            return Err("voxtype was not found on PATH".to_owned());
+        };
+        if self.settings.remote_endpoint.trim().is_empty() {
+            return Err("Enter the server's address first".to_owned());
+        }
+
+        let config = crate::env::write_private_config(&self.engine_settings())
+            .map_err(|err| format!("Could not write the settings: {err}"))?;
+        let probe = crate::env::write_probe_wav().map_err(|err| err.to_string())?;
+
+        let started = std::time::Instant::now();
+        let output = std::process::Command::new(&binary)
+            .arg("-c")
+            .arg(&config)
+            .arg("-q")
+            .arg("transcribe")
+            .arg(probe.path())
+            .output()
+            .map_err(|err| format!("Could not run voxtype: {err}"))?;
+
+        if output.status.success() {
+            Ok(format!("Reached the server in {:?}", started.elapsed()))
+        } else {
+            // voxtype puts the reason on stderr; the last line is the useful one.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let reason = stderr
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("no reason given")
+                .trim()
+                .to_owned();
+            Err(reason)
         }
     }
 

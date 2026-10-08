@@ -25,8 +25,16 @@ pub struct State {
     /// voxtype's `context_window_optimization`: two to nearly three times
     /// faster under 22.5 seconds, which is what makes realtime possible.
     pub fast_mode: bool,
-    /// CPU threads for inference.
+    /// CPU threads for inference. Ignored when a server does the work.
     pub threads: u32,
+    /// Send audio to a transcription server instead of running the model here.
+    pub remote_enabled: bool,
+    pub remote_endpoint: String,
+    pub remote_model: String,
+    pub remote_api_key: String,
+    pub remote_timeout_secs: u32,
+    /// The result of the last connection test, shown next to the button.
+    pub remote_probe: Option<Result<String, String>>,
 }
 
 impl Default for State {
@@ -39,6 +47,12 @@ impl Default for State {
             max_utterance_secs: 20.0,
             fast_mode: true,
             threads: crate::env::default_threads(),
+            remote_enabled: false,
+            remote_endpoint: String::new(),
+            remote_model: "whisper-1".to_owned(),
+            remote_api_key: String::new(),
+            remote_timeout_secs: 30,
+            remote_probe: None,
         }
     }
 }
@@ -64,6 +78,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
 
     ui.add_space(8.0);
     ui.label(t("Transcription"));
+    ui.add_enabled_ui(!app.settings.remote_enabled, |ui| {
     ui.horizontal(|ui| {
         ui.label(t("Engine"));
         combo(ui, "engine", &mut app.settings.engine, &app.engines);
@@ -90,6 +105,76 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             "whisper.cpp stops getting faster past about eight threads for the \
              small English models.",
         ));
+    });
+
+    ui.add_space(8.0);
+    ui.label(t("Transcription server"));
+    ui.checkbox(
+        &mut app.settings.remote_enabled,
+        t("Run the model on another computer"),
+    )
+    .on_hover_text(t(
+        "Sends each pass to an OpenAI-compatible transcription server. The \
+         model stays loaded there, so a machine with a GPU can serve one \
+         without, and no pass pays to load the model.",
+    ));
+    ui.add_enabled_ui(app.settings.remote_enabled, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(t("Address"));
+            ui.add(
+                egui::TextEdit::singleline(&mut app.settings.remote_endpoint)
+                    .desired_width(240.0)
+                    .hint_text("http://desktop.lan:8080"),
+            );
+            ui.label(t("Model"));
+            ui.add(
+                egui::TextEdit::singleline(&mut app.settings.remote_model)
+                    .desired_width(130.0)
+                    .hint_text("whisper-1"),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label(t("API key"));
+            ui.add(
+                egui::TextEdit::singleline(&mut app.settings.remote_api_key)
+                    .desired_width(240.0)
+                    .password(true)
+                    .hint_text(t("optional")),
+            );
+            ui.add(
+                egui::Slider::new(&mut app.settings.remote_timeout_secs, 5..=120)
+                    .text(t("timeout s")),
+            );
+        });
+        ui.horizontal(|ui| {
+            if ui.button(t("Test connection")).clicked() {
+                app.probe_transcription_server();
+            }
+            match &app.settings.remote_probe {
+                Some(Ok(text)) => ui.colored_label(app.palette.accent, text.clone()),
+                Some(Err(text)) => ui.colored_label(app.palette.danger, text.clone()),
+                None => ui.label(
+                    egui::RichText::new(t("not tested"))
+                        .small()
+                        .color(app.palette.secondary),
+                ),
+            };
+        });
+        if app.settings.remote_endpoint.starts_with("http://")
+            && !app.settings.remote_endpoint.contains("localhost")
+            && !app.settings.remote_endpoint.contains("127.0.0.1")
+        {
+            ui.label(
+                egui::RichText::new(t(
+                    "This address is not encrypted, so the audio crosses the \
+                     network in the clear. Fine on a network you trust; use a \
+                     tunnel otherwise.",
+                ))
+                .small()
+                .color(app.palette.warning),
+            );
+        }
+    });
     if let Some(backend) = app.engine.backend.as_deref() {
         ui.label(
             egui::RichText::new(format!("{} {backend}", t("Acceleration:")))

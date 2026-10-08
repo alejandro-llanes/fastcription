@@ -22,7 +22,10 @@ sit in a meeting and read what is being said, as it is said.
 - **Imports past voxtype meetings** recorded by voxtype's own meeting mode.
 - **Starts and stops the voxtype systemd user service** from the UI.
 
-Everything runs locally. Audio does not leave the machine.
+Everything runs locally by default. Audio does not leave the machine unless you
+point it at a transcription server yourself — see
+[docs/SERVER.md](docs/SERVER.md), which is how a desktop with a GPU can do the
+work for a laptop without one.
 
 ## Requirements
 

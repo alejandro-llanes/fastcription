@@ -716,29 +716,62 @@ esac
     }
 }
 
+/// Where transcription runs and with what.
+pub struct EngineSettings {
+    pub model: String,
+    pub language: String,
+    pub threads: u32,
+    pub fast_mode: bool,
+    /// Set to send audio to a transcription server instead of running the model
+    /// on this machine.
+    pub remote: Option<RemoteEngine>,
+}
+
+/// An OpenAI-compatible transcription server, which is what voxtype's remote
+/// mode speaks: it POSTs the audio to `{endpoint}/v1/audio/transcriptions` as
+/// multipart form data.
+///
+/// Useful when the model should run somewhere else — a desktop with a GPU
+/// serving a laptop that has none. The model stays resident there, so no pass
+/// pays to load it.
+pub struct RemoteEngine {
+    pub endpoint: String,
+    /// The model name to ask the server for, e.g. `whisper-1` or whatever that
+    /// server calls the model it has loaded.
+    pub model: String,
+    /// Optional bearer token. Stored in the config file, which is why that file
+    /// is written user-only whenever a key is present.
+    pub api_key: String,
+    pub timeout_secs: u32,
+}
+
 /// fastcription's own voxtype configuration file.
 ///
 /// Decision D6 says the user's `~/.config/voxtype/config.toml` is never
-/// rewritten, and it still is not. But voxtype's most valuable knob for this
-/// app has no command-line flag: `context_window_optimization` makes clips
-/// under 22.5 seconds transcribe two to nearly three times faster, measured on
-/// this machine as 0.75s to 0.28s for a 7 second window. Realtime depends on
-/// it.
+/// rewritten, and it still is not. But voxtype's two most valuable settings for
+/// this app have no command-line flag: `context_window_optimization`, which
+/// makes clips under 22.5 seconds two to nearly three times faster (0.75s to
+/// 0.28s for a 7 second window on this machine), and remote mode. Realtime
+/// depends on the first and running the model elsewhere depends on the second.
 ///
 /// `voxtype -c <file>` accepts an arbitrary config, so fastcription keeps its
 /// own and passes it explicitly. The user's file is read for defaults and never
 /// touched; this one is ours to overwrite, and says so in a comment for anyone
 /// who finds it.
-pub fn write_private_config(
-    model: &str,
-    language: &str,
-    threads: u32,
-    fast_mode: bool,
-) -> Result<PathBuf, String> {
+pub fn write_private_config(settings: &EngineSettings) -> Result<PathBuf, String> {
     let dir = dirs::config_dir()
         .ok_or("no configuration directory")?
         .join("fastcription");
-    std::fs::create_dir_all(&dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+    write_private_config_in(&dir, settings)
+}
+
+/// The body of [`write_private_config`], with the directory given rather than
+/// discovered, so tests do not contend over one real path.
+pub fn write_private_config_in(
+    dir: &Path,
+    settings: &EngineSettings,
+) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
     let path = dir.join("voxtype.toml");
 
     let mut body = String::from(
@@ -749,19 +782,72 @@ pub fn write_private_config(
          # this file to `voxtype -c` instead.\n\n\
          [whisper]\n",
     );
-    if !model.trim().is_empty() {
-        body.push_str(&format!("model = {}\n", toml_string(model)));
+
+    match &settings.remote {
+        Some(remote) => {
+            body.push_str("mode = \"remote\"\n");
+            body.push_str(&format!(
+                "remote_endpoint = {}\n",
+                toml_string(remote.endpoint.trim())
+            ));
+            if !remote.model.trim().is_empty() {
+                body.push_str(&format!(
+                    "remote_model = {}\n",
+                    toml_string(remote.model.trim())
+                ));
+            }
+            if !remote.api_key.trim().is_empty() {
+                body.push_str(&format!(
+                    "remote_api_key = {}\n",
+                    toml_string(remote.api_key.trim())
+                ));
+            }
+            body.push_str(&format!(
+                "remote_timeout_secs = {}\n",
+                remote.timeout_secs.max(1)
+            ));
+            if !settings.language.trim().is_empty() {
+                body.push_str(&format!(
+                    "language = {}\n",
+                    toml_string(&settings.language)
+                ));
+            }
+        }
+        None => {
+            if !settings.model.trim().is_empty() {
+                body.push_str(&format!("model = {}\n", toml_string(&settings.model)));
+            }
+            if !settings.language.trim().is_empty() {
+                body.push_str(&format!(
+                    "language = {}\n",
+                    toml_string(&settings.language)
+                ));
+            }
+            // The reason this file exists. Only meaningful for a local model.
+            body.push_str(&format!(
+                "context_window_optimization = {}\n",
+                settings.fast_mode
+            ));
+            body.push_str(&format!("threads = {}\n", settings.threads.max(1)));
+        }
     }
-    if !language.trim().is_empty() {
-        body.push_str(&format!("language = {}\n", toml_string(language)));
-    }
-    // The whole reason this file exists. Exposed as a setting because the
-    // optimisation can change a word here and there, and upstream warns it can
-    // make large models repeat themselves.
-    body.push_str(&format!("context_window_optimization = {fast_mode}\n"));
-    body.push_str(&format!("threads = {}\n", threads.max(1)));
 
     std::fs::write(&path, body).map_err(|err| format!("{}: {err}", path.display()))?;
+
+    // A bearer token in a world-readable file would be a quiet mistake.
+    let has_secret = settings
+        .remote
+        .as_ref()
+        .is_some_and(|remote| !remote.api_key.trim().is_empty());
+    if has_secret {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(err) =
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        {
+            tracing::warn!(%err, "could not restrict permissions on the config holding the API key");
+        }
+    }
+
     Ok(path)
 }
 
@@ -795,7 +881,7 @@ pub fn default_threads() -> u32 {
 
 #[cfg(test)]
 mod config_tests {
-    use super::{toml_string, write_private_config};
+    use super::{toml_string, write_private_config_in, EngineSettings};
 
     /// The model and language come from text fields, so a value containing a
     /// quote must not be able to close the string and inject another key.
@@ -813,11 +899,15 @@ mod config_tests {
     /// parse as the TOML voxtype expects.
     #[test]
     fn the_written_config_enables_the_optimisation_and_parses() {
-        let path = match write_private_config("base.en", "en", 8, true) {
-            Ok(path) => path,
-            // A sandbox with no config directory is not a test failure.
-            Err(_) => return,
+        let settings = EngineSettings {
+            model: "base.en".into(),
+            language: "en".into(),
+            threads: 8,
+            fast_mode: true,
+            remote: None,
         };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_private_config_in(dir.path(), &settings).expect("write");
         let body = std::fs::read_to_string(&path).expect("read back");
         assert!(body.contains("context_window_optimization = true"));
         assert!(body.contains("threads = 8"));
@@ -827,6 +917,220 @@ mod config_tests {
         assert_eq!(
             whisper.get("context_window_optimization").and_then(|v| v.as_bool()),
             Some(true)
+        );
+    }
+}
+
+/// Half a second of silence as a 16 kHz mono WAV, for probing a transcription
+/// server. Written by hand rather than pulling in a WAV crate for forty-four
+/// bytes of header.
+pub fn write_probe_wav() -> std::io::Result<tempfile::NamedTempFile> {
+    use std::io::Write;
+    const RATE: u32 = 16_000;
+    let frames = RATE / 2;
+    let data_len = frames * 2;
+
+    let mut file = tempfile::Builder::new()
+        .prefix("fastcription-probe")
+        .suffix(".wav")
+        .tempfile()?;
+    let w = file.as_file_mut();
+    w.write_all(b"RIFF")?;
+    w.write_all(&(36 + data_len).to_le_bytes())?;
+    w.write_all(b"WAVEfmt ")?;
+    w.write_all(&16u32.to_le_bytes())?;
+    w.write_all(&1u16.to_le_bytes())?;
+    w.write_all(&1u16.to_le_bytes())?;
+    w.write_all(&RATE.to_le_bytes())?;
+    w.write_all(&(RATE * 2).to_le_bytes())?;
+    w.write_all(&2u16.to_le_bytes())?;
+    w.write_all(&16u16.to_le_bytes())?;
+    w.write_all(b"data")?;
+    w.write_all(&data_len.to_le_bytes())?;
+    w.write_all(&vec![0u8; data_len as usize])?;
+    w.flush()?;
+    Ok(file)
+}
+
+#[cfg(test)]
+mod remote_config_tests {
+    use super::{write_private_config_in, EngineSettings, RemoteEngine};
+
+    fn settings(api_key: &str) -> EngineSettings {
+        EngineSettings {
+            model: "base.en".into(),
+            language: "en".into(),
+            threads: 8,
+            fast_mode: true,
+            remote: Some(RemoteEngine {
+                endpoint: "http://desktop.lan:8080".into(),
+                model: "whisper-1".into(),
+                api_key: api_key.into(),
+                timeout_secs: 30,
+            }),
+        }
+    }
+
+    /// Remote mode and local mode are mutually exclusive in voxtype's config:
+    /// writing a local `model` alongside `mode = "remote"` would be ambiguous
+    /// about which the engine should use.
+    #[test]
+    fn remote_mode_writes_the_server_and_omits_the_local_model() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_private_config_in(dir.path(), &settings("")).expect("write");
+        let body = std::fs::read_to_string(&path).expect("read back");
+        assert!(body.contains("mode = \"remote\""));
+        assert!(body.contains("remote_endpoint = \"http://desktop.lan:8080\""));
+        assert!(body.contains("remote_model = \"whisper-1\""));
+        assert!(body.contains("remote_timeout_secs = 30"));
+        assert!(
+            !body.contains("\nmodel = "),
+            "a local model must not be written in remote mode: {body}"
+        );
+        assert!(
+            !body.contains("context_window_optimization"),
+            "the local optimisation is meaningless against a server: {body}"
+        );
+        let _: toml::Value = toml::from_str(&body).expect("valid TOML");
+    }
+
+    /// A bearer token in a world-readable file would be a quiet mistake.
+    #[test]
+    fn a_config_holding_an_api_key_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path =
+            write_private_config_in(dir.path(), &settings("secret-token")).expect("write");
+        let body = std::fs::read_to_string(&path).expect("read back");
+        assert!(body.contains("remote_api_key = \"secret-token\""));
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "config with a key must be user-only");
+
+        // Writing again without a key must not leave the old one behind.
+        write_private_config_in(dir.path(), &settings("")).expect("rewrite");
+        let body = std::fs::read_to_string(&path).expect("read back");
+        assert!(!body.contains("secret-token"), "a removed key must be gone");
+    }
+}
+
+#[cfg(test)]
+mod remote_path_tests {
+    use super::{write_private_config_in, EngineSettings, RemoteEngine};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// A minimal stand-in for an OpenAI-compatible transcription server.
+    ///
+    /// Returns the port it listens on and what the one request it serves
+    /// contained, so the test can assert fastcription's config made voxtype
+    /// speak the protocol a real server expects.
+    fn serve_once(reply: &'static str) -> (u16, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            // Read headers, then exactly as many body bytes as declared.
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 8192];
+            let mut header_end = None;
+            while header_end.is_none() {
+                let n = sock.read(&mut buf).expect("read");
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                header_end = raw.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4);
+            }
+            let header_end = header_end.unwrap_or(raw.len());
+            let headers = String::from_utf8_lossy(&raw[..header_end]).to_string();
+            let declared: usize = headers
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                .and_then(|l| l.split(':').nth(1)?.trim().parse().ok())
+                .unwrap_or(0);
+            while raw.len() - header_end < declared {
+                let n = sock.read(&mut buf).expect("read body");
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+            }
+            let body = String::from_utf8_lossy(&raw[header_end..]).to_string();
+
+            let payload = format!("{{\"text\":\"{reply}\"}}");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            sock.write_all(response.as_bytes()).expect("respond");
+            let _ = sock.flush();
+            format!("{headers}\n--BODY--\n{body}")
+        });
+        (port, handle)
+    }
+
+    /// Proves the whole remote path without a GPU anywhere: the config
+    /// fastcription writes makes voxtype POST the audio to an
+    /// OpenAI-compatible endpoint and hand the server's answer back as the
+    /// transcript.
+    #[test]
+    #[ignore = "needs the voxtype binary"]
+    fn a_transcription_server_is_reached_through_the_config_we_write() {
+        let Some(binary) = fc_voxtype::cli::find_binary() else {
+            return;
+        };
+        let (port, server) = serve_once("the server answered");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = EngineSettings {
+            model: "base.en".into(),
+            language: "en".into(),
+            threads: 8,
+            fast_mode: true,
+            remote: Some(RemoteEngine {
+                endpoint: format!("http://127.0.0.1:{port}"),
+                model: "whisper-1".into(),
+                api_key: "probe-token".into(),
+                timeout_secs: 30,
+            }),
+        };
+        let config = write_private_config_in(dir.path(), &settings).expect("write config");
+        let probe = super::write_probe_wav().expect("probe wav");
+
+        let output = std::process::Command::new(&binary)
+            .arg("-c")
+            .arg(&config)
+            .arg("-q")
+            .arg("transcribe")
+            .arg(probe.path())
+            .output()
+            .expect("run voxtype");
+        assert!(
+            output.status.success(),
+            "voxtype failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let request = server.join().expect("server thread");
+        assert!(
+            request.contains("POST /v1/audio/transcriptions"),
+            "expected the OpenAI transcription endpoint, got:\n{}",
+            request.lines().next().unwrap_or_default()
+        );
+        assert!(
+            request.contains("Authorization: Bearer probe-token"),
+            "the API key must be sent"
+        );
+        assert!(request.contains("multipart/form-data"));
+        assert!(request.contains("name=\"file\""), "the audio must be attached");
+        assert!(request.contains("RIFF"), "the attachment must be a WAV");
+        assert!(request.contains("name=\"model\""));
+
+        let transcript = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            transcript.contains("the server answered"),
+            "the server's text must come back as the transcript, got: {transcript}"
         );
     }
 }
