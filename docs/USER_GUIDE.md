@@ -232,7 +232,11 @@ None of it is a control:
   choice already made; the control that makes it is in the top bar.
 - **transcription behind** — a chip, and only while transcription cannot keep
   up. See section 18.
-- **voxtype** — the daemon's state, as a chip on the right.
+- **voxtype** — the daemon's state, as a chip on the right. Hidden while a
+  transcription server is in use: the daemon's state then says nothing about
+  what is transcribing, and a chip reading "stopped" beside a transcript that
+  is arriving fine only invites you to start something you do not need. The
+  Start/Stop controls stay under **Settings → System**.
 - **"transcription behind — words arrive late"** — appears only while
   transcription cannot keep up, that is while one pass takes longer than the
   **seconds between passes** setting. No audio is lost when this shows; the

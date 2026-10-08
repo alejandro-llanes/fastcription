@@ -894,9 +894,17 @@ impl App {
                     );
                 }
 
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    service_pill(ui, &palette, self.voxtype_service);
-                });
+                // The daemon's state is for someone whose transcription runs
+                // on this machine. With a server doing the work it answers a
+                // question nobody on this window is asking, and a chip that
+                // reads "stopped" beside a transcript that is arriving fine
+                // only invites them to go and start something they do not
+                // need. The Start/Stop controls stay under Settings → System.
+                if !self.settings.remote_enabled {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        service_pill(ui, &palette, self.voxtype_service);
+                    });
+                }
             });
         });
     }
