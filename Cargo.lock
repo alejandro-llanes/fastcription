@@ -1000,7 +1000,7 @@ checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
 name = "fastcription"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1141,7 +1141,7 @@ checksum = "caf1079563223d5d59d83c85886a56e586cfd5c1a26292e971a0fa266531ac5a"
 
 [[package]]
 name = "fc-asr"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fc-core",
  "hound",
@@ -1151,7 +1151,7 @@ dependencies = [
 
 [[package]]
 name = "fc-audio"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crossbeam-channel",
  "fc-core",
@@ -1163,7 +1163,7 @@ dependencies = [
 
 [[package]]
 name = "fc-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -1172,7 +1172,7 @@ dependencies = [
 
 [[package]]
 name = "fc-export"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fc-core",
  "serde",
@@ -1183,7 +1183,7 @@ dependencies = [
 
 [[package]]
 name = "fc-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dirs",
  "fc-core",
@@ -1195,7 +1195,7 @@ dependencies = [
 
 [[package]]
 name = "fc-voxtype"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crossbeam-channel",
  "dirs",
