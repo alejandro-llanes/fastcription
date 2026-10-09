@@ -554,9 +554,11 @@ The service pill combines two signals, because neither alone is enough.
 `systemctl` knows whether the unit is active but says nothing until asked; the
 daemon's runtime state file changes the instant it does something but does not
 exist while the daemon is stopped. So an inotify watch turns any daemon
-activity into an immediate re-check, and a slow poll catches the unit being
-started or stopped from outside fastcription — every 15 seconds with the watch
-working, every 3 without. A daemon started by hand counts as running even when
+activity into a re-check a tenth of a second later — one for the whole burst,
+since a single state change is several filesystem events — and a slow poll
+catches the unit being started or stopped from outside fastcription: every
+15 seconds with the watch working, every 3 without. Reading the state file is
+not activity; only writes are. A daemon started by hand counts as running even when
 `systemctl` reports the unit absent.
 
 Every probe fails on its own and says so. A missing model does not hide a found

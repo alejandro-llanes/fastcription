@@ -16,7 +16,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
-use notify::{Event, RecursiveMode, Watcher};
+use notify::event::{AccessKind, AccessMode};
+use notify::{Event, EventKind, RecursiveMode, Watcher};
 
 use crate::error::{Result, VoxtypeError};
 
@@ -121,8 +122,29 @@ pub enum RuntimeUpdate {
     MeetingEnded,
 }
 
+/// The receiving end of [`watch`]: a [`Receiver`] of updates that is also the
+/// watcher thread's reason to keep running. Dropping it stops the thread within
+/// about [`IDLE_TICK`], whether or not the daemon ever writes again.
+pub struct Updates {
+    updates: Receiver<RuntimeUpdate>,
+    /// Never sent on. The thread holds the other end and asks it on every idle
+    /// tick whether this side is gone -- the only way a sender can learn that
+    /// its receiver was dropped without having something to send. The updates
+    /// channel alone could not tell it: a daemon that has stopped writes
+    /// nothing more, so there would be nothing to send, for ever.
+    _alive: Sender<()>,
+}
+
+impl std::ops::Deref for Updates {
+    type Target = Receiver<RuntimeUpdate>;
+
+    fn deref(&self) -> &Receiver<RuntimeUpdate> {
+        &self.updates
+    }
+}
+
 /// Spawns a background thread that watches `paths` and sends
-/// [`RuntimeUpdate`]s until the returned [`Receiver`] is dropped.
+/// [`RuntimeUpdate`]s until the returned [`Updates`] is dropped.
 ///
 /// The thread owns the `notify` watcher for its whole lifetime and stops within
 /// about [`IDLE_TICK`] of the receiver being dropped — it has to be able to
@@ -136,7 +158,7 @@ pub enum RuntimeUpdate {
 /// restart voxtype` with `RuntimeDirectory=` does exactly that), and an inotify
 /// watch on a removed directory is simply blind — it reports nothing about the
 /// new one, for ever.
-pub fn watch(paths: RuntimePaths) -> Result<Receiver<RuntimeUpdate>> {
+pub fn watch(paths: RuntimePaths) -> Result<Updates> {
     let (raw_tx, raw_rx) = crossbeam_channel::unbounded::<notify::Result<Event>>();
     let mut watcher = notify::recommended_watcher(raw_tx)?;
 
@@ -155,15 +177,19 @@ pub fn watch(paths: RuntimePaths) -> Result<Receiver<RuntimeUpdate>> {
     }
 
     let (tx, rx) = crossbeam_channel::unbounded();
+    let (alive_tx, alive_rx) = crossbeam_channel::bounded::<()>(0);
     // Named so that "this thread exited when its receiver was dropped" is
     // something a test can actually check: `watch` hands back a receiver, not a
     // join handle. Under 15 characters, which is all `/proc/*/comm` keeps.
     std::thread::Builder::new()
         .name("fc-vox-runtime".into())
-        .spawn(move || run_watch_loop(watcher, raw_rx, tx, paths, watching_dir))
+        .spawn(move || run_watch_loop(watcher, raw_rx, tx, alive_rx, paths, watching_dir))
         .map_err(VoxtypeError::Io)?;
 
-    Ok(rx)
+    Ok(Updates {
+        updates: rx,
+        _alive: alive_tx,
+    })
 }
 
 /// The watcher thread's body. Split out from [`watch`] so a test can run it
@@ -172,6 +198,7 @@ fn run_watch_loop(
     mut watcher: impl Watcher,
     raw_rx: Receiver<notify::Result<Event>>,
     tx: Sender<RuntimeUpdate>,
+    alive: Receiver<()>,
     paths: RuntimePaths,
     mut watching_dir: bool,
 ) {
@@ -190,6 +217,13 @@ fn run_watch_loop(
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
         };
+        // Every tick, not only when there is something to send: see `Updates`.
+        if matches!(
+            alive.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected)
+        ) {
+            return;
+        }
 
         if !watching_dir {
             // Waiting for the directory to appear. Checked on every tick, not
@@ -230,6 +264,9 @@ fn run_watch_loop(
         }
 
         let Some(event) = event else { continue };
+        if !is_change(&event.kind) {
+            continue;
+        }
         for path in &event.paths {
             if *path == state_path {
                 if let Some(state) = read_state(&state_path) {
@@ -247,6 +284,26 @@ fn run_watch_loop(
                 }
             }
         }
+    }
+}
+
+/// Whether an event can mean a file's contents are different now.
+///
+/// `notify`'s inotify backend subscribes to `IN_OPEN`, so every read of a file
+/// in the watched directory arrives here as `Access(Open)` naming that file --
+/// the service monitor's `read_now`, and the `read_state` this loop does in
+/// answer to an event. Taking those for changes made the watcher its own event
+/// source: each read was the next event, the loop turned over as fast as a
+/// four-byte file can be opened, and every turn queued an update that the
+/// consumer drained far more slowly -- about 13 MB a second, for as long as
+/// the app was open, idle or not (v0.1.0). A read never changes a file, so no
+/// `Access` event counts except the one that ends a write.
+fn is_change(kind: &EventKind) -> bool {
+    match kind {
+        EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+        EventKind::Access(_) => false,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => true,
+        EventKind::Any | EventKind::Other => true,
     }
 }
 
@@ -276,4 +333,43 @@ fn emit_current(
         tx.send(RuntimeUpdate::Meeting(meeting)).map_err(|_| ())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use notify::event::{CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind, RenameMode};
+
+    use super::*;
+
+    /// The inotify backend's subscription, kind by kind: the one a read
+    /// produces must not count, everything a write or a rename produces must.
+    #[test]
+    fn a_read_is_not_a_change_but_every_kind_of_write_is() {
+        let open = EventKind::Access(AccessKind::Open(AccessMode::Any));
+        assert!(!is_change(&open), "IN_OPEN is what a read looks like");
+        assert!(!is_change(&EventKind::Access(AccessKind::Read)));
+        assert!(!is_change(&EventKind::Access(AccessKind::Close(
+            AccessMode::Read
+        ))));
+        assert!(!is_change(&EventKind::Access(AccessKind::Any)));
+
+        // A write in place: truncate, write, close.
+        assert!(is_change(&EventKind::Modify(ModifyKind::Data(
+            DataChange::Any
+        ))));
+        assert!(is_change(&EventKind::Access(AccessKind::Close(
+            AccessMode::Write
+        ))));
+        // An atomic replace: a new file renamed over the old one.
+        assert!(is_change(&EventKind::Create(CreateKind::File)));
+        assert!(is_change(&EventKind::Modify(ModifyKind::Name(
+            RenameMode::To
+        ))));
+        assert!(is_change(&EventKind::Remove(RemoveKind::File)));
+        assert!(is_change(&EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::Any
+        ))));
+        // A queue overflow says "look again", which is a change for our purposes.
+        assert!(is_change(&EventKind::Other));
+    }
 }

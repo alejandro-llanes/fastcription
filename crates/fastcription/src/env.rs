@@ -366,6 +366,10 @@ impl ServiceMonitor {
     const WATCHED_POLL: std::time::Duration = std::time::Duration::from_secs(15);
     /// Without a watch, the poll is the only signal there is.
     const BLIND_POLL: std::time::Duration = std::time::Duration::from_secs(3);
+    /// How long to let a burst of daemon activity finish before looking. A
+    /// single write to `state` is two or three inotify events, a meeting
+    /// starting is more, and each used to be its own `systemctl` run.
+    const SETTLE: std::time::Duration = std::time::Duration::from_millis(100);
 
     pub fn spawn() -> Self {
         let (tx, updates) = crossbeam_channel::bounded(8);
@@ -396,9 +400,18 @@ impl ServiceMonitor {
                         Err(crossbeam_channel::TrySendError::Disconnected(_)) => return,
                     }
                     match &watch {
-                        // Any daemon activity is a reason to look again now.
+                        // Any daemon activity is a reason to look again now --
+                        // once, for all of it. Whatever else the daemon did
+                        // while this settled is the same reason, and leaving
+                        // it queued would mean a `systemctl` per event, with
+                        // the queue growing by however much the watcher gets
+                        // ahead of those.
                         Some(rx) => match rx.recv_timeout(poll) {
-                            Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                            Ok(_) => {
+                                std::thread::sleep(Self::SETTLE);
+                                for _ in rx.try_iter() {}
+                            }
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                                 std::thread::sleep(poll)
                             }

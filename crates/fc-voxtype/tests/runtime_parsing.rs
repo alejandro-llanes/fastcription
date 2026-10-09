@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use fc_voxtype::runtime::{watch, DaemonState, MeetingState, RuntimePaths, RuntimeUpdate};
 
-/// The three tests that start a real watcher run one at a time. They assert on
+/// The tests that start a real watcher run one at a time. They assert on
 /// watcher threads of this process, and cargo runs the tests in this file
 /// concurrently in one process, so overlapping them would make each one's
 /// bookkeeping depend on the others.
@@ -178,6 +178,51 @@ fn watch_follows_the_directory_through_a_remove_and_recreate() {
         )),
         "the watcher must follow the directory to its replacement"
     );
+}
+
+/// Reading the state file is not a change. `notify` subscribes to `IN_OPEN`, so
+/// the watcher sees every read -- the service monitor's, the app's, its own --
+/// as an event naming `state`. Taking those for changes made it re-read the
+/// file on each one, each read being the next event: a loop that spun a core
+/// and queued an update per turn, some 13 MB a second, for as long as the app
+/// ran. That is the 20 GB an instance left idle in the tray reached in v0.1.0.
+#[test]
+fn reading_the_state_file_is_not_a_change() {
+    let _serial = watcher_guard();
+    let base = tempfile::tempdir().expect("tempdir");
+    let voxtype_dir = base.path().join("voxtype");
+    std::fs::create_dir_all(&voxtype_dir).expect("create voxtype dir");
+    let state = voxtype_dir.join("state");
+    std::fs::write(&state, "idle").expect("write state");
+
+    let rx = watch(RuntimePaths {
+        dir: voxtype_dir.clone(),
+    })
+    .expect("watch");
+
+    // A write is a change, and must still be reported.
+    std::fs::write(&state, "recording").expect("write state");
+    assert!(
+        wait_for(&rx, Duration::from_secs(5), |u| matches!(
+            u,
+            RuntimeUpdate::State(DaemonState::Recording)
+        )),
+        "a write to the state file must be reported"
+    );
+    // The same write's trailing events (close-after-write) may still be on
+    // their way; they are not what this test is about.
+    std::thread::sleep(Duration::from_millis(300));
+    for _ in rx.try_iter() {}
+
+    // Then the file is read, as the service monitor and the app do whenever
+    // they like -- many times, as the watcher's own answer to each would be.
+    for _ in 0..200 {
+        let _ = std::fs::read_to_string(&state);
+    }
+    match rx.recv_timeout(Duration::from_millis(500)) {
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+        other => panic!("reading the file produced {other:?}: the watcher is its own event source"),
+    }
 }
 
 /// The app rebuilds this watcher whenever it rediscovers the runtime directory,

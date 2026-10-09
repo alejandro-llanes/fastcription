@@ -417,7 +417,11 @@ speaker labels and a metadata header, mirroring voxtype's flags.
   model downloaded, engine not compiled in.
 - **Service control**: `systemctl --user start|stop|restart voxtype.service`;
   state from `systemctl --user show -p ActiveState,SubState` plus an inotify watch
-  on the runtime `state` file. Note that the live path does *not* need the daemon —
+  on the runtime `state` file. The watch acts only on events a write produces:
+  `notify` subscribes to `IN_OPEN`, so the app's own reads of that file come back
+  to it as events, and answering each with another read made the watcher its own
+  event source — a core spun and the update queue grew by 13 MB/s for as long as
+  the app ran, idle or not (v0.1.0). Note that the live path does *not* need the daemon —
   service control exists for the user's dictation workflow and for meeting-mode
   delegation, as `CLAUDE.md` requires.
 - **The level meter is our own**, peak and RMS computed on the capture thread
